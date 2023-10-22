@@ -36,13 +36,15 @@ type Tracer struct {
 	bpfModule  *bpf.Module
 	sources    string
 	binaryPath string
+	pid        *int
 }
 
-func New(jsonOutput bool, sources string, binaryPath string) *Tracer {
+func New(jsonOutput bool, sources string, binaryPath string, pid *int) *Tracer {
 	return &Tracer{
 		jsonOutput: jsonOutput,
 		sources:    sources,
 		binaryPath: binaryPath,
+		pid:        pid,
 	}
 }
 

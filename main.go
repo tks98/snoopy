@@ -59,10 +59,15 @@ func printTlsMessage(tlsMessage *tls_trace.TlsMessage, jsonOutput bool) {
 	}
 }
 
+var pidToTrace *int
+
 func main() {
 	var jsonOutput bool
 	flag.BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+
+	pid := flag.Int("pid", -1, "Specify the PID to trace (optional, if not specified, all processes will be traced)")
 	flag.Parse()
+	pidToTrace = pid
 
 	sources, err := ReadEbpfProgram("bpf/snoopy.c")
 	if err != nil {
@@ -74,17 +79,21 @@ func main() {
 		log.Fatal(fmt.Errorf("Error getting binary path: %s", err))
 	}
 
-	tracer := tls_trace.New(jsonOutput, sources, binaryPath)
+	// Assuming tls_trace.New has a way to accept optional PID
+	tracer := tls_trace.New(jsonOutput, sources, binaryPath, pidToTrace)
 	tlsMessages, err := tracer.TraceMessageChannel()
 	if err != nil {
 		log.Fatal(fmt.Errorf("Failed to start tls_trace: %s", err))
 	}
 
 	for message := range tlsMessages {
-		printTlsMessage(&message, jsonOutput)
+		// Only process messages from the specified PID, if PID is set
+		if pidToTrace == nil || *pidToTrace < 0 || *pidToTrace == int(message.Pid) {
+			printTlsMessage(&message, jsonOutput)
+		}
 	}
-}
 
+}
 func ReadEbpfProgram(filePath string) (string, error) {
 	b, err := os.ReadFile(filePath)
 	return string(b), err
