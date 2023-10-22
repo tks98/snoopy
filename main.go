@@ -28,7 +28,8 @@ func printTlsMessage(tlsMessage *tls_trace.TlsMessage, jsonOutput bool) {
 			Function    string  `json:"function"`
 			ProcessName string  `json:"process_name"`
 			ElapsedTime float64 `json:"elapsed_time"`
-			PTID        uint64  `json:"ptid"`
+			PID         uint32  `json:"pid"`
+			TID         uint32  `json:"tid"`
 			MessageSize int     `json:"message_size"`
 			Result      int32   `json:"result"`
 			TLSContent  string  `json:"tls_content"`
@@ -36,7 +37,8 @@ func printTlsMessage(tlsMessage *tls_trace.TlsMessage, jsonOutput bool) {
 			Function:    funcName,
 			ProcessName: procName,
 			ElapsedTime: elapsedSeconds,
-			PTID:        tlsMessage.Ptid,
+			PID:         tlsMessage.Pid,
+			TID:         tlsMessage.Tid,
 			MessageSize: endIdx,
 			Result:      tlsMessage.Result,
 			TLSContent:  string(tlsMessage.Message[:endIdx]),
@@ -50,7 +52,7 @@ func printTlsMessage(tlsMessage *tls_trace.TlsMessage, jsonOutput bool) {
 	} else {
 		currentTime := time.Now()
 		timestamp := currentTime.Format("15:04:05.000000")
-		fmt.Printf("[%s] Function %s, Process Name %s, PTID %d: Message Size %d bytes, Result %d\n", timestamp, funcName, procName, tlsMessage.Ptid, endIdx, tlsMessage.Result)
+		fmt.Printf("[%s] Function %s, Process Name %s, PID %d, TID %d: Message Size %d bytes, Result %d\n", timestamp, funcName, procName, tlsMessage.Pid, tlsMessage.Tid, endIdx, tlsMessage.Result)
 		fmt.Println("TLS Content:")
 		fmt.Println(string(tlsMessage.Message[:endIdx]))
 		fmt.Println("========================================")

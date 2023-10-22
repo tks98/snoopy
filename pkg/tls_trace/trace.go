@@ -23,7 +23,8 @@ const (
 
 type TlsMessage struct {
 	Elapsed     uint64
-	Ptid        uint64
+	Pid         uint32
+	Tid         uint32
 	Result      int32
 	Function    int32
 	ProcessName [16]byte
@@ -76,10 +77,33 @@ func (t *Tracer) TraceMessageChannel() (<-chan TlsMessage, error) {
 		var msg TlsMessage
 		for {
 			data := <-channel
-			err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &msg)
-			if err != nil {
-				// failed to decode, could be related to a number of things, but all we can do it skip this iteration
-				log.Printf("Failed to decode received data: %s\n", err)
+			buffer := bytes.NewBuffer(data)
+			if err := binary.Read(buffer, binary.LittleEndian, &msg.Elapsed); err != nil {
+				log.Printf("Failed to decode Elapsed: %s\n", err)
+				continue
+			}
+			if err := binary.Read(buffer, binary.LittleEndian, &msg.Pid); err != nil {
+				log.Printf("Failed to decode Pid: %s\n", err)
+				continue
+			}
+			if err := binary.Read(buffer, binary.LittleEndian, &msg.Tid); err != nil {
+				log.Printf("Failed to decode Tid: %s\n", err)
+				continue
+			}
+			if err := binary.Read(buffer, binary.LittleEndian, &msg.Result); err != nil {
+				log.Printf("Failed to decode Result: %s\n", err)
+				continue
+			}
+			if err := binary.Read(buffer, binary.LittleEndian, &msg.Function); err != nil {
+				log.Printf("Failed to decode Function: %s\n", err)
+				continue
+			}
+			if err := binary.Read(buffer, binary.LittleEndian, &msg.ProcessName); err != nil {
+				log.Printf("Failed to decode ProcessName: %s\n", err)
+				continue
+			}
+			if err := binary.Read(buffer, binary.LittleEndian, &msg.Message); err != nil {
+				log.Printf("Failed to decode Message: %s\n", err)
 				continue
 			}
 
