@@ -1,4 +1,4 @@
 PHONY: run 
 
 run:
-	go run -exec sudo main.go
+	sudo go run main.go
