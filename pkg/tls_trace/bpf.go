@@ -11,6 +11,7 @@ import (
 	bpf "github.com/iovisor/gobpf/bcc"
 )
 
+// Constants used within the package
 const (
 	MessageMaxBuffer   = 10000
 	LibSSLSoPathAMd64  = "/lib/x86_64-linux-gnu/libssl.so.3"
@@ -21,6 +22,7 @@ const (
 	SSLWrite           = 1
 )
 
+// Tracer struct for TLS tracing
 type Tracer struct {
 	jsonOutput bool
 	bpfModule  *bpf.Module
@@ -29,6 +31,7 @@ type Tracer struct {
 	pid        *int
 }
 
+// New returns a new tracer instance
 func New(jsonOutput bool, sources string, binaryPath string, pid *int) *Tracer {
 	return &Tracer{
 		jsonOutput: jsonOutput,
@@ -38,6 +41,7 @@ func New(jsonOutput bool, sources string, binaryPath string, pid *int) *Tracer {
 	}
 }
 
+// attachProbes attaches required uprobe for tracing specific functions
 func (t *Tracer) attachProbes(binaryPath string) error {
 	t.attachUprobeEntry(binaryPath, "SSL_read")
 	t.attachUprobeReturn(binaryPath, "SSL_read")
@@ -47,6 +51,7 @@ func (t *Tracer) attachProbes(binaryPath string) error {
 	return nil
 }
 
+// TraceMessageChannel retrieves the trace in a channel from BPF program
 func (t *Tracer) TraceMessageChannel() (<-chan TlsMessage, error) {
 
 	t.bpfModule = bpf.NewModule(t.sources, []string{})
@@ -54,62 +59,36 @@ func (t *Tracer) TraceMessageChannel() (<-chan TlsMessage, error) {
 		return nil, fmt.Errorf("Error attaching probes: %s", err)
 	}
 
+	// Map table in bpf module to channel
 	tlsData := t.bpfModule.TableId("TLS_DATA_PERF_OUTPUT")
-
 	table := bpf.NewTable(tlsData, t.bpfModule)
 	channel := make(chan []byte)
+	out := make(chan TlsMessage)
+
+	// Create performance map to relay traced data to channel
 	perfMap, err := bpf.InitPerfMap(table, channel, nil)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to init perf map: %s", err)
 	}
 
-	out := make(chan TlsMessage)
-
+	// Message decoding routine
 	go func() {
 		var msg TlsMessage
 		for {
 			data := <-channel
 			buffer := bytes.NewBuffer(data)
-			if err := binary.Read(buffer, binary.LittleEndian, &msg.Elapsed); err != nil {
-				log.Printf("Failed to decode Elapsed: %s\n", err)
-				continue
+			for _, field := range []interface{}{&msg.Elapsed, &msg.Pid, &msg.Tid, &msg.Result, &msg.Function, &msg.ProcessName, &msg.Message} {
+				if err := binary.Read(buffer, binary.LittleEndian, field); err != nil {
+					log.Printf("Failed to decode data: %s\n", err)
+					continue
+				}
 			}
-			if err := binary.Read(buffer, binary.LittleEndian, &msg.Pid); err != nil {
-				log.Printf("Failed to decode Pid: %s\n", err)
-				continue
-			}
-			if err := binary.Read(buffer, binary.LittleEndian, &msg.Tid); err != nil {
-				log.Printf("Failed to decode Tid: %s\n", err)
-				continue
-			}
-			if err := binary.Read(buffer, binary.LittleEndian, &msg.Result); err != nil {
-				log.Printf("Failed to decode Result: %s\n", err)
-				continue
-			}
-			if err := binary.Read(buffer, binary.LittleEndian, &msg.Function); err != nil {
-				log.Printf("Failed to decode Function: %s\n", err)
-				continue
-			}
-			if err := binary.Read(buffer, binary.LittleEndian, &msg.ProcessName); err != nil {
-				log.Printf("Failed to decode ProcessName: %s\n", err)
-				continue
-			}
-			if err := binary.Read(buffer, binary.LittleEndian, &msg.Message); err != nil {
-				log.Printf("Failed to decode Message: %s\n", err)
-				continue
-			}
-
-			// find the first 0 byte
-			endIdx := bytes.IndexByte(msg.Message[:], 0)
-			if endIdx == -1 {
-				endIdx = MessageMaxBuffer
-			}
-
-			// send parsed message to output channel
+			// Send the parsed message into output channel
 			out <- msg
 		}
 	}()
 
+	// Capture Interrupt / Kill signals for graceful exit of routines and map
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, os.Kill)
 
@@ -126,6 +105,8 @@ func (t *Tracer) TraceMessageChannel() (<-chan TlsMessage, error) {
 	return out, nil
 }
 
+// UProbe function attachment helpers
+
 func (t *Tracer) attachUprobeEntry(binaryPath, funcName string) {
 	t.attachUprobe(binaryPath, funcName, DefaultUprobeEntry)
 }
@@ -134,6 +115,7 @@ func (t *Tracer) attachUprobeReturn(binaryPath, funcName string) {
 	t.attachUprobe(binaryPath, funcName, DefaultUprobeRet)
 }
 
+// attachUprobe attaches a uProbe for the function funcName on binaryPath
 func (t *Tracer) attachUprobe(binaryPath, funcName, probeType string) {
 	probeName := fmt.Sprintf("uprobe_%s_%s", probeType, funcName)
 	uProbe, err := t.bpfModule.LoadUprobe(probeName)
