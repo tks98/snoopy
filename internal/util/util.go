@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+)
 
-	"github.com/tks98/snoopy/pkg/tls_trace"
+const (
+	LibSSLSoPathAMd64 = "/lib/x86_64-linux-gnu/libssl.so.3"
+	LibSSLSoPathArm64 = "/lib/aarch64-linux-gnu/libssl.so.3"
 )
 
 // CLIOptions is a struct for command line options
@@ -40,15 +43,15 @@ func ReadEbpfProgram(filePath string) (string, error) {
 	return string(b), err
 }
 
-// GetBinaryPath function returns the path of the binary file based on the architecture
-func GetBinaryPath() (string, error) {
+// GetLibSSLPath function returns the path of the libssl shared library file based on the architecture
+func GetLibSSLPath() (string, error) {
 	switch runtime.GOARCH {
 	case "amd64":
 		// Return the path for amd64 architecture
-		return tls_trace.LibSSLSoPathAMd64, nil
+		return LibSSLSoPathAMd64, nil
 	case "arm64":
 		// Return the path for arm64 architecture
-		return tls_trace.LibSSLSoPathArm64, nil
+		return LibSSLSoPathArm64, nil
 	default:
 		// Return error if the architecture is not supported
 		return "", fmt.Errorf("unsupported architecture")

@@ -23,8 +23,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Obtain libssl binary path for Uprobes
-	binaryPath, err := util.GetBinaryPath()
+	// Obtain libssl.so path for Uprobes
+	binaryPath, err := util.GetLibSSLPath()
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -13,9 +13,8 @@ import (
 
 // Constants used within the package
 const (
-	MessageMaxBuffer   = 10000
-	LibSSLSoPathAMd64  = "/lib/x86_64-linux-gnu/libssl.so.3"
-	LibSSLSoPathArm64  = "/lib/aarch64-linux-gnu/libssl.so.3"
+	MessageMaxBuffer = 10000
+
 	DefaultUprobeEntry = "entry"
 	DefaultUprobeRet   = "return"
 	SSLRead            = 0
