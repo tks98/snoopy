@@ -2,7 +2,7 @@
 
 ## Overview
 
-Snoopy is a security tool for monitoring encrypted network traffic. It uses eBPF to hook SSL_READ and SSL_WRITE functions in the libssl library. This allows Snoopy to inspect traffic from applications that use libssl for TLS encryption, without decrypting the traffic.
+Snoopy is a tool for tracing and monitoring SSL/TLS connections in applications that use the OpenSSL library. It uses eBPF uprobes to hook the SSL_read() and SSL_write() functions of libssl.so, allowing it to collect metadata before encryption/decryption takes place. This allows Snoopy to monitor SSL traffic without needing to decrypt it.
 
 
 ## Usage
@@ -20,6 +20,7 @@ Example
 
 ```bash
 sudo snoopy --json --pid 1337
+
 {
     "function": "SSL_READ",
     "process_name": "curl",
@@ -30,6 +31,7 @@ sudo snoopy --json --pid 1337
     "result": 0,
     "tls_content": "106.8,\"High\":58335.1,\"ChangePercentFromLastMonth\":36.41,\"Volume\":\"4.01M\"},{\"Date\":\"01/01/2021\",\"Price\":33108.1,\"Open\":28951.7,\"High\":41921.7,\"ChangePercentFromLastMonth\":14.37,\"Volume\":\"5.50M\"
 }
+
 ```
 This will print TLS information in JSON format only from process ID 1337.
 Not supplying either flag, Snoopy will visually display all intercepted SSL/TLS traffic from all processes that use the OpenSSL library.
