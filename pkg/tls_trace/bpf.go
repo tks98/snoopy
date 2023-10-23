@@ -21,16 +21,6 @@ const (
 	SSLWrite           = 1
 )
 
-type TlsMessage struct {
-	Elapsed     uint64
-	Pid         uint32
-	Tid         uint32
-	Result      int32
-	Function    int32
-	ProcessName [16]byte
-	Message     [MessageMaxBuffer]byte
-}
-
 type Tracer struct {
 	jsonOutput bool
 	bpfModule  *bpf.Module
@@ -160,16 +150,5 @@ func (t *Tracer) attachUprobe(binaryPath, funcName, probeType string) {
 
 	if err != nil {
 		log.Fatalf("Failed to attach %s: %s", funcName, err)
-	}
-}
-
-func GetFunctionName(functionCode int32) string {
-	switch functionCode {
-	case SSLRead:
-		return "SSL_READ"
-	case SSLWrite:
-		return "SSL_WRITE"
-	default:
-		return "UNKNOWN"
 	}
 }
