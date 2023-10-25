@@ -83,7 +83,6 @@ func (t *TlsMessage) printTableOutput(funcName, procName, timestamp string) {
 	// New table writer
 	tw := table.NewWriter()
 	tw.SetOutputMirror(os.Stdout)
-	tw.AppendHeader(table.Row{"DESCRIPTION", "VALUE"})
 	tw.AppendRow([]interface{}{"Timestamp", timestamp})
 	tw.AppendRow([]interface{}{"Function", funcName})
 	tw.AppendRow([]interface{}{"Process Name", procName})
