@@ -19,7 +19,7 @@ sudo snoopy --json --pid 1337
 Example
 
 ```bash
-sudo snoopy --json --pid 1716
+sudo snoopy --json --pid 1716580
 
 {
     "function": "SSL_READ",
