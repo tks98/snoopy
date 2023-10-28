@@ -21,6 +21,9 @@ jobs:
       - name: Install BCC dependencies
         run: sudo apt-get update && sudo apt-get install -y bpfcc-tools linux-headers-$(uname -r)
 
+      - name: List BCC files
+        run: dpkg-query -L bpfcc-tools
+
       - name: Read version
         id: vars
         run: echo "RELEASE_VERSION=$(cat VERSION)" >> $GITHUB_ENV
