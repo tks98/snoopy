@@ -1,0 +1,96 @@
+name: Go Build and Release for snoopy
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Go environment
+        uses: actions/setup-go@v2
+        with:
+          go-version: '1.20'
+
+      - name: Read version
+        id: vars
+        run: echo "RELEASE_VERSION=$(cat VERSION)" >> $GITHUB_ENV
+
+      - name: Build for Linux AMD64
+        run: GOOS=linux GOARCH=amd64 go build -o snoopy
+
+      - name: Package and Hash (AMD64)
+        run: |
+          tar -czvf "tachyon_${{ env.RELEASE_VERSION }}_amd64.tar.gz" snoopy
+          sha256sum "tachyon_${{ env.RELEASE_VERSION }}_amd64.tar.gz" > "tachyon_${{ env.RELEASE_VERSION }}_amd64.tar.gz.sha256"
+
+      - name: Build for Linux ARM64
+        run: GOOS=linux GOARCH=arm64 go build -o snoopy
+
+      - name: Package and Hash (ARM64)
+        run: |
+          tar -czvf "tachyon_${{ env.RELEASE_VERSION }}_arm64.tar.gz" snoopy
+          sha256sum "snoopy_${{ env.RELEASE_VERSION }}_arm64.tar.gz" > "snoopy_${{ env.RELEASE_VERSION }}_arm64.tar.gz.sha256"
+
+      - name: Create Release
+        id: create_release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          release_name: Release ${{ env.RELEASE_VERSION }}
+          body: New release version ${{ env.RELEASE_VERSION }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Assets (AMD64)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./snoopy_${{ env.RELEASE_VERSION }}_amd64.tar.gz
+          asset_name: snoopy_${{ env.RELEASE_VERSION }}_amd64.tar.gz
+          asset_content_type: application/gzip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release SHA (AMD64)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./snoopy_${{ env.RELEASE_VERSION }}_amd64.tar.gz.sha256
+          asset_name: snoopy_${{ env.RELEASE_VERSION }}_amd64.tar.gz.sha256
+          asset_content_type: text/plain
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Assets (ARM64)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./snoopy_${{ env.RELEASE_VERSION }}_arm64.tar.gz
+          asset_name: snoopy_${{ env.RELEASE_VERSION }}_arm64.tar.gz
+          asset_content_type: application/gzip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release SHA (ARM64)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./snoopy_${{ env.RELEASE_VERSION }}_arm64.tar.gz.sha256
+          asset_name: snoopy_${{ env.RELEASE_VERSION }}_arm64.tar.gz.sha256
+          asset_content_type: text/plain
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

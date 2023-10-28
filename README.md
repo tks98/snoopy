@@ -30,7 +30,7 @@ sudo snoopy --json --pid 1716580
     "tid": 1716580,
     "message_size": 1369,
     "result": 0,
-    "tls_content": "106.8,\"High\":58335.1,\"ChangePercentFromLastMonth\":36.41,\"Volume\":\"4.01M\"},{\"Date\":\"01/01/2021\",\"Price\":33108.1,\"Open\":28951.7,\"High\":41921.7,\"ChangePercentFromLastMonth\":14.37,\"Volume\":\"5.50M\"
+    "tls_content": "106.8,\"High\":58335.1...."
 }
 
 ```
@@ -52,7 +52,7 @@ sudo snoopy
 | Message Size | 1369 bytes      |
 +--------------+-----------------+
 [ TLS Content ]
-Open":0.2,"High":0.5,"ChangePercentFromLastMonth":0,"Volume":"826.25K"},{"Date":"10/01/2010","Price":0.2,"Open":0.1,"High":0.2,"ChangePercentFromLastMonth":210.99,"Volume":"1.11M"}
+Open":0.2,"High":0.5,"ChangePercentFromLastMonth":..."}
 ...
 [ End of TLS Message ]
 ```
