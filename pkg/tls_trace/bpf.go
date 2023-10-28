@@ -23,29 +23,40 @@ const (
 
 // Tracer struct for TLS tracing
 type Tracer struct {
-	jsonOutput bool
-	bpfModule  *bpf.Module
-	sources    string
-	binaryPath string
-	pid        *int
+	jsonOutput  bool
+	bpfModule   *bpf.Module
+	sources     string
+	binaryPaths map[string]string
+	pid         *int
 }
 
 // New returns a new tracer instance
-func New(jsonOutput bool, sources string, binaryPath string, pid *int) *Tracer {
+func New(jsonOutput bool, sources string, binaryPaths map[string]string, pid *int) *Tracer {
 	return &Tracer{
-		jsonOutput: jsonOutput,
-		sources:    sources,
-		binaryPath: binaryPath,
-		pid:        pid,
+		jsonOutput:  jsonOutput,
+		sources:     sources,
+		binaryPaths: binaryPaths,
+		pid:         pid,
 	}
 }
 
 // attachProbes attaches required uprobe for tracing specific functions
-func (t *Tracer) attachProbes(binaryPath string) error {
-	t.attachUprobeEntry(binaryPath, "SSL_read")
-	t.attachUprobeReturn(binaryPath, "SSL_read")
-	t.attachUprobeEntry(binaryPath, "SSL_write")
-	t.attachUprobeReturn(binaryPath, "SSL_write")
+func (t *Tracer) attachProbes() error {
+	// Attach OpenSSL Probes
+	if path, exists := t.binaryPaths["OpenSSL"]; exists {
+		t.attachUprobeEntry(path, "SSL_read")
+		t.attachUprobeReturn(path, "SSL_read")
+		t.attachUprobeEntry(path, "SSL_write")
+		t.attachUprobeReturn(path, "SSL_write")
+	}
+
+	// Attach GnuTLS Probes
+	if path, exists := t.binaryPaths["GnuTLS"]; exists {
+		t.attachUprobeEntry(path, "gnutls_record_recv")
+		t.attachUprobeReturn(path, "gnutls_record_recv")
+		t.attachUprobeEntry(path, "gnutls_record_send")
+		t.attachUprobeReturn(path, "gnutls_record_send")
+	}
 
 	return nil
 }
@@ -54,7 +65,7 @@ func (t *Tracer) attachProbes(binaryPath string) error {
 func (t *Tracer) TraceMessageChannel() (<-chan TlsMessage, error) {
 
 	t.bpfModule = bpf.NewModule(t.sources, []string{})
-	if err := t.attachProbes(t.binaryPath); err != nil {
+	if err := t.attachProbes(); err != nil {
 		return nil, fmt.Errorf("Error attaching probes: %s", err)
 	}
 
@@ -76,7 +87,7 @@ func (t *Tracer) TraceMessageChannel() (<-chan TlsMessage, error) {
 		for {
 			data := <-channel
 			buffer := bytes.NewBuffer(data)
-			for _, field := range []interface{}{&msg.Elapsed, &msg.Pid, &msg.Tid, &msg.Result, &msg.Function, &msg.ProcessName, &msg.Message} {
+			for _, field := range []interface{}{&msg.Elapsed, &msg.Pid, &msg.Tid, &msg.Result, &msg.FunctionName, &msg.ProcessName, &msg.Message} { // Added &msg.FunctionName
 				if err := binary.Read(buffer, binary.LittleEndian, field); err != nil {
 					log.Printf("Failed to decode data: %s\n", err)
 					continue

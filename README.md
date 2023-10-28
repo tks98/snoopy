@@ -2,8 +2,9 @@
 
 ## Overview
 
-Snoopy is a tool for tracing and monitoring SSL/TLS connections in applications that use the OpenSSL library. It uses eBPF uprobes to hook the SSL_read() and SSL_write() functions of libssl.so, allowing it to collect metadata before encryption/decryption takes place. This allows Snoopy to monitor SSL traffic without needing to decrypt it.
+Snoopy is a tool for tracing and monitoring SSL/TLS connections in applications that use the common SSL libraries. It uses eBPF uprobes to hook SSL functions allowing it to collect metadata before encryption/decryption takes place. This allows Snoopy to monitor SSL traffic without needing to decrypt it.
 
+Snoopy supports inspecting traffic from application that use OpenSSL (libssl.so) or gnutls (libgnutls.so).
 
 ## Usage
 
@@ -52,6 +53,7 @@ sudo snoopy
 +--------------+-----------------+
 [ TLS Content ]
 Open":0.2,"High":0.5,"ChangePercentFromLastMonth":0,"Volume":"826.25K"},{"Date":"10/01/2010","Price":0.2,"Open":0.1,"High":0.2,"ChangePercentFromLastMonth":210.99,"Volume":"1.11M"}
+...
 [ End of TLS Message ]
 ```
 

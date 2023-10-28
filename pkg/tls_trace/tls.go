@@ -13,14 +13,14 @@ import (
 
 // TlsMessage struct to handle each message data
 type TlsMessage struct {
-	Elapsed     uint64
-	Pid         uint32
-	Tid         uint32
-	Result      int32
-	Function    int32
-	ProcessName [16]byte
-	Message     [MessageMaxBuffer]byte
-	EndIdx      int
+	Elapsed      uint64
+	Pid          uint32
+	Tid          uint32
+	Result       int32
+	FunctionName [20]byte // New field to store the function name
+	ProcessName  [16]byte
+	Message      [MessageMaxBuffer]byte
+	EndIdx       int
 }
 
 // getEndIndex returns end index of the message
@@ -35,18 +35,6 @@ func (t *TlsMessage) getEndIndex() int {
 // HasContent checks if the TLS message has content
 func (t *TlsMessage) HasContent() bool {
 	return bytes.IndexByte(t.Message[:], 0) != 0
-}
-
-// GetFunctionName returns function name by function code
-func (t *TlsMessage) GetFunctionName() string {
-	switch t.Function {
-	case SSLRead:
-		return "SSL_READ"
-	case SSLWrite:
-		return "SSL_WRITE"
-	default:
-		return "UNKNOWN"
-	}
 }
 
 // createJsonOutput creates and prints JSON representation of the message
@@ -106,8 +94,8 @@ func (t *TlsMessage) Print(jsonOutput bool) {
 	t.EndIdx = t.getEndIndex()
 
 	elapsedSeconds := float64(t.Elapsed) / 1e6
-	funcName := t.GetFunctionName()
 	procName := string(t.ProcessName[:bytes.IndexByte(t.ProcessName[:], 0)])
+	funcName := string(t.FunctionName[:bytes.IndexByte(t.FunctionName[:], 0)]) // Using the new FunctionName field
 	if jsonOutput {
 		t.createJsonOutput(funcName, procName, elapsedSeconds)
 	} else {

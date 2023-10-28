@@ -8,8 +8,10 @@ import (
 )
 
 const (
-	LibSSLSoPathAMd64 = "/lib/x86_64-linux-gnu/libssl.so.3"
-	LibSSLSoPathArm64 = "/lib/aarch64-linux-gnu/libssl.so.3"
+	LibSSLSoPathAMd64    = "/lib/x86_64-linux-gnu/libssl.so.3"
+	LibSSLSoPathArm64    = "/lib/aarch64-linux-gnu/libssl.so.3"
+	LibGnuTLSSoPathAMd64 = "/usr/lib/x86_64-linux-gnu/libgnutls.so.30.31.0"
+	LibGnuTLSSoPathArm64 = "/usr/lib/aarch64-linux-gnu/libgnutls.so.30.31.0"
 )
 
 // CLIOptions is a struct for command line options
@@ -43,17 +45,20 @@ func ReadEbpfProgram(filePath string) (string, error) {
 	return string(b), err
 }
 
-// GetLibSSLPath function returns the path of the libssl shared library file based on the architecture
-func GetLibSSLPath() (string, error) {
+// GetLibPaths function returns a map of library names to their paths based on the architecture
+func GetLibPaths() (map[string]string, error) {
+	libPaths := make(map[string]string)
+
 	switch runtime.GOARCH {
 	case "amd64":
-		// Return the path for amd64 architecture
-		return LibSSLSoPathAMd64, nil
+		libPaths["OpenSSL"] = LibSSLSoPathAMd64
+		libPaths["GnuTLS"] = LibGnuTLSSoPathAMd64 // You should confirm this path
 	case "arm64":
-		// Return the path for arm64 architecture
-		return LibSSLSoPathArm64, nil
+		libPaths["OpenSSL"] = LibSSLSoPathArm64
+		libPaths["GnuTLS"] = LibGnuTLSSoPathArm64 // This path was confirmed from your system
 	default:
-		// Return error if the architecture is not supported
-		return "", fmt.Errorf("unsupported architecture")
+		return nil, fmt.Errorf("unsupported architecture")
 	}
+
+	return libPaths, nil
 }

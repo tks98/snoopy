@@ -23,14 +23,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Obtain libssl.so path for Uprobes
-	binaryPath, err := util.GetLibSSLPath()
+	// Get shared SSL library paths for Uprobes
+	binaryPaths, err := util.GetLibPaths()
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Create new TLS tracer with parsed options
-	tracer := tls_trace.New(opts.JSONOutput, sources, binaryPath, &opts.PID)
+	tracer := tls_trace.New(opts.JSONOutput, sources, binaryPaths, &opts.PID)
 
 	// Start tracing by obtaining the message channel
 	tlsMessages, err := tracer.TraceMessageChannel()
@@ -40,6 +40,7 @@ func main() {
 
 	// Loop over messages from the TLS tracer
 	for message := range tlsMessages {
+		message.Print(opts.JSONOutput)
 		// If PID was provided and equals the message Pid, or if no PID was provided
 		// and the message has content, print the message.
 		if (opts.PID < 0 || opts.PID == int(message.Pid)) && message.HasContent() {
