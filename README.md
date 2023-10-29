@@ -2,16 +2,24 @@
 
 ## Overview
 
-Snoopy is a tool for tracing and monitoring SSL/TLS connections in applications that use the common SSL libraries. It uses eBPF uprobes to hook SSL functions allowing it to collect metadata before encryption/decryption takes place. This allows Snoopy to monitor SSL traffic without needing to decrypt it.
+Snoopy is a tool for tracing and monitoring SSL/TLS connections in applications that use common SSL libraries. It leverages eBPF uprobes to hook into SSL functions, collecting metadata before encryption/decryption. This enables Snoopy to monitor SSL traffic without decryption.
 
-Snoopy supports inspecting traffic from application that use OpenSSL (libssl.so) or gnutls (libgnutls.so).
+Snoopy supports inspecting traffic from applications that use OpenSSL (libssl.so) or GnuTLS (libgnutls.so).
+
+
+## Building
+Snoopy relies on [gobpf](https://github.com/iovisor/gobpf/tree/master), which are Go bindings for bcc. You will need to install [libbcc](https://github.com/iovisor/bcc/blob/master/INSTALL.md) for your specific kernel.
+
+```
+go build -o snoopy
+```
 
 ## Usage
 
 Snoopy supports two optional flags, --json and --pid.
 
 ```bash
-sudo snoopy --json --pid 1337
+sudo ./snoopy --json --pid 1337
 ```
 
 - `json`: Print TLS information in JSON format.
