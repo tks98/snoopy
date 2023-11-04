@@ -72,3 +72,9 @@ Feel free to create issues for bugs and feature requests, or make pull requests 
 ## License
 
 This project is licensed under the MIT License.
+
+## References 
+* https://www.airplane.dev/blog/decrypting-ssl-at-scale-with-ebpf
+* https://medium.com/@yunwei356/ebpf-practical-tutorial-capturing-ssl-tls-plain-text-using-uprobe-fccb010cfd64
+* https://www.datadoghq.com/blog/ebpf-guide/
+* https://blog.px.dev/ebpf-openssl-tracing/
