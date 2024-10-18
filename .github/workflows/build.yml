@@ -28,19 +28,23 @@ jobs:
 
     - name: Install BCC
       run: |
-        git clone https://github.com/iovisor/bcc.git
-        mkdir bcc/build
-        cd bcc/build
-        cmake ..
-        make
-        sudo make install
-        cd ../..
+        sudo apt-get install -y software-properties-common
+        sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 4052245BD4284CDD
+        echo "deb https://repo.iovisor.org/apt/$(lsb_release -cs) $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/iovisor.list
+        sudo apt-get update
+        sudo apt-get install -y bcc-tools libbcc-examples linux-headers-$(uname -r)
+
+    - name: Install specific gobpf version
+      run: go get github.com/iovisor/gobpf@v0.2.0
+
+    - name: Update go.mod
+      run: go mod tidy
 
     - name: Build Snoopy
       run: go build -v -o snoopy
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: snoopy
         path: snoopy
