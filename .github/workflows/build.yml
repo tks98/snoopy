@@ -15,9 +15,9 @@ jobs:
     - uses: actions/checkout@v2
 
     - name: Set up Go
-      uses: actions/setup-go@v2
+      uses: actions/setup-go@v4
       with:
-        go-version: 1.20
+        go-version: '1.20'
 
     - name: Install dependencies
       run: |
@@ -26,7 +26,15 @@ jobs:
           libllvm13 llvm-13-dev libclang-13-dev python3 zlib1g-dev libelf-dev libfl-dev \
           python3-setuptools liblzma-dev libdebuginfod-dev arping netperf iperf
 
+    - name: Cache BCC
+      id: cache-bcc
+      uses: actions/cache@v2
+      with:
+        path: /usr/local/lib/python3.*/dist-packages/bcc
+        key: ${{ runner.os }}-bcc-${{ hashFiles('**/bcc_version.txt') }}
+
     - name: Install BCC
+      if: steps.cache-bcc.outputs.cache-hit != 'true'
       run: |
         git clone https://github.com/iovisor/bcc.git
         mkdir bcc/build; cd bcc/build
@@ -38,6 +46,7 @@ jobs:
         make
         sudo make install
         popd
+        echo $(git -C bcc rev-parse HEAD) > bcc_version.txt
 
     - name: Install specific gobpf version
       run: go get github.com/iovisor/gobpf@v0.2.0
