@@ -12,38 +12,22 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v2
+      uses: actions/setup-go@v5
       with:
-        go-version: 1.17
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y bison build-essential cmake flex git libedit-dev \
-          libllvm14 llvm-14-dev libclang-14-dev python3 zlib1g-dev libelf-dev libfl-dev \
-          python3-setuptools liblzma-dev libdebuginfod-dev arping netperf iperf
+        go-version: '1.21'
 
     - name: Install BCC
       run: |
-        git clone https://github.com/iovisor/bcc.git
-        mkdir bcc/build; cd bcc/build
-        cmake ..
-        make
-        sudo make install
-        cmake -DPYTHON_CMD=python3 .. # build python3 binding
-        pushd src/python/
-        make
-        sudo make install
-        popd
+        sudo apt-get update
+        sudo apt-get install -y bcc-tools libbcc-examples linux-headers-$(uname -r)
 
     - name: Install specific gobpf version
-      run: go get github.com/iovisor/gobpf@v0.2.0
-
-    - name: Update go.mod
-      run: go mod tidy
+      run: |
+        go get github.com/iovisor/gobpf@v0.2.0
+        go mod tidy
 
     - name: Build Snoopy
       run: go build -v -o snoopy
