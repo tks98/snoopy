@@ -1,0 +1,46 @@
+name: Build Snoopy
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: 1.17
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bison build-essential cmake flex git libedit-dev \
+          libllvm12 llvm-12-dev libclang-12-dev python3 zlib1g-dev libelf-dev libfl-dev \
+          python3-setuptools liblzma-dev
+
+    - name: Install BCC
+      run: |
+        git clone https://github.com/iovisor/bcc.git
+        mkdir bcc/build
+        cd bcc/build
+        cmake ..
+        make
+        sudo make install
+        cd ../..
+
+    - name: Build Snoopy
+      run: go build -v -o snoopy
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: snoopy
+        path: snoopy
