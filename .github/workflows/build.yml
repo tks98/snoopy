@@ -34,19 +34,9 @@ jobs:
         key: ${{ runner.os }}-bcc-${{ hashFiles('**/bcc_version.txt') }}
 
     - name: Install BCC
-      if: steps.cache-bcc.outputs.cache-hit != 'true'
       run: |
-        git clone https://github.com/iovisor/bcc.git
-        mkdir bcc/build; cd bcc/build
-        cmake ..
-        make
-        sudo make install
-        cmake -DPYTHON_CMD=python3 .. # build python3 binding
-        pushd src/python/
-        make
-        sudo make install
-        popd
-        echo $(git -C bcc rev-parse HEAD) > bcc_version.txt
+        sudo apt-get update
+        sudo apt-get install -y bcc=0.16.17-3.3
 
     - name: Install specific gobpf version
       run: go get github.com/iovisor/gobpf@v0.2.0
