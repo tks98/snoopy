@@ -23,7 +23,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y bison build-essential cmake flex git libedit-dev \
-          libllvm14 llvm-14-dev libclang-14-dev python3 zlib1g-dev libelf-dev libfl-dev \
+          libllvm13 llvm-13-dev libclang-13-dev python3 zlib1g-dev libelf-dev libfl-dev \
           python3-setuptools liblzma-dev libdebuginfod-dev arping netperf iperf
 
     - name: Install BCC
