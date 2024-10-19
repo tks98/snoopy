@@ -1,0 +1,93 @@
+name: Build Snoopy
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v2
+
+    - name: Install essential packages and kernel headers
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          bison \
+          build-essential \
+          cmake \
+          flex \
+          git \
+          libedit-dev \
+          libllvm14 \
+          llvm-14-dev \
+          libclang-14-dev \
+          python3 \
+          zlib1g-dev \
+          libelf-dev \
+          libfl-dev \
+          python3-setuptools \
+          liblzma-dev \
+          libdebuginfod-dev \
+          arping \
+          netperf \
+          iperf \
+          wget \
+          curl \
+          kmod \
+          linux-headers-generic \
+          gcc-aarch64-linux-gnu
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.20.5'
+
+    - name: Install BCC
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bpfcc-tools
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y \
+            libbpfcc:arm64 \
+            libbpfcc-dev:arm64
+        else
+          sudo apt-get install -y \
+            libbpfcc \
+            libbpfcc-dev
+        fi
+
+    - name: Set up kernel headers
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y linux-headers-$(uname -r)
+        sudo ln -s /usr/src/linux-headers-$(uname -r) /lib/modules/$(uname -r)/build
+
+    - name: Build Snoopy
+      env:
+        GOARCH: ${{ matrix.arch }}
+        CGO_ENABLED: 1
+      run: |
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOARCH=arm64 go build -v -o snoopy-arm64
+        else
+          go build -v -o snoopy-amd64
+        fi
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: snoopy-${{ matrix.arch }}
+        path: snoopy-${{ matrix.arch }}
