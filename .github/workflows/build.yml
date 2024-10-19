@@ -7,12 +7,17 @@ on:
     branches: [ main ]
 
 jobs:
-
   build:
     runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
     
     steps:
     - uses: actions/checkout@v3
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v2
 
     - name: Install essential packages and kernel headers
       run: |
@@ -40,7 +45,8 @@ jobs:
           wget \
           curl \
           kmod \
-          linux-headers-generic
+          linux-headers-generic \
+          gcc-aarch64-linux-gnu
 
     - name: Set up Go
       uses: actions/setup-go@v4
@@ -62,10 +68,18 @@ jobs:
         sudo ln -s /usr/src/linux-headers-$(uname -r) /lib/modules/$(uname -r)/build
 
     - name: Build Snoopy
-      run: go build -v -o snoopy
+      env:
+        GOARCH: ${{ matrix.arch }}
+        CGO_ENABLED: 1
+      run: |
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOARCH=arm64 go build -v -o snoopy-arm64
+        else
+          go build -v -o snoopy-amd64
+        fi
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: snoopy
-        path: snoopy
+        name: snoopy-${{ matrix.arch }}
+        path: snoopy-${{ matrix.arch }}
