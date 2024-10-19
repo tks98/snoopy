@@ -56,14 +56,15 @@ jobs:
     - name: Install BCC
       run: |
         sudo apt-get update
+        sudo apt-get install -y bpfcc-tools
         if [ "${{ matrix.arch }}" = "arm64" ]; then
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
           sudo apt-get install -y \
-            bpfcc-tools:arm64 \
             libbpfcc:arm64 \
             libbpfcc-dev:arm64
         else
           sudo apt-get install -y \
-            bpfcc-tools \
             libbpfcc \
             libbpfcc-dev
         fi
