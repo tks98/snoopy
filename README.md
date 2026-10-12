@@ -32,8 +32,8 @@ HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_S
 
 ## Features
 
-- **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS and Go's
-  `crypto/tls`, including stripped Go binaries.
+- **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS, wolfSSL,
+  Mbed TLS, s2n-tls and Go's `crypto/tls`, including stripped Go binaries.
 - **Finds what to trace:** system libraries, libraries loaded by running
   processes (including inside containers, and copies that an upgrade has
   since replaced), Go programs, and anything you point it at with `--lib`.
@@ -130,11 +130,11 @@ Each line is one call to a TLS read or write function:
 | Field | Description |
 | --- | --- |
 | `time` | When the call returned. |
-| `function`, `library` | The traced function, e.g. `SSL_read`, and its library: `openssl`, `gnutls`, `nss` or `go`. |
+| `function`, `library` | The traced function, e.g. `SSL_read`, and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n` or `go`. |
 | `direction` | `read` (received from the peer) or `write` (sent to it). |
 | `process_name`, `pid`, `tid` | The calling process and thread. |
 | `container_id` | The container the process runs in, if any. |
-| `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. |
+| `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*`, `WOLFSSL*`, `mbedtls_ssl_context*`, `struct s2n_connection*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. |
 | `fd`, `local_addr`, `remote_addr` | The socket, if known. |
 | `latency_ns` | Time spent inside the call. |
 | `size` | Bytes the call transferred. |
@@ -162,6 +162,9 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. |
+| wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
+| Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
+| s2n-tls | `s2n_recv`, `s2n_send` | Data sent with `s2n_sendv` isn't captured. |
 | Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64. Works on stripped binaries. |
 
 Programs that do their own socket I/O around the TLS library, such as .NET's
@@ -203,7 +206,9 @@ make generate     # recompile bpf/snoopy.c after changing it (needs clang 18 and
 ```
 
 The integration tests use whichever of `curl`, `python3`, `gnutls-cli` and the
-NSS development files (`libnss3-dev`) are installed, and skip the rest. CI runs
+NSS, wolfSSL, Mbed TLS and s2n-tls development files (`libnss3-dev`,
+`libwolfssl-dev`, `libmbedtls-dev`; s2n-tls has to be built from source) are
+installed, and skip the rest. CI runs
 them on x86_64 and arm64. To run them on an older kernel in a VM, use
 [vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
 Install vimto with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`; a build

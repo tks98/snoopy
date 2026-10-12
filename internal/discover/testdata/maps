@@ -5,5 +5,9 @@
 7f3e1d400000-7f3e1d5c0000 r-xp 00000000 08:01 1838600                    /usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1
 7f3e1d600000-7f3e1d640000 r-xp 00000000 08:01 1838700                    /opt/my app/lib/libnspr4.so
 7f3e1d700000-7f3e1d740000 r-xp 00000000 08:01 1838800                    /usr/lib/x86_64-linux-gnu/libssl3.so
+7f3e1d740000-7f3e1d780000 r-xp 00000000 08:01 1838810                    /usr/lib/x86_64-linux-gnu/libwolfssl.so.42.0.0
+7f3e1d780000-7f3e1d790000 r-xp 00000000 08:01 1838820                    /usr/lib/x86_64-linux-gnu/libmbedcrypto.so.7
+7f3e1d790000-7f3e1d7a0000 r-xp 00000000 08:01 1838830                    /usr/lib/x86_64-linux-gnu/libmbedtls.so.14
+7f3e1d7a0000-7f3e1d7c0000 r-xp 00000000 08:01 1838840                    /usr/local/lib/libs2n.so.1
 7f3e1d800000-7f3e1d840000 r-xp 00000000 08:01 1838900                    /tmp/libssl.so.1.1 (deleted)
 7ffd3a5f0000-7ffd3a611000 rw-p 00000000 00:00 0                          [stack]

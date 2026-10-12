@@ -24,21 +24,33 @@ const (
 	FuncPRSend
 	FuncGoRead
 	FuncGoWrite
+	FuncWolfSSLRead
+	FuncWolfSSLWrite
+	FuncMbedTLSRead
+	FuncMbedTLSWrite
+	FuncS2NRecv
+	FuncS2NSend
 )
 
 var functionNames = map[Function]string{
-	FuncSSLRead:    "SSL_read",
-	FuncSSLWrite:   "SSL_write",
-	FuncSSLReadEx:  "SSL_read_ex",
-	FuncSSLWriteEx: "SSL_write_ex",
-	FuncGnuTLSRecv: "gnutls_record_recv",
-	FuncGnuTLSSend: "gnutls_record_send",
-	FuncPRRead:     "PR_Read",
-	FuncPRWrite:    "PR_Write",
-	FuncPRRecv:     "PR_Recv",
-	FuncPRSend:     "PR_Send",
-	FuncGoRead:     "crypto/tls.(*Conn).Read",
-	FuncGoWrite:    "crypto/tls.(*Conn).Write",
+	FuncSSLRead:      "SSL_read",
+	FuncSSLWrite:     "SSL_write",
+	FuncSSLReadEx:    "SSL_read_ex",
+	FuncSSLWriteEx:   "SSL_write_ex",
+	FuncGnuTLSRecv:   "gnutls_record_recv",
+	FuncGnuTLSSend:   "gnutls_record_send",
+	FuncPRRead:       "PR_Read",
+	FuncPRWrite:      "PR_Write",
+	FuncPRRecv:       "PR_Recv",
+	FuncPRSend:       "PR_Send",
+	FuncGoRead:       "crypto/tls.(*Conn).Read",
+	FuncGoWrite:      "crypto/tls.(*Conn).Write",
+	FuncWolfSSLRead:  "wolfSSL_read",
+	FuncWolfSSLWrite: "wolfSSL_write",
+	FuncMbedTLSRead:  "mbedtls_ssl_read",
+	FuncMbedTLSWrite: "mbedtls_ssl_write",
+	FuncS2NRecv:      "s2n_recv",
+	FuncS2NSend:      "s2n_send",
 }
 
 func (f Function) String() string {
@@ -59,6 +71,12 @@ func (f Function) Library() discover.Library {
 		return discover.NSS
 	case FuncGoRead, FuncGoWrite:
 		return discover.GoTLS
+	case FuncWolfSSLRead, FuncWolfSSLWrite:
+		return discover.WolfSSL
+	case FuncMbedTLSRead, FuncMbedTLSWrite:
+		return discover.MbedTLS
+	case FuncS2NRecv, FuncS2NSend:
+		return discover.S2N
 	}
 	return 0
 }
@@ -81,7 +99,8 @@ func (d Direction) String() string {
 // Direction returns whether the function receives or sends data.
 func (f Function) Direction() Direction {
 	switch f {
-	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite:
+	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
+		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend:
 		return Write
 	}
 	return Read

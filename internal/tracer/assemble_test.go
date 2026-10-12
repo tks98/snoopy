@@ -47,7 +47,7 @@ func TestFunctionsMatchBPFEnum(t *testing.T) {
 	if enum == nil {
 		t.Fatal("enum fn_id not found")
 	}
-	names := regexp.MustCompile(`FN_[A-Z_]+`).FindAllString(string(enum[1]), -1)
+	names := regexp.MustCompile(`FN_[A-Z0-9_]+`).FindAllString(string(enum[1]), -1)
 
 	want := map[string]Function{
 		"FN_SSL_READ": FuncSSLRead, "FN_SSL_WRITE": FuncSSLWrite,
@@ -56,6 +56,9 @@ func TestFunctionsMatchBPFEnum(t *testing.T) {
 		"FN_PR_READ": FuncPRRead, "FN_PR_WRITE": FuncPRWrite,
 		"FN_PR_RECV": FuncPRRecv, "FN_PR_SEND": FuncPRSend,
 		"FN_GO_READ": FuncGoRead, "FN_GO_WRITE": FuncGoWrite,
+		"FN_WOLFSSL_READ": FuncWolfSSLRead, "FN_WOLFSSL_WRITE": FuncWolfSSLWrite,
+		"FN_MBEDTLS_SSL_READ": FuncMbedTLSRead, "FN_MBEDTLS_SSL_WRITE": FuncMbedTLSWrite,
+		"FN_S2N_RECV": FuncS2NRecv, "FN_S2N_SEND": FuncS2NSend,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("C enum has %d functions, Go has %d", len(names), len(want))
@@ -76,6 +79,8 @@ func TestFunctionDirection(t *testing.T) {
 	for fn, want := range map[Function]Direction{
 		FuncSSLRead: Read, FuncSSLWriteEx: Write, FuncGnuTLSRecv: Read,
 		FuncPRSend: Write, FuncGoRead: Read, FuncGoWrite: Write,
+		FuncWolfSSLRead: Read, FuncWolfSSLWrite: Write, FuncMbedTLSRead: Read,
+		FuncMbedTLSWrite: Write, FuncS2NRecv: Read, FuncS2NSend: Write,
 	} {
 		if got := fn.Direction(); got != want {
 			t.Errorf("%s: direction %s, want %s", fn, got, want)

@@ -39,6 +39,12 @@ enum fn_id {
 	FN_PR_SEND,
 	FN_GO_READ,
 	FN_GO_WRITE,
+	FN_WOLFSSL_READ,
+	FN_WOLFSSL_WRITE,
+	FN_MBEDTLS_SSL_READ,
+	FN_MBEDTLS_SSL_WRITE,
+	FN_S2N_RECV,
+	FN_S2N_SEND,
 };
 
 // How to interpret a function's return value.
@@ -55,7 +61,7 @@ enum ret_kind {
 struct event_header {
 	__u64 timestamp_ns; // CLOCK_MONOTONIC when the call returned
 	__u64 latency_ns;   // time spent inside the call
-	__u64 conn_id;	    // SSL*, gnutls_session_t, PRFileDesc* or *tls.Conn
+	__u64 conn_id;	    // the library's connection handle, e.g. SSL* or *tls.Conn
 	__u32 pid;
 	__u32 tid;
 	__u32 size;	    // bytes transferred by the call
@@ -427,7 +433,7 @@ static __always_inline void propagate_fd(__u64 pid_tgid, struct depth_key *dk, _
 	}
 }
 
-/* C libraries (OpenSSL, GnuTLS, NSS) */
+/* C libraries (OpenSSL, GnuTLS, NSS, wolfSSL, Mbed TLS, s2n-tls) */
 
 // The stack pointer a uretprobe sees, which is the entry stack pointer
 // minus the popped return address on x86 and unchanged on arm64. Matching
@@ -649,6 +655,52 @@ NSPR_PROBE(PR_Read, FN_PR_READ)
 NSPR_PROBE(PR_Write, FN_PR_WRITE)
 NSPR_PROBE(PR_Recv, FN_PR_RECV)
 NSPR_PROBE(PR_Send, FN_PR_SEND)
+
+// wolfSSL. wolfSSL_recv and wolfSSL_send call these, so they aren't probed.
+// int wolfSSL_read(WOLFSSL *ssl, void *data, int sz) and wolfSSL_write alike.
+
+SEC("uprobe/wolfSSL_read")
+int BPF_UPROBE(wolfssl_read_enter, void *ssl, void *data)
+{
+	return enter_call(ctx, FN_WOLFSSL_READ, RET_INT, (__u64)ssl, data, 0);
+}
+
+SEC("uprobe/wolfSSL_write")
+int BPF_UPROBE(wolfssl_write_enter, void *ssl, const void *data)
+{
+	return enter_call(ctx, FN_WOLFSSL_WRITE, RET_INT, (__u64)ssl, data, 0);
+}
+
+// Mbed TLS.
+// int mbedtls_ssl_read(mbedtls_ssl_context *ssl, unsigned char *buf, size_t len) and _write alike.
+
+SEC("uprobe/mbedtls_ssl_read")
+int BPF_UPROBE(mbedtls_ssl_read_enter, void *ssl, void *buf)
+{
+	return enter_call(ctx, FN_MBEDTLS_SSL_READ, RET_INT, (__u64)ssl, buf, 0);
+}
+
+SEC("uprobe/mbedtls_ssl_write")
+int BPF_UPROBE(mbedtls_ssl_write_enter, void *ssl, const void *buf)
+{
+	return enter_call(ctx, FN_MBEDTLS_SSL_WRITE, RET_INT, (__u64)ssl, buf, 0);
+}
+
+// s2n-tls. s2n_sendv takes an array of buffers and isn't probed.
+// ssize_t s2n_recv(struct s2n_connection *conn, void *buf, ssize_t size, s2n_blocked_status *blocked)
+// and s2n_send alike.
+
+SEC("uprobe/s2n_recv")
+int BPF_UPROBE(s2n_recv_enter, void *conn, void *buf)
+{
+	return enter_call(ctx, FN_S2N_RECV, RET_SSIZE, (__u64)conn, buf, 0);
+}
+
+SEC("uprobe/s2n_send")
+int BPF_UPROBE(s2n_send_enter, void *conn, const void *buf)
+{
+	return enter_call(ctx, FN_S2N_SEND, RET_SSIZE, (__u64)conn, buf, 0);
+}
 
 // One return probe serves every C function: the entry probe recorded how
 // to interpret the return value.

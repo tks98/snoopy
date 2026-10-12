@@ -230,6 +230,21 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 			{"PR_Recv", t.objs.PR_RecvEnter},
 			{"PR_Send", t.objs.PR_SendEnter},
 		}
+	case discover.WolfSSL:
+		probes = []cProbe{
+			{"wolfSSL_read", t.objs.WolfsslReadEnter},
+			{"wolfSSL_write", t.objs.WolfsslWriteEnter},
+		}
+	case discover.MbedTLS:
+		probes = []cProbe{
+			{"mbedtls_ssl_read", t.objs.MbedtlsSslReadEnter},
+			{"mbedtls_ssl_write", t.objs.MbedtlsSslWriteEnter},
+		}
+	case discover.S2N:
+		probes = []cProbe{
+			{"s2n_recv", t.objs.S2nRecvEnter},
+			{"s2n_send", t.objs.S2nSendEnter},
+		}
 	case discover.GoTLS:
 		return t.attachGo(ex, target.Go)
 	default:

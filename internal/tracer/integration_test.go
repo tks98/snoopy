@@ -6,8 +6,8 @@
 //	go test -c -tags integration -o tracer.test ./internal/tracer
 //	sudo ./tracer.test -test.v
 //
-// Tests for clients that aren't installed (curl, python3, gnutls-cli, an NSS
-// toolchain) are skipped.
+// Tests for clients that aren't installed (curl, python3, gnutls-cli, an NSS,
+// wolfSSL, Mbed TLS or s2n-tls toolchain) are skipped.
 package tracer
 
 import (
@@ -358,6 +358,58 @@ func TestNSS(t *testing.T) {
 	waitFor(t, events, "PR_Read", func(ev *Event) bool {
 		return ev.Function == FuncPRRead && contains("served /nss-test")(ev)
 	})
+}
+
+func TestWolfSSL(t *testing.T) {
+	testCClient(t, discover.WolfSSL, "wolfsslclient", FuncWolfSSLWrite, FuncWolfSSLRead, "-lwolfssl")
+}
+
+func TestMbedTLS(t *testing.T) {
+	testCClient(t, discover.MbedTLS, "mbedtlsclient", FuncMbedTLSWrite, FuncMbedTLSRead,
+		"-lmbedtls", "-lmbedx509", "-lmbedcrypto")
+}
+
+// s2n-tls isn't packaged by most distributions; the test runs if it's
+// installed, e.g. built from source into /usr/local.
+func TestS2N(t *testing.T) {
+	testCClient(t, discover.S2N, "s2nclient", FuncS2NSend, FuncS2NRecv, "-ls2n")
+}
+
+// testCClient builds testdata/<name>.c, a client that sends a GET request
+// through the library, and checks that both the request and the response
+// are captured along with the socket's addresses. It skips the test if the
+// library's development files aren't installed.
+func testCClient(t *testing.T, lib discover.Library, name string, write, read Function, ldflags ...string) {
+	t.Helper()
+	requireRoot(t)
+	cc := requireTool(t, "cc")
+	client := filepath.Join(t.TempDir(), name)
+	args := append([]string{"testdata/" + name + ".c", "-o", client}, ldflags...)
+	if out, err := exec.Command(cc, args...).CombinedOutput(); err != nil {
+		if bytes.Contains(out, []byte("No such file or directory")) || bytes.Contains(out, []byte("cannot find -l")) {
+			t.Skipf("%s development files not installed", lib)
+		}
+		t.Fatalf("build %s: %v: %s", name, err, out)
+	}
+
+	events := startTracer(t, Options{Comm: name}, systemTargets(t, lib))
+	srv, port := newServer(t)
+	path := "/" + name
+	if out, err := exec.Command(client, port, path).CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v: %s", name, err, out)
+	}
+	server := srv.Listener.Addr().String()
+	sent := waitFor(t, events, write.String(), func(ev *Event) bool {
+		return ev.Function == write && contains("GET "+path+" HTTP/1.0")(ev)
+	})
+	checkConnection(t, sent, server)
+	received := waitFor(t, events, read.String(), func(ev *Event) bool {
+		return ev.Function == read && contains("served "+path+" ")(ev)
+	})
+	checkConnection(t, received, server)
+	if sent.ConnID != received.ConnID {
+		t.Errorf("request on connection %#x, response on %#x", sent.ConnID, received.ConnID)
+	}
 }
 
 // Without kernel BTF the CO-RE socket lookup is compiled out; everything

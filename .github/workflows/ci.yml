@@ -73,7 +73,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install TLS clients
-        run: sudo apt-get update && sudo apt-get install -y curl python3 gnutls-bin libnss3-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y curl python3 gnutls-bin libnss3-dev libwolfssl-dev libmbedtls-dev pkg-config
       - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
       - name: Run (as root)
         working-directory: internal/tracer

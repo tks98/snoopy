@@ -24,6 +24,9 @@ const (
 	GnuTLS
 	NSS
 	GoTLS
+	WolfSSL
+	MbedTLS
+	S2N
 )
 
 func (l Library) String() string {
@@ -36,6 +39,12 @@ func (l Library) String() string {
 		return "nss"
 	case GoTLS:
 		return "go"
+	case WolfSSL:
+		return "wolfssl"
+	case MbedTLS:
+		return "mbedtls"
+	case S2N:
+		return "s2n"
 	}
 	return "unknown"
 }
@@ -54,7 +63,7 @@ type Target struct {
 }
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
-var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*"}
+var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*"}
 
 // libDirs are searched for system-wide libraries.
 var libDirs = []string{
