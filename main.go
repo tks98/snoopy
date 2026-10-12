@@ -219,7 +219,9 @@ func run(cfg config) error {
 // reportAttach logs the result of attaching to a target and reports whether
 // any function was attached to.
 func reportAttach(cfg config, target discover.Target, funcs []string, err error) bool {
-	if err != nil {
+	// A file reached through /proc/<pid> is gone if the process exited in
+	// the meantime, which short-lived new processes often do.
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		logf("warning: %s %s: %v", target.Library, target.Path, err)
 	}
 	if len(funcs) == 0 {

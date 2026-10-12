@@ -166,7 +166,7 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
-| NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. |
+| NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. Includes the copy bundled with Firefox, also when Firefox starts after snoopy. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
 | Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
 | s2n-tls | `s2n_recv`, `s2n_send` | Data sent with `s2n_sendv` isn't captured. |
@@ -178,6 +178,11 @@ Programs that do their own socket I/O around the TLS library, such as .NET's
 Not supported: rustls, Java, TLS libraries with stripped symbols (such as the
 BoringSSL inside Chrome), QUIC/HTTP/3, and programs that use OpenSSL only
 through its BIO layer (e.g. `openssl s_server -www`).
+
+Browsers use HTTP/3 (QUIC) with many sites, and that traffic doesn't pass
+through the TLS library's read and write functions, so snoopy doesn't see it.
+To see it in Firefox, set `network.http.http3.enable` to `false` in
+`about:config`; Firefox then uses HTTP/2 or HTTP/1.1 over TLS.
 
 ## How it works
 
