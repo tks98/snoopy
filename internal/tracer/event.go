@@ -30,6 +30,8 @@ const (
 	FuncMbedTLSWrite
 	FuncS2NRecv
 	FuncS2NSend
+	FuncRustlsRead
+	FuncRustlsWrite
 )
 
 var functionNames = map[Function]string{
@@ -51,6 +53,8 @@ var functionNames = map[Function]string{
 	FuncMbedTLSWrite: "mbedtls_ssl_write",
 	FuncS2NRecv:      "s2n_recv",
 	FuncS2NSend:      "s2n_send",
+	FuncRustlsRead:   "rustls::Reader::read",
+	FuncRustlsWrite:  "rustls::Writer::write",
 }
 
 func (f Function) String() string {
@@ -77,6 +81,8 @@ func (f Function) Library() discover.Library {
 		return discover.MbedTLS
 	case FuncS2NRecv, FuncS2NSend:
 		return discover.S2N
+	case FuncRustlsRead, FuncRustlsWrite:
+		return discover.Rustls
 	}
 	return 0
 }
@@ -100,7 +106,7 @@ func (d Direction) String() string {
 func (f Function) Direction() Direction {
 	switch f {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
-		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend:
+		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite:
 		return Write
 	}
 	return Read

@@ -168,6 +168,13 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   that started before snoopy only get the old per-call frame summary.
   Missing bytes (truncated captures) are tolerated inside DATA payloads;
   anywhere else, decoding stops for that direction with a note.
+- **rustls** is found by mangled symbol names (v0 and legacy;
+  `inspectRustls`). Its Reader and Writer do no socket I/O, so
+  `rust_threads` remembers, per thread that called them, the last socket
+  syscall (a read's socket is the one just read from) and which Writer is
+  waiting for the next one (which teaches `conn_infos` its socket, so only
+  a connection's first write lacks it). Returns are `io::Result<usize>` in
+  two registers (`RET_RUST_RESULT`).
 
 ## Review findings (all addressed in commit `a35431f`)
 
@@ -189,7 +196,8 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   3 s after the exec. TLS calls made before a new library is attached are
   missed, and libraries a long-running process `dlopen`s more than 3 s after
   its exec aren't picked up.
-- **Not supported:** rustls, Java, stripped BoringSSL (Chrome), QUIC/HTTP/3,
+- **Not supported:** rustls under tokio (hyper, reqwest: `Reader::read` is
+  inlined into tokio-rustls, writes use `write_vectored`), Java, stripped BoringSSL (Chrome), QUIC/HTTP/3,
   apps using OpenSSL only via its BIO layer (`openssl s_server -www`).
 - **No socket details** (fd or addresses) for apps that do their own socket
   I/O around OpenSSL with memory BIOs, e.g. .NET.

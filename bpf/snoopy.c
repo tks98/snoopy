@@ -45,6 +45,8 @@ enum fn_id {
 	FN_MBEDTLS_SSL_WRITE,
 	FN_S2N_RECV,
 	FN_S2N_SEND,
+	FN_RUSTLS_READ,
+	FN_RUSTLS_WRITE,
 };
 
 // How to interpret a function's return value.
@@ -52,6 +54,7 @@ enum ret_kind {
 	RET_INT,     // int: bytes transferred, <= 0 on error
 	RET_SSIZE,   // ssize_t: bytes transferred, < 0 on error
 	RET_BOOL_EX, // 1 on success, byte count written through a size_t*
+	RET_RUST_RESULT, // Rust's io::Result<usize>: Ok (0) or Err, then the byte count
 };
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
@@ -447,12 +450,16 @@ static __always_inline void propagate_fd(__u64 pid_tgid, struct depth_key *dk, _
 // it pairs each return with its own call even when calls nest.
 #if defined(__TARGET_ARCH_x86)
 #define RETURN_TO_ENTRY_SP(sp) ((sp) - 8)
+#define RUST_RESULT_VALUE(ctx) ((ctx)->dx) // second return register
 #elif defined(__TARGET_ARCH_arm64)
 #define RETURN_TO_ENTRY_SP(sp) (sp)
+#define RUST_RESULT_VALUE(ctx) ((ctx)->user_regs.regs[1])
 #endif
 
-static __always_inline int enter_call(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
-				      __u64 len_ptr)
+// enter_call_fd records a call in flight. fd is its socket if already known,
+// or -1; otherwise a syscall made during the call tells.
+static __always_inline int enter_call_fd(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
+					 __u64 len_ptr, __s32 fd)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid))
@@ -465,15 +472,23 @@ static __always_inline int enter_call(struct pt_regs *ctx, __u8 fn, __u8 ret, __
 	call.buf = (__u64)buf;
 	call.len_ptr = len_ptr;
 	call.sp = PT_REGS_SP(ctx);
-	call.fd = -1;
+	call.fd = fd;
 	call.fn = fn;
 	call.ret = ret;
+	if (fd >= 0)
+		track_conn(pid_tgid, conn, fd);
 
 	struct depth_key dk;
 	__builtin_memset(&dk, 0, sizeof(dk));
 	dk.thread = pid_tgid;
 	push_call(&dk, get_depth(&dk), &call);
 	return 0;
+}
+
+static __always_inline int enter_call(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
+				      __u64 len_ptr)
+{
+	return enter_call_fd(ctx, fn, ret, conn, buf, len_ptr, -1);
 }
 
 static __always_inline int exit_call(struct pt_regs *ctx)
@@ -515,6 +530,11 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 		break;
 	case RET_SSIZE:
 		n = (long)PT_REGS_RC(ctx);
+		break;
+	case RET_RUST_RESULT:
+		// The discriminant's upper bits aren't defined if it's narrower than
+		// the register.
+		n = (__u8)PT_REGS_RC(ctx) == 0 ? (__s64)RUST_RESULT_VALUE(ctx) : 0;
 		break;
 	default: {
 		__u64 len = 0;
@@ -569,6 +589,37 @@ static __always_inline int record_fd(__u64 fd)
 	 (id) == 211 /* sendmsg */ || (id) == 212 /* recvmsg */)
 #endif
 
+// Threads that called rustls. rustls's Reader and Writer only move plaintext
+// in and out of the connection's buffers; the socket I/O happens around
+// them on the same thread: a read just before Reader::read, a write just
+// after Writer::write. So for these threads, remember the last socket
+// syscall, and which connection the next one is for.
+struct rust_thread {
+	__u64 want_conn; // a Writer's connection, waiting for its socket
+	__s32 last_fd;
+	__u32 _pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, __u64); // pid_tgid
+	__type(value, struct rust_thread);
+} rust_threads SEC(".maps");
+
+static __always_inline void note_rust_thread_fd(__u64 fd)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct rust_thread *rt = bpf_map_lookup_elem(&rust_threads, &pid_tgid);
+	if (!rt)
+		return;
+	rt->last_fd = (__s32)fd;
+	if (rt->want_conn) {
+		track_conn(pid_tgid, rt->want_conn, (__s32)fd);
+		rt->want_conn = 0;
+	}
+}
+
 // sched:sched_process_exec, raised after a successful execve. It runs in the
 // process itself, which by then has a single thread, so its PID is the TGID.
 SEC("raw_tracepoint/sched_process_exec")
@@ -592,6 +643,7 @@ int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 	__u64 fd = 0;
 	if (bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD(regs)))
 		return 0;
+	note_rust_thread_fd(fd);
 	return record_fd(fd);
 }
 
@@ -719,7 +771,57 @@ int BPF_UPROBE(s2n_send_enter, void *conn, const void *buf)
 	return enter_call(ctx, FN_S2N_SEND, RET_SSIZE, (__u64)conn, buf, 0);
 }
 
-// One return probe serves every C function: the entry probe recorded how
+// rustls.
+// fn <Reader as Read>::read(&mut self, buf: &mut [u8]) -> io::Result<usize>
+// fn <Writer as Write>::write(&mut self, buf: &[u8]) -> io::Result<usize>
+// Both are short-lived wrappers whose first field points into the
+// connection (its plaintext buffer for Reader, the connection for Writer),
+// which serves as the connection's handle.
+
+static __always_inline __u64 rust_conn(const void *self)
+{
+	__u64 conn = 0;
+	bpf_probe_read_user(&conn, sizeof(conn), self);
+	return conn;
+}
+
+static __always_inline struct rust_thread *rust_thread(__u64 pid_tgid)
+{
+	struct rust_thread *rt = bpf_map_lookup_elem(&rust_threads, &pid_tgid);
+	if (rt)
+		return rt;
+	struct rust_thread fresh;
+	__builtin_memset(&fresh, 0, sizeof(fresh));
+	fresh.last_fd = -1;
+	bpf_map_update_elem(&rust_threads, &pid_tgid, &fresh, BPF_NOEXIST);
+	return bpf_map_lookup_elem(&rust_threads, &pid_tgid);
+}
+
+SEC("uprobe/rustls_read")
+int BPF_UPROBE(rustls_read_enter, const void *self, void *buf)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct rust_thread *rt = rust_thread(pid_tgid);
+	__s32 fd = rt ? rt->last_fd : -1;
+	return enter_call_fd(ctx, FN_RUSTLS_READ, RET_RUST_RESULT, rust_conn(self), buf, 0, fd);
+}
+
+SEC("uprobe/rustls_write")
+int BPF_UPROBE(rustls_write_enter, const void *self, const void *buf)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	__u64 conn = rust_conn(self);
+	struct rust_thread *rt = rust_thread(pid_tgid);
+	if (rt)
+		rt->want_conn = conn;
+	return enter_call(ctx, FN_RUSTLS_WRITE, RET_RUST_RESULT, conn, buf, 0);
+}
+
+// One return probe serves every function above: the entry probe recorded how
 // to interpret the return value.
 SEC("uretprobe/tls_return")
 int tls_return(struct pt_regs *ctx)

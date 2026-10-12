@@ -746,3 +746,56 @@ func TestNewProcess(t *testing.T) {
 		t.Errorf("the private libssl in %s wasn't attached to", libDir)
 	}
 }
+
+// TestRustls needs a Rust toolchain, and building the client takes a while,
+// so it only runs with SNOOPY_TEST_RUSTLS=1.
+func TestRustls(t *testing.T) {
+	requireRoot(t)
+	if os.Getenv("SNOOPY_TEST_RUSTLS") != "1" {
+		t.Skip("set SNOOPY_TEST_RUSTLS=1 to build the rustls client with cargo and run this test")
+	}
+	cargo := requireTool(t, "cargo")
+	build := exec.Command(cargo, "build", "--release", "--quiet", "--manifest-path", "testdata/rustlsclient/Cargo.toml")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build rustls client: %v: %s", err, out)
+	}
+	client, err := filepath.Abs("testdata/rustlsclient/target/release/rustlsclient")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := discover.Inspect(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := startTracer(t, Options{Comm: "rustlsclient"}, targets)
+	srv, port := newServer(t)
+	if out, err := exec.Command(client, port, "/rustls").CombinedOutput(); err != nil {
+		t.Fatalf("rustlsclient: %v: %s", err, out)
+	}
+	waitFor(t, events, "Writer::write", func(ev *Event) bool {
+		return ev.Function == FuncRustlsWrite && contains("GET /rustls HTTP/1.0")(ev)
+	})
+	// The client reads into a growing buffer, so the response is spread
+	// over several reads; one thread makes them, so they arrive in order.
+	var reads []*Event
+	var response []byte
+	for deadline := time.Now().Add(20 * time.Second); !bytes.Contains(response, []byte("served /rustls ")); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			events.dump(t)
+			t.Fatalf("response not captured; got %q", response)
+		}
+		reads, response = nil, nil
+		events.mu.Lock()
+		for _, ev := range events.events {
+			if ev.Function == FuncRustlsRead {
+				reads = append(reads, ev)
+				response = append(response, ev.Data...)
+			}
+		}
+		events.mu.Unlock()
+	}
+	// The socket of a read is the one the thread read from just before.
+	for _, ev := range reads {
+		checkConnection(t, ev, srv.Listener.Addr().String())
+	}
+}

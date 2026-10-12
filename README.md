@@ -35,7 +35,8 @@ server: cloudflare
 ## Features
 
 - **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS, wolfSSL,
-  Mbed TLS, s2n-tls and Go's `crypto/tls`, including stripped Go binaries.
+  Mbed TLS, s2n-tls, rustls (synchronous use) and Go's `crypto/tls`,
+  including stripped Go binaries.
 - **Finds what to trace:** system libraries, libraries loaded by running
   processes (including inside containers, and copies that an upgrade has
   since replaced), Go programs, and anything you point it at with `--lib`.
@@ -137,7 +138,7 @@ Each line is one call to a TLS read or write function:
 | Field | Description |
 | --- | --- |
 | `time` | When the call returned. |
-| `function`, `library` | The traced function, e.g. `SSL_read`, and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n` or `go`. |
+| `function`, `library` | The traced function, e.g. `SSL_read`, and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n`, `rustls` or `go`. |
 | `direction` | `read` (received from the peer) or `write` (sent to it). |
 | `process_name`, `pid`, `tid` | The calling process and thread. |
 | `container_id` | The container the process runs in, if any. |
@@ -174,12 +175,13 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
 | Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
 | s2n-tls | `s2n_recv`, `s2n_send` | Data sent with `s2n_sendv` isn't captured. |
+| rustls | `Reader::read`, `Writer::write`, found by their mangled names | Programs that use rustls's reader and writer directly, such as `ureq` or `rustls::Stream`. Needs the program's symbol table, which Cargo keeps by default. Not async stacks built on tokio-rustls (`hyper`, `reqwest`, `axum`): there the read path is inlined and writes are vectored. The first write of each connection has no socket details. |
 | Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64. Works on stripped binaries. |
 
 Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
-Not supported: rustls, Java, TLS libraries with stripped symbols (such as the
+Not supported: rustls under tokio (see above), Java, TLS libraries with stripped symbols (such as the
 BoringSSL inside Chrome), QUIC/HTTP/3, and programs that use OpenSSL only
 through its BIO layer (e.g. `openssl s_server -www`).
 
@@ -223,7 +225,8 @@ make generate     # recompile bpf/snoopy.c after changing it (needs clang 18 and
 The integration tests use whichever of `curl`, `python3`, `gnutls-cli` and the
 NSS, wolfSSL, Mbed TLS and s2n-tls development files (`libnss3-dev`,
 `libwolfssl-dev`, `libmbedtls-dev`; s2n-tls has to be built from source) are
-installed, and skip the rest. CI runs
+installed, and skip the rest. The rustls test builds a client with `cargo`,
+which takes a while, so it only runs with `SNOOPY_TEST_RUSTLS=1`. CI runs
 them on x86_64 and arm64. To run them on an older kernel in a VM, use
 [vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
 Install vimto with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`; a build

@@ -302,3 +302,28 @@ func TestFind(t *testing.T) {
 		t.Errorf("want one warning for a non-TLS --lib, got %v, %v", warnings, err)
 	}
 }
+
+func TestRustlsSymbols(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		read, write bool
+	}{
+		// From a rustls 0.23 build with rustc 1.99 (v0 mangling).
+		{"_RNvXs2_NtNtCs1eO8RepwP5M_6rustls4conn10connectionNtB5_6ReaderNtNtNtCscoGKTY0KSTf_5alloc2io4read4Read4read", true, false},
+		{"_RNvXs5_NtNtCs1eO8RepwP5M_6rustls4conn10connectionNtB5_6WriterNtNtNtCslpfLnFkgLmC_4core2io5write5Write5write", false, true},
+		// Legacy mangling, older rustls and Rust.
+		{"_ZN66_$LT$rustls..conn..connection..Reader$u20$as$u20$std..io..Read$GT$4read17h0123456789abcdefE", true, false},
+		{"_ZN55_$LT$rustls..conn..Writer$u20$as$u20$std..io..Write$GT$5write17h0ee1e61402b1a37cE", false, true},
+		// Other methods and types.
+		{"_ZN66_$LT$rustls..conn..connection..Reader$u20$as$u20$std..io..Read$GT$10read_exact17h0123456789abcdefE", false, false},
+		{"_RNvXs3_NtNtCs1eO8RepwP5M_6rustls4conn10connectionNtB5_6ReaderNtNtCscoGKTY0KSTf_5alloc2io7BufRead8fill_buf", false, false},
+		{"_ZN58_$LT$std..io..buffered..BufReader$u20$as$u20$std..io..Read$GT$4read17h0123456789abcdefE", false, false},
+	} {
+		if got := rustlsRead.MatchString(tc.name); got != tc.read {
+			t.Errorf("read %v for %s", got, tc.name)
+		}
+		if got := rustlsWrite.MatchString(tc.name); got != tc.write {
+			t.Errorf("write %v for %s", got, tc.name)
+		}
+	}
+}

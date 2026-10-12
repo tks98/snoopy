@@ -250,6 +250,8 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 		}
 	case discover.GoTLS:
 		return t.attachGo(ex, target.Go)
+	case discover.Rustls:
+		return t.attachRustls(ex, target.Rust)
 	default:
 		return nil, fmt.Errorf("unsupported library %v", target.Library)
 	}
@@ -276,6 +278,41 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 	}
 	if len(attached) == 0 {
 		return nil, errors.New("none of the expected functions were found")
+	}
+	return attached, nil
+}
+
+// attachRustls attaches to rustls's Reader::read and Writer::write, found by
+// their mangled names, at their file offsets.
+func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]string, error) {
+	if ri == nil {
+		return nil, errors.New("missing rustls function information")
+	}
+	var attached []string
+	for _, p := range []struct {
+		name    string
+		offsets []uint64
+		prog    *ebpf.Program
+	}{
+		{"rustls::Reader::read", ri.Reads, t.objs.RustlsReadEnter},
+		{"rustls::Writer::write", ri.Writes, t.objs.RustlsWriteEnter},
+	} {
+		for _, off := range p.offsets {
+			opts := &link.UprobeOptions{Address: off, PID: t.opts.PID}
+			ret, err := ex.Uretprobe("", t.objs.TlsReturn, opts)
+			if err != nil {
+				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
+			}
+			t.addLink(ret)
+			entry, err := ex.Uprobe("", p.prog, opts)
+			if err != nil {
+				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
+			}
+			t.addLink(entry)
+		}
+		if len(p.offsets) > 0 {
+			attached = append(attached, p.name)
+		}
 	}
 	return attached, nil
 }

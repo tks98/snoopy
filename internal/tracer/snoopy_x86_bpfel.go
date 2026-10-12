@@ -80,6 +80,13 @@ type snoopyEventHeader struct {
 	Pad         [4]uint8
 }
 
+type snoopyRustThread struct {
+	_        structs.HostLayout
+	WantConn uint64
+	LastFd   int32
+	Pad      uint32
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
@@ -90,6 +97,7 @@ const (
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
 	snoopyMapLostEvents             = "lost_events"
+	snoopyMapRustThreads            = "rust_threads"
 	snoopyProgPR_ReadEnter          = "PR_Read_enter"
 	snoopyProgPR_RecvEnter          = "PR_Recv_enter"
 	snoopyProgPR_SendEnter          = "PR_Send_enter"
@@ -101,6 +109,8 @@ const (
 	snoopyProgGoTlsWriteEnter       = "go_tls_write_enter"
 	snoopyProgMbedtlsSslReadEnter   = "mbedtls_ssl_read_enter"
 	snoopyProgMbedtlsSslWriteEnter  = "mbedtls_ssl_write_enter"
+	snoopyProgRustlsReadEnter       = "rustls_read_enter"
+	snoopyProgRustlsWriteEnter      = "rustls_write_enter"
 	snoopyProgS2nRecvEnter          = "s2n_recv_enter"
 	snoopyProgS2nSendEnter          = "s2n_send_enter"
 	snoopyProgSchedProcessExec      = "sched_process_exec"
@@ -173,6 +183,8 @@ type snoopyProgramSpecs struct {
 	GoTlsWriteEnter       *ebpf.ProgramSpec `ebpf:"go_tls_write_enter"`
 	MbedtlsSslReadEnter   *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_read_enter"`
 	MbedtlsSslWriteEnter  *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_write_enter"`
+	RustlsReadEnter       *ebpf.ProgramSpec `ebpf:"rustls_read_enter"`
+	RustlsWriteEnter      *ebpf.ProgramSpec `ebpf:"rustls_write_enter"`
 	S2nRecvEnter          *ebpf.ProgramSpec `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.ProgramSpec `ebpf:"s2n_send_enter"`
 	SchedProcessExec      *ebpf.ProgramSpec `ebpf:"sched_process_exec"`
@@ -196,6 +208,7 @@ type snoopyMapSpecs struct {
 	Events      *ebpf.MapSpec `ebpf:"events"`
 	Execs       *ebpf.MapSpec `ebpf:"execs"`
 	LostEvents  *ebpf.MapSpec `ebpf:"lost_events"`
+	RustThreads *ebpf.MapSpec `ebpf:"rust_threads"`
 }
 
 // snoopyVariableSpecs contains global variables before they are loaded into the kernel.
@@ -236,6 +249,7 @@ type snoopyMaps struct {
 	Events      *ebpf.Map `ebpf:"events"`
 	Execs       *ebpf.Map `ebpf:"execs"`
 	LostEvents  *ebpf.Map `ebpf:"lost_events"`
+	RustThreads *ebpf.Map `ebpf:"rust_threads"`
 }
 
 func (m *snoopyMaps) Close() error {
@@ -246,6 +260,7 @@ func (m *snoopyMaps) Close() error {
 		m.Events,
 		m.Execs,
 		m.LostEvents,
+		m.RustThreads,
 	)
 }
 
@@ -276,6 +291,8 @@ type snoopyPrograms struct {
 	GoTlsWriteEnter       *ebpf.Program `ebpf:"go_tls_write_enter"`
 	MbedtlsSslReadEnter   *ebpf.Program `ebpf:"mbedtls_ssl_read_enter"`
 	MbedtlsSslWriteEnter  *ebpf.Program `ebpf:"mbedtls_ssl_write_enter"`
+	RustlsReadEnter       *ebpf.Program `ebpf:"rustls_read_enter"`
+	RustlsWriteEnter      *ebpf.Program `ebpf:"rustls_write_enter"`
 	S2nRecvEnter          *ebpf.Program `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.Program `ebpf:"s2n_send_enter"`
 	SchedProcessExec      *ebpf.Program `ebpf:"sched_process_exec"`
@@ -302,6 +319,8 @@ func (p *snoopyPrograms) Close() error {
 		p.GoTlsWriteEnter,
 		p.MbedtlsSslReadEnter,
 		p.MbedtlsSslWriteEnter,
+		p.RustlsReadEnter,
+		p.RustlsWriteEnter,
 		p.S2nRecvEnter,
 		p.S2nSendEnter,
 		p.SchedProcessExec,

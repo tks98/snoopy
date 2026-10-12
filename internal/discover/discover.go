@@ -27,6 +27,7 @@ const (
 	WolfSSL
 	MbedTLS
 	S2N
+	Rustls
 )
 
 func (l Library) String() string {
@@ -45,6 +46,8 @@ func (l Library) String() string {
 		return "mbedtls"
 	case S2N:
 		return "s2n"
+	case Rustls:
+		return "rustls"
 	}
 	return "unknown"
 }
@@ -60,6 +63,8 @@ type Target struct {
 	Library Library
 	// Go holds the probe locations for GoTLS targets.
 	Go *GoInfo
+	// Rust holds the probe locations for Rustls targets.
+	Rust *RustInfo
 }
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
