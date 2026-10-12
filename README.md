@@ -24,9 +24,11 @@ Server: BaseHTTP/0.6 Python/3.13.16
 Content-Type: application/json
 Content-Length: 35
 
-00:27:03.800050 curl (pid 5567) SSL_read ← 127.0.0.1:8445  122 bytes  80µs  fd 5, conn 0x55d9efe75f80
-HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_STREAM]
-00000000  00 00 31 01 04 00 00 00  01 88 5f 92 49 7c a5 8a  |..1......._.I|..|
+16:21:30.061843 curl (pid 754998) SSL_read ← 104.20.23.154:443  171 bytes  127µs  fd 5, conn 0xbe9168ce6300
+HTTP/2 HEADERS stream=1 length=162 [END_HEADERS]
+:status: 200
+content-type: text/html; charset=utf-8
+server: cloudflare
 ...
 ```
 
@@ -43,9 +45,9 @@ HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_S
   not as the TLS records sent to the proxy.
 - **Connection details:** process, thread, socket and local and remote
   address for every call, plus the container ID when the process runs in one.
-- **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 frames are
-  summarized and binary data is hex-dumped. With `--json` you get one JSON
-  object per line instead.
+- **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 is shown frame by
+  frame with its headers decoded (HPACK), and binary data is hex-dumped. With
+  `--json` you get one JSON object per line instead.
 - **Wireshark:** `--pcap` writes the plaintext as TCP streams so Wireshark
   can dissect the application protocol.
 - **Single static binary:** the eBPF program is compiled ahead of time and
@@ -147,6 +149,8 @@ Each line is one call to a TLS read or write function:
 | `incomplete` | Set when part of the payload was dropped because the ring buffer was full. |
 | `read_error` | Set when the payload couldn't be read from the process's memory. |
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. |
+| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call) and decoded `headers` (`name`, `value`). Only for connections whose start snoopy saw: HPACK compresses headers against a table built up over the connection. |
+| `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 
 Fields that don't apply are left out.
 

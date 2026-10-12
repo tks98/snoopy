@@ -13,12 +13,13 @@ import (
 // JSON prints one JSON object per line (NDJSON).
 type JSON struct {
 	enc *json.Encoder
+	h2  *http2Conns
 }
 
 func NewJSON(w io.Writer) *JSON {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	return &JSON{enc: enc}
+	return &JSON{enc: enc, h2: newHTTP2Conns()}
 }
 
 // jsonEvent is the documented JSON schema; see README.md.
@@ -45,6 +46,24 @@ type jsonEvent struct {
 	// set when bytes were captured.
 	Data       *string `json:"data,omitempty"`
 	DataBase64 []byte  `json:"data_base64,omitempty"`
+	// The HTTP/2 frames in the data, for connections whose start was seen.
+	HTTP2      []jsonHTTP2Frame `json:"http2,omitempty"`
+	HTTP2Error string           `json:"http2_error,omitempty"`
+}
+
+type jsonHTTP2Frame struct {
+	Type      string       `json:"type"`
+	Stream    uint32       `json:"stream"`
+	Length    int          `json:"length,omitempty"`
+	Flags     []string     `json:"flags,omitempty"`
+	Continued bool         `json:"continued,omitempty"`
+	DataBytes int          `json:"data_bytes,omitempty"`
+	Headers   []jsonHeader `json:"headers,omitempty"`
+}
+
+type jsonHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 func (j *JSON) Print(ev *tracer.Event) error {
@@ -82,6 +101,15 @@ func (j *JSON) Print(ev *tracer.Event) error {
 		} else {
 			out.DataBase64 = ev.Data
 		}
+	}
+	frames, _, note := j.h2.process(ev)
+	out.HTTP2Error = note
+	for _, f := range frames {
+		jf := jsonHTTP2Frame{Type: f.Type, Stream: f.Stream, Length: f.Length, Flags: f.Flags, Continued: f.Continued, DataBytes: len(f.Data)}
+		for _, h := range f.Headers {
+			jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
+		}
+		out.HTTP2 = append(out.HTTP2, jf)
 	}
 	return j.enc.Encode(out)
 }

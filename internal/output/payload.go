@@ -183,6 +183,14 @@ func validHTTP2Frame(typ, flags byte, length int, stream uint32) bool {
 }
 
 func http2Flags(typ, flags byte) string {
+	names := http2FlagNames(typ, flags)
+	if len(names) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(names, ",") + "]"
+}
+
+func http2FlagNames(typ, flags byte) []string {
 	var names []string
 	add := func(bit byte, name string) {
 		if flags&bit != 0 {
@@ -200,8 +208,5 @@ func http2Flags(typ, flags byte) string {
 	case 9: // CONTINUATION
 		add(0x4, "END_HEADERS")
 	}
-	if len(names) == 0 {
-		return ""
-	}
-	return "[" + strings.Join(names, ",") + "]"
+	return names
 }

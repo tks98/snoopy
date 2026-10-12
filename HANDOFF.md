@@ -90,7 +90,7 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 | `internal/tracer/event.go` | `Event`, `Function` (must match `enum fn_id` in C; a test checks) |
 | `internal/discover/` | Finds targets: system libs, `/proc/*/maps`, deleted files, Go binaries, RET offsets, prologue check |
 | `internal/procinfo/` | Container ID from cgroups; `/proc` socket lookup (fallback when there's no BTF) |
-| `internal/output/` | Text (HTTP/1 pretty-print, HTTP/2 frame summary, hexdump), NDJSON, pcap writer |
+| `internal/output/` | Text (HTTP/1 pretty-print, HTTP/2 frames with HPACK-decoded headers, hexdump), NDJSON, pcap writer |
 | `main.go` | CLI flags and wiring |
 | `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86, arm64, 5 kernels) |
 | `.github/workflows/release.yml`, `.goreleaser.yaml` | Releases on `v*` tags |
@@ -162,6 +162,12 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 - **pcap:** streams are keyed by 4-tuple. If both ends are traced, only the
   first endpoint seen is written. Synthetic ports are handed out sequentially,
   and the least recently used of 16384 streams is evicted.
+- **HTTP/2** (`internal/output/http2.go`) is decoded per (pid, connection,
+  direction) from the connection preface on, as a byte stream: frames can
+  span calls. HPACK's table is built up over the connection, so connections
+  that started before snoopy only get the old per-call frame summary.
+  Missing bytes (truncated captures) are tolerated inside DATA payloads;
+  anywhere else, decoding stops for that direction with a note.
 
 ## Review findings (all addressed in commit `a35431f`)
 
@@ -199,7 +205,6 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   - An `--sslkeylog` mode.
   - A flag for the ring buffer size (`tracer.Options.RingBufferSize` exists,
     but there's no CLI flag).
-  - HPACK decoding for HTTP/2 headers.
 - **Possible cleanup:** `internal/discover`'s cgo-fixture test tries to build
   for linux with `cc` when one exists, so it fails if ever run on macOS.
   Skip it unless `runtime.GOOS == "linux"`.
