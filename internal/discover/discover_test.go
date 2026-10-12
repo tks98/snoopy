@@ -130,21 +130,39 @@ func TestPclntabMatchesSymtab(t *testing.T) {
 	}
 }
 
-func TestCheckGoPrologue(t *testing.T) {
-	// LEA R12, [RSP-0x58]; CMP R12, [R14+0x10]
-	if err := checkGoPrologue(elf.EM_X86_64, []byte{0x4c, 0x8d, 0x64, 0x24, 0xa8, 0x4d, 0x3b, 0x66, 0x10}); err != nil {
-		t.Errorf("x86 prologue rejected: %v", err)
-	}
-	// MOVD 16(R28), R16
-	if err := checkGoPrologue(elf.EM_AARCH64, le32(0xf9400b90)); err != nil {
-		t.Errorf("arm64 prologue rejected: %v", err)
-	}
-	// Mid-function code: MOV RDX, [RSP+0x80]; NOP
-	if err := checkGoPrologue(elf.EM_X86_64, []byte{0x48, 0x8b, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00, 0x90}); err == nil {
-		t.Error("x86: accepted code that isn't a function start")
-	}
-	if err := checkGoPrologue(elf.EM_AARCH64, le32(0xd503201f)); err == nil {
-		t.Error("arm64: accepted code that isn't a function start")
+func TestGoBodyOffset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		machine elf.Machine
+		code    []byte
+		want    uint64 // 0: must be rejected
+	}{
+		// CMP RSP, [R14+0x10]; JBE; PUSH RBP
+		{"x86", elf.EM_X86_64, []byte{0x49, 0x3b, 0x66, 0x10, 0x0f, 0x86, 0x7a, 0x03, 0x00, 0x00, 0x55}, 10},
+		// LEA R12, [RSP-0x48]; CMP R12, [R14+0x10]; JBE; PUSH RBP
+		{"x86 large frame", elf.EM_X86_64, []byte{0x4c, 0x8d, 0x64, 0x24, 0xb8, 0x4d, 0x3b, 0x66, 0x10, 0x0f, 0x86, 0x93, 0x07, 0x00, 0x00, 0x55}, 15},
+		// MOVD 16(R28), R16; CMP R16, RSP; BLS; MOVD.W R30, -112(RSP)
+		{"arm64", elf.EM_AARCH64, le32(0xf9400b90, 0xeb3063ff, 0x54001909, 0xf8190ffe), 12},
+		// MOVD 16(R28), R16; SUB $80, RSP, R17; CMP R16, R17; BLS
+		{"arm64 large frame", elf.EM_AARCH64, le32(0xf9400b90, 0xd10143f1, 0xeb10023f, 0x540033c9), 16},
+		// Mid-function code: MOV RDX, [RSP+0x80]; NOP
+		{"x86 mid-function", elf.EM_X86_64, []byte{0x48, 0x8b, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00, 0x90}, 0},
+		// CMP RSP, [R14+0x10] without the branch
+		{"x86 no branch", elf.EM_X86_64, []byte{0x49, 0x3b, 0x66, 0x10, 0x90}, 0},
+		// NOP
+		{"arm64 mid-function", elf.EM_AARCH64, le32(0xd503201f), 0},
+		// MOVD 16(R28), R16; CMP R16, RSP; NOP
+		{"arm64 no branch", elf.EM_AARCH64, le32(0xf9400b90, 0xeb3063ff, 0xd503201f), 0},
+	} {
+		got, err := goBodyOffset(tc.machine, tc.code)
+		switch {
+		case tc.want == 0 && err == nil:
+			t.Errorf("%s: accepted code that doesn't start with a stack check", tc.name)
+		case tc.want != 0 && err != nil:
+			t.Errorf("%s: %v", tc.name, err)
+		case got != tc.want:
+			t.Errorf("%s: body at %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -187,6 +205,9 @@ func TestFindGoFunc(t *testing.T) {
 				}
 				if len(fn.Returns) == 0 {
 					t.Fatalf("%s: no returns", name)
+				}
+				if fn.Body == 0 || fn.Body > 16 {
+					t.Errorf("%s: stack check ends at %d", name, fn.Body)
 				}
 				// The offsets are file offsets: check the bytes there.
 				for _, r := range fn.Returns {

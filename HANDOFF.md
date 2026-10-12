@@ -14,7 +14,8 @@ automation, and fixes 8 issues found in an independent review.
 | Unit tests, lint, amd64 and arm64 builds | Green in CI |
 | Committed BPF objects match `bpf/snoopy.c` | Green in CI |
 | Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI (run #3) |
-| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | All five pass locally (QEMU without KVM), after fixing a test race that showed on 6.12. Red in CI run #3 only because vimto needs a static test binary, fixed in `9015ae7` (`CGO_ENABLED=0`). **Check that the CI run for the latest commit is green.** |
+| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | Red in CI through `7f1ea93` because vimto itself was built with cgo, so it refused to run (`9015ae7` had made the *test* binary static, which wasn't the problem). Fixed by installing vimto with `CGO_ENABLED=0`. Locally (amd64 container, QEMU without KVM) all five pass after the morestack fix below. **Check that the CI run for the latest commit is green.** |
+| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04, OpenSSL 3.5.5, curl 8.18) | Pass natively in a Parallels VM. |
 
 ### To do first
 
@@ -109,6 +110,12 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
     Go matches by depth. Go uses uprobes on every `RET` instruction (found by
     disassembly in `internal/discover/inspect.go`), never uretprobes, which
     corrupt Go stacks.
+  - **Go entry probes go after the stack check**, not on the first
+    instruction (`GoFunc.Body`). When the stack has to grow,
+    `runtime.morestack` restarts the function from the top, so a probe on
+    the first instruction saw one call twice. Depth matching then paired an
+    outer Read's arguments with the inner Read's result in TLS over TLS
+    (flaky `TestNestedGo`; `TestGoStackGrowth` reproduces it every time).
 - **Verifier constraints, all learned the hard way:**
   - **Zero every struct passed to a helper** (`__builtin_memset`). Kernels
     without a backport of 6.3's relaxed checks (e.g. 5.10.100) reject
@@ -198,9 +205,15 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 
 ## Things learned about the environment
 
-- `go test -c` with cgo enabled gives a dynamically linked binary;
-  vimto's `exec` needs a static one, hence `CGO_ENABLED=0` in CI and the
-  Makefile.
+- vimto refuses to run unless it was itself built without cgo: install it
+  with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`. The test binary is
+  also built with `CGO_ENABLED=0` in CI and the Makefile.
+- vimto picks the QEMU binary and kernel image from its own GOARCH. To run
+  CI's x86_64 kernels on Apple Silicon, run it in an amd64 container
+  (`docker run --platform linux/amd64 ubuntu:24.04`, then
+  `VIMTO_DISABLE_KVM=true`); about 1.5 to 2.5 minutes per kernel.
+- curl 8.18 writes the request headers and the start of the body in one
+  `SSL_write`; `TestOpenSSLLargePayload` used to assume separate writes.
 - The ring buffer doesn't guarantee events from different CPUs arrive in
   call order. Integration tests use `eventLog`, so waits are order-independent.
   An earlier version flaked on 6.12.

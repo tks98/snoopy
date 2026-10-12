@@ -19,7 +19,7 @@ integration: ## Run the eBPF integration tests (uses sudo)
 	go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
 	cd internal/tracer && sudo ./tracer.test -test.v
 
-integration-vm: ## Run the integration tests on another kernel, e.g. KERNEL=5.10 (needs vimto and QEMU)
+integration-vm: ## Run the integration tests on another kernel, e.g. KERNEL=5.10 (needs QEMU and vimto, installed with CGO_ENABLED=0)
 	CGO_ENABLED=0 go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
 	cd internal/tracer && vimto -kernel :$(KERNEL) exec -- ./tracer.test -test.v
 

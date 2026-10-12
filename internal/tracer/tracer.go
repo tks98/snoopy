@@ -286,9 +286,14 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, e
 			}
 			t.links = append(t.links, l)
 		}
-		l, err := ex.Uprobe("", fn.prog, &link.UprobeOptions{Address: fn.f.Offset, PID: t.opts.PID})
+		// The entry probe goes after the stack check: when the stack has to
+		// grow, runtime.morestack restarts the function from the top, and a
+		// probe on the first instruction would see the call twice.
+		l, err := ex.Uprobe("", fn.prog, &link.UprobeOptions{
+			Address: fn.f.Offset, Offset: fn.f.Body, PID: t.opts.PID,
+		})
 		if err != nil {
-			return attached, fmt.Errorf("%s: %w", fn.name, err)
+			return attached, fmt.Errorf("%s+%#x: %w", fn.name, fn.f.Body, err)
 		}
 		t.links = append(t.links, l)
 		attached = append(attached, fn.name)

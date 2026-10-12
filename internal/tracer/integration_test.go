@@ -79,6 +79,22 @@ func (l *eventLog) find(match func(*Event) bool) *Event {
 	return nil
 }
 
+// dump logs every event received so far, to show what arrived instead.
+func (l *eventLog) dump(t *testing.T) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	t.Logf("%d events received:", len(l.events))
+	for _, ev := range l.events {
+		data := ev.Data
+		if len(data) > 64 {
+			data = data[:64]
+		}
+		t.Logf("  %v pid=%d tid=%d conn=%#x fd=%d size=%d incomplete=%v %q",
+			ev.Function, ev.PID, ev.TID, ev.ConnID, ev.FD, ev.Size, ev.Incomplete, data)
+	}
+}
+
 // startTracer attaches to the given library kinds and collects events.
 func startTracer(t *testing.T, opts Options, targets []discover.Target) *eventLog {
 	t.Helper()
@@ -143,6 +159,7 @@ func waitFor(t *testing.T, events *eventLog, desc string, match func(*Event) boo
 		case <-events.added:
 		case <-time.After(100 * time.Millisecond):
 		case <-timeout:
+			events.dump(t)
 			t.Fatalf("timed out waiting for %s", desc)
 		}
 	}
@@ -246,25 +263,27 @@ func TestOpenSSLLargePayload(t *testing.T) {
 		t.Fatalf("curl: %v: %s", err, out)
 	}
 
-	// curl sends the body in several SSL_write calls of up to 64 KiB, each
+	// curl sends the request in several writes of up to 64 KiB, each
 	// captured as multiple ring buffer chunks. One thread makes them, so
-	// they arrive in order.
-	var got []byte
+	// they arrive in order. Newer curl versions (8.18) put the headers and
+	// the start of the body in the same write.
+	var stream, got []byte
 	deadline := time.Now().Add(20 * time.Second)
 	for len(got) < len(body) && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
-		got = got[:0]
+		stream = stream[:0]
 		events.mu.Lock()
 		for _, ev := range events.events {
-			if ev.Function != FuncSSLWrite || bytes.HasPrefix(ev.Data, []byte("POST ")) {
+			if ev.Function != FuncSSLWrite && ev.Function != FuncSSLWriteEx {
 				continue
 			}
 			if ev.Truncated() || ev.Incomplete {
 				t.Errorf("partial capture: size %d, captured %d, incomplete %v", ev.Size, len(ev.Data), ev.Incomplete)
 			}
-			got = append(got, ev.Data...)
+			stream = append(stream, ev.Data...)
 		}
 		events.mu.Unlock()
+		_, got, _ = bytes.Cut(stream, []byte("\r\n\r\n"))
 	}
 	if !bytes.Equal(got, body) {
 		t.Fatalf("captured %d bytes that differ from the %d sent", len(got), len(body))
@@ -444,6 +463,110 @@ func TestNestedGo(t *testing.T) {
 	waitFor(t, events, "tunneled read", func(ev *Event) bool {
 		return ev.Function == FuncGoRead && contains("served /nested-go")(ev) && ev.PID == write.PID && ev.ConnID == write.ConnID
 	})
+}
+
+// When a Go function's stack check fails, runtime.morestack grows the stack
+// and restarts the function from its first instruction. With TLS over TLS,
+// an outer Read seen twice left a call behind that was then paired with the
+// inner Read's return. Read from fresh goroutines at increasing stack depths,
+// so that for some reads the outer Read is the call that grows the stack.
+func TestGoStackGrowth(t *testing.T) {
+	requireRoot(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := discover.Inspect(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := startTracer(t, Options{PID: os.Getpid()}, targets)
+
+	srv, _ := newServer(t)
+	host := srv.Listener.Addr().String()
+	outer, err := tls.Dial("tcp", newHTTPSProxy(t, srv.TLS), &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outer.Close()
+	fmt.Fprintf(outer, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host)
+	resp, err := http.ReadResponse(bufio.NewReader(outer), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT: %s", resp.Status)
+	}
+	inner := tls.Client(outer, &tls.Config{InsecureSkipVerify: true})
+	defer inner.Close()
+
+	const rounds = 512 // about 16 KiB of stack in steps smaller than a frame of the read path
+	buf := make([]byte, 4096)
+	for i := range rounds {
+		path := fmt.Sprintf("/stack-%d", i)
+		if _, err := fmt.Fprintf(inner, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error)
+		go atDepth(i, func() {
+			var got []byte
+			for !bytes.Contains(got, []byte("served "+path+" ")) {
+				n, err := inner.Read(buf)
+				if err != nil {
+					done <- err
+					return
+				}
+				got = append(got, buf[:n]...)
+			}
+			done <- nil
+		})
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write := waitFor(t, events, "tunneled write", func(ev *Event) bool {
+		return ev.Function == FuncGoWrite && contains("GET /stack-0 HTTP/1.1")(ev)
+	})
+	// Every response must show up as a read on the tunneled connection.
+	var missing []int
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		missing = missing[:0]
+		for i := range rounds {
+			served := contains(fmt.Sprintf("served /stack-%d ", i))
+			if events.find(func(ev *Event) bool {
+				return ev.Function == FuncGoRead && ev.ConnID == write.ConnID && served(ev)
+			}) == nil {
+				missing = append(missing, i)
+			}
+		}
+		if len(missing) == 0 || time.Now().After(deadline) {
+			break
+		}
+	}
+	if len(missing) > 0 {
+		served := contains(fmt.Sprintf("served /stack-%d ", missing[0]))
+		events.mu.Lock()
+		for _, ev := range events.events {
+			if ev.Function == FuncGoRead && served(ev) {
+				t.Logf("round %d: %v conn=%#x size=%d %q", missing[0], ev.Function, ev.ConnID, ev.Size, ev.Data)
+			}
+		}
+		events.mu.Unlock()
+		t.Errorf("%d of %d tunneled reads not reported on the tunneled connection (conn=%#x), e.g. round %d",
+			len(missing), rounds, write.ConnID, missing[0])
+	}
+}
+
+// atDepth calls f with n more stack frames in use.
+//
+//go:noinline
+func atDepth(n int, f func()) {
+	if n > 0 {
+		atDepth(n-1, f)
+		return
+	}
+	f()
 }
 
 func TestNestedOpenSSL(t *testing.T) {

@@ -45,6 +45,7 @@ type GoInfo struct {
 // GoFunc locates one Go function inside an executable.
 type GoFunc struct {
 	Offset  uint64   // file offset of the function's first instruction
+	Body    uint64   // offset of the first instruction after the stack check, relative to Offset
 	Returns []uint64 // offsets of its RET instructions, relative to Offset
 }
 
@@ -177,7 +178,8 @@ func FindGoFunc(f *elf.File, name string) (GoFunc, error) {
 	}
 	// A probe in the wrong place would corrupt the traced program, so make
 	// sure this really is the start of a Go function.
-	if err := checkGoPrologue(f.Machine, code); err != nil {
+	body, err := goBodyOffset(f.Machine, code)
+	if err != nil {
 		return GoFunc{}, fmt.Errorf("%s at %#x: %w", name, start, err)
 	}
 
@@ -189,7 +191,7 @@ func FindGoFunc(f *elf.File, name string) (GoFunc, error) {
 	if err != nil {
 		return GoFunc{}, err
 	}
-	return GoFunc{Offset: off, Returns: rets}, nil
+	return GoFunc{Offset: off, Body: body, Returns: rets}, nil
 }
 
 func goFuncBounds(f *elf.File, name string) (start, end uint64, err error) {
@@ -260,34 +262,55 @@ func pclntabTextStart(pclntab []byte) (uint64, bool) {
 	return binary.LittleEndian.Uint64(pclntab[off:]), true
 }
 
-// checkGoPrologue verifies that code starts like a Go function that checks
-// for stack growth, comparing the stack pointer to g.stackguard0 (16 bytes
-// into the g, which lives in R14 on amd64 and R28 on arm64).
-func checkGoPrologue(machine elf.Machine, code []byte) error {
+// goBodyOffset verifies that code starts like a Go function that checks for
+// stack growth, comparing the stack pointer to g.stackguard0 (16 bytes into
+// the g, which lives in R14 on amd64 and R28 on arm64) and branching to
+// runtime.morestack. It returns the offset of the instruction after that
+// branch. morestack grows the stack and restarts the function from its first
+// instruction, so a probe there can fire twice for one call; after the
+// branch, it fires once.
+func goBodyOffset(machine elf.Machine, code []byte) (uint64, error) {
 	switch machine {
 	case elf.EM_X86_64:
-		// CMP RSP, [R14+16], possibly after LEA R12, [RSP-framesize].
-		for off, i := 0, 0; i < 2 && off < len(code); i++ {
+		// [LEA R12, [RSP-framesize]]; CMP RSP or R12, [R14+16]; JBE morestack
+		sawCheck := false
+		for off, i := 0, 0; i < 3 && off < len(code); i++ {
 			inst, err := x86asm.Decode(code[off:], 64)
 			if err != nil {
 				break
 			}
+			off += inst.Len
+			if sawCheck {
+				if inst.Op == x86asm.JBE {
+					return uint64(off), nil
+				}
+				break
+			}
 			for _, arg := range inst.Args {
 				if m, ok := arg.(x86asm.Mem); ok && inst.Op == x86asm.CMP && m.Base == x86asm.R14 && m.Disp == 16 {
-					return nil
+					sawCheck = true
 				}
 			}
-			off += inst.Len
 		}
 	case elf.EM_AARCH64:
-		// MOVD 16(R28), R16
-		if len(code) >= 4 {
-			if inst, err := arm64asm.Decode(code[:4]); err == nil && strings.HasSuffix(inst.String(), "[X28,#16]") {
-				return nil
+		// MOVD 16(R28), R16; [SUB $framesize, RSP, R17]; CMP R16, RSP or R17; BLS morestack
+		if len(code) < 4 {
+			break
+		}
+		if inst, err := arm64asm.Decode(code[:4]); err != nil || !strings.HasSuffix(inst.String(), "[X28,#16]") {
+			break
+		}
+		for off := 4; off < 16 && off+4 <= len(code); off += 4 {
+			inst, err := arm64asm.Decode(code[off : off+4])
+			if err != nil {
+				break
+			}
+			if c, ok := inst.Args[0].(arm64asm.Cond); ok && inst.Op == arm64asm.B && c.Value == 9 /* LS */ && !c.Invert {
+				return uint64(off + 4), nil
 			}
 		}
 	}
-	return errors.New("doesn't start with a Go stack check; not attaching")
+	return 0, errors.New("doesn't start with a Go stack check; not attaching")
 }
 
 // FindReturns returns the offsets of the return instructions in code.

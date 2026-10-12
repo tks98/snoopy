@@ -206,6 +206,8 @@ The integration tests use whichever of `curl`, `python3`, `gnutls-cli` and the
 NSS development files (`libnss3-dev`) are installed, and skip the rest. CI runs
 them on x86_64 and arm64, and on older kernels in VMs with
 [vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
+Install vimto with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`; a build
+with cgo refuses to run.
 
 To release, push a tag like `v2.0.0`. GoReleaser builds and publishes the
 binaries.
