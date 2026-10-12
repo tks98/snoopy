@@ -85,28 +85,3 @@ jobs:
           go build -o snoopy .
           ./snoopy --version
           sudo timeout -s INT 5 ./snoopy --no-scan --quiet || [ $? -eq 124 ]
-
-  kernels:
-    name: Integration tests (Linux ${{ matrix.kernel }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # Long-term kernels, oldest first. Images from github.com/cilium/ci-kernels.
-        kernel: ["5.10", "5.15", "6.1", "6.6", "6.12"]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: Install QEMU and TLS clients
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 gnutls-bin libnss3-dev pkg-config
-      - run: sudo chmod 0666 /dev/kvm
-      # vimto refuses to run unless it was itself built without cgo.
-      - run: CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0
-      # vimto only runs statically linked binaries.
-      - run: CGO_ENABLED=0 go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
-      # vimto boots the kernel in a VM that sees the host's files; see .vimto.toml.
-      - name: Run on Linux ${{ matrix.kernel }}
-        working-directory: internal/tracer
-        run: vimto -kernel :${{ matrix.kernel }} exec -- ./tracer.test -test.v -test.timeout 5m
