@@ -19,13 +19,14 @@ func TestMappedLibraries(t *testing.T) {
 	defer f.Close()
 
 	got := MappedLibraries(f)
-	want := []string{
-		"/usr/lib/x86_64-linux-gnu/libssl.so.3",
-		"/usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1",
-		"/opt/my app/lib/libnspr4.so",
+	want := []Mapping{
+		{"/usr/lib/x86_64-linux-gnu/libssl.so.3", "7f3e1d200000-7f3e1d222000", false},
+		{"/usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1", "7f3e1d400000-7f3e1d5c0000", false},
+		{"/opt/my app/lib/libnspr4.so", "7f3e1d600000-7f3e1d640000", false},
+		{"/tmp/libssl.so.1.1", "7f3e1d800000-7f3e1d840000", true},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("got %q\nwant %q", got, want)
+		t.Errorf("got %+v\nwant %+v", got, want)
 	}
 }
 
@@ -70,20 +71,81 @@ func le32(words ...uint32) []byte {
 // buildGoFixture compiles testdata/gotls for the given architecture.
 func buildGoFixture(t *testing.T, goarch string, strip bool) string {
 	t.Helper()
+	ldflags := ""
+	if strip {
+		ldflags = "-s -w"
+	}
+	return buildFixture(t, "./testdata/gotls", ldflags, "GOARCH="+goarch, "CGO_ENABLED=0")
+}
+
+func buildFixture(t *testing.T, pkg, ldflags string, env ...string) string {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("builds a Go program")
 	}
-	out := filepath.Join(t.TempDir(), "gotls-"+goarch)
-	args := []string{"build", "-o", out}
-	if strip {
-		args = append(args, "-ldflags=-s -w")
-	}
-	cmd := exec.Command("go", append(args, "./testdata/gotls")...)
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
+	out := filepath.Join(t.TempDir(), "fixture")
+	cmd := exec.Command("go", "build", "-o", out, "-ldflags="+ldflags, pkg)
+	cmd.Env = append(append(os.Environ(), "GOOS=linux"), env...)
 	if msg, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, msg)
 	}
 	return out
+}
+
+// Stripped binaries are located through .gopclntab. It must agree with the
+// symbol table, also for cgo programs, whose C code precedes Go's in .text.
+func TestPclntabMatchesSymtab(t *testing.T) {
+	builds := map[string]func(t *testing.T) string{
+		"amd64": func(t *testing.T) string { return buildGoFixture(t, "amd64", false) },
+		"arm64": func(t *testing.T) string { return buildGoFixture(t, "arm64", false) },
+		"cgo-external": func(t *testing.T) string {
+			if _, err := exec.LookPath("cc"); err != nil {
+				t.Skip("no C compiler")
+			}
+			return buildFixture(t, "./testdata/gotlscgo", "-linkmode=external", "CGO_ENABLED=1")
+		},
+	}
+	for name, build := range builds {
+		t.Run(name, func(t *testing.T) {
+			f, err := elf.Open(build(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			for _, fn := range []string{goReadFunc, goWriteFunc} {
+				s1, e1, err := symtabBounds(f, fn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s2, e2, err := pclntabBounds(f, fn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// pclntab's end includes the alignment padding after the function.
+				if s1 != s2 || e2 < e1 || e2-e1 >= 32 {
+					t.Errorf("%s: symtab [%#x, %#x), pclntab [%#x, %#x)", fn, s1, e1, s2, e2)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckGoPrologue(t *testing.T) {
+	// LEA R12, [RSP-0x58]; CMP R12, [R14+0x10]
+	if err := checkGoPrologue(elf.EM_X86_64, []byte{0x4c, 0x8d, 0x64, 0x24, 0xa8, 0x4d, 0x3b, 0x66, 0x10}); err != nil {
+		t.Errorf("x86 prologue rejected: %v", err)
+	}
+	// MOVD 16(R28), R16
+	if err := checkGoPrologue(elf.EM_AARCH64, le32(0xf9400b90)); err != nil {
+		t.Errorf("arm64 prologue rejected: %v", err)
+	}
+	// Mid-function code: MOV RDX, [RSP+0x80]; NOP
+	if err := checkGoPrologue(elf.EM_X86_64, []byte{0x48, 0x8b, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00, 0x90}); err == nil {
+		t.Error("x86: accepted code that isn't a function start")
+	}
+	if err := checkGoPrologue(elf.EM_AARCH64, le32(0xd503201f)); err == nil {
+		t.Error("arm64: accepted code that isn't a function start")
+	}
 }
 
 func TestFindGoFunc(t *testing.T) {

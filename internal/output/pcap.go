@@ -22,10 +22,15 @@ import (
 // them as missing. If both ends of a connection are traced, only the first
 // one seen is written, as the other sees the same bytes.
 type Pcap struct {
-	w       *bufio.Writer
-	streams map[streamKey]*tcpStream
-	ipID    uint16
+	w        *bufio.Writer
+	streams  map[streamKey]*tcpStream
+	ipID     uint16
+	nextPort uint16 // for connections without known addresses
 }
+
+// maxStreams bounds the connections Pcap remembers; it doesn't see them
+// close, so the least recently used one is ended when the limit is reached.
+const maxStreams = 16384
 
 // streamKey identifies a TCP connection by its endpoints (lowest first), or,
 // if the addresses are unknown, by the process and TLS connection.
@@ -44,6 +49,7 @@ type tcpStream struct {
 	owner               owner
 	local, remote       netip.AddrPort
 	localSeq, remoteSeq uint32
+	lastSeen            time.Time
 }
 
 const (
@@ -85,6 +91,9 @@ func (p *Pcap) Print(ev *tracer.Event) error {
 	}
 	s := p.streams[key]
 	if s == nil {
+		if len(p.streams) >= maxStreams {
+			p.evictOldest(ev.Time)
+		}
 		s = p.newStream(ev)
 		p.streams[key] = s
 		p.handshake(s, ev.Time)
@@ -92,6 +101,7 @@ func (p *Pcap) Print(ev *tracer.Event) error {
 	if s.owner != (owner{ev.PID, ev.ConnID}) {
 		return nil // the other end of a connection we already write
 	}
+	s.lastSeen = ev.Time
 
 	src, dst := s.local, s.remote
 	seq, ack := &s.localSeq, &s.remoteSeq
@@ -133,12 +143,34 @@ func (p *Pcap) newStream(ev *tracer.Event) *tcpStream {
 		remote:    ev.Remote,
 		localSeq:  sum,
 		remoteSeq: sum * 31,
+		lastSeen:  ev.Time,
 	}
 	if !hasAddresses(ev) {
-		s.local = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(10000+sum%50000))
+		// Hand out local ports in turn, so concurrent connections don't
+		// end up with the same addresses.
+		if p.nextPort < 10000 {
+			p.nextPort = 10000
+		}
+		s.local = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), p.nextPort)
 		s.remote = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 2}), 443)
+		p.nextPort++
 	}
 	return s
+}
+
+// evictOldest ends the least recently used stream.
+func (p *Pcap) evictOldest(now time.Time) {
+	var oldestKey streamKey
+	var oldest *tcpStream
+	for k, s := range p.streams {
+		if oldest == nil || s.lastSeen.Before(oldest.lastSeen) {
+			oldestKey, oldest = k, s
+		}
+	}
+	if oldest != nil {
+		p.packet(now, oldest.local, oldest.remote, oldest.localSeq, oldest.remoteSeq, tcpFIN|tcpACK, nil)
+		delete(p.streams, oldestKey)
+	}
 }
 
 func hasAddresses(ev *tracer.Event) bool {

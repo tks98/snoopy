@@ -19,10 +19,19 @@ type snoopyActiveCall struct {
 	Conn    uint64
 	Buf     uint64
 	LenPtr  uint64
+	Sp      uint64
 	Fd      int32
 	Fn      uint8
 	Ret     uint8
-	_       [2]byte
+	Pad     [2]uint8
+}
+
+type snoopyCallKey struct {
+	_      structs.HostLayout
+	Thread uint64
+	G      uint64
+	Depth  uint32
+	Pad    uint32
 }
 
 type snoopyConnInfo struct {
@@ -33,7 +42,7 @@ type snoopyConnInfo struct {
 	Rport  uint16
 	Laddr  [16]uint8
 	Raddr  [16]uint8
-	_      [2]byte
+	Pad    [2]uint8
 }
 
 type snoopyConnKey struct {
@@ -42,7 +51,13 @@ type snoopyConnKey struct {
 	Conn uint64
 }
 
-type snoopyEvent struct {
+type snoopyDepthKey struct {
+	_      structs.HostLayout
+	Thread uint64
+	G      uint64
+}
+
+type snoopyEventHeader struct {
 	_           structs.HostLayout
 	TimestampNs uint64
 	LatencyNs   uint64
@@ -62,14 +77,7 @@ type snoopyEvent struct {
 	Laddr       [16]uint8
 	Raddr       [16]uint8
 	Comm        [16]int8
-	Data        [16384]uint8
-	_           [4]byte
-}
-
-type snoopyGoKey struct {
-	_    structs.HostLayout
-	Tgid uint64
-	G    uint64
+	Pad         [4]uint8
 }
 
 // Names of all BPF objects in the ELF.
@@ -77,11 +85,10 @@ type snoopyGoKey struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	snoopyMapActiveCalls            = "active_calls"
+	snoopyMapCallDepth              = "call_depth"
 	snoopyMapConnInfos              = "conn_infos"
 	snoopyMapEvents                 = "events"
-	snoopyMapGoActiveCalls          = "go_active_calls"
 	snoopyMapLostEvents             = "lost_events"
-	snoopyMapScratch                = "scratch"
 	snoopyProgPR_ReadEnter          = "PR_Read_enter"
 	snoopyProgPR_RecvEnter          = "PR_Recv_enter"
 	snoopyProgPR_SendEnter          = "PR_Send_enter"
@@ -98,11 +105,11 @@ const (
 	snoopyProgSysEnter              = "sys_enter"
 	snoopyProgTlsReturn             = "tls_return"
 	snoopyVarFilterComm             = "filter_comm"
+	snoopyVarHaveBtf                = "have_btf"
 	snoopyVarMaxCapture             = "max_capture"
-	snoopyVarResolveAddrs           = "resolve_addrs"
 	snoopyVarTargComm               = "targ_comm"
 	snoopyVarTargTgid               = "targ_tgid"
-	snoopyVarUnusedEvent            = "unused_event"
+	snoopyVarUnusedEventHeader      = "unused_event_header"
 )
 
 // loadSnoopy returns the embedded CollectionSpec for snoopy.
@@ -168,24 +175,23 @@ type snoopyProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type snoopyMapSpecs struct {
-	ActiveCalls   *ebpf.MapSpec `ebpf:"active_calls"`
-	ConnInfos     *ebpf.MapSpec `ebpf:"conn_infos"`
-	Events        *ebpf.MapSpec `ebpf:"events"`
-	GoActiveCalls *ebpf.MapSpec `ebpf:"go_active_calls"`
-	LostEvents    *ebpf.MapSpec `ebpf:"lost_events"`
-	Scratch       *ebpf.MapSpec `ebpf:"scratch"`
+	ActiveCalls *ebpf.MapSpec `ebpf:"active_calls"`
+	CallDepth   *ebpf.MapSpec `ebpf:"call_depth"`
+	ConnInfos   *ebpf.MapSpec `ebpf:"conn_infos"`
+	Events      *ebpf.MapSpec `ebpf:"events"`
+	LostEvents  *ebpf.MapSpec `ebpf:"lost_events"`
 }
 
 // snoopyVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type snoopyVariableSpecs struct {
-	FilterComm   *ebpf.VariableSpec `ebpf:"filter_comm"`
-	MaxCapture   *ebpf.VariableSpec `ebpf:"max_capture"`
-	ResolveAddrs *ebpf.VariableSpec `ebpf:"resolve_addrs"`
-	TargComm     *ebpf.VariableSpec `ebpf:"targ_comm"`
-	TargTgid     *ebpf.VariableSpec `ebpf:"targ_tgid"`
-	UnusedEvent  *ebpf.VariableSpec `ebpf:"unused_event"`
+	FilterComm        *ebpf.VariableSpec `ebpf:"filter_comm"`
+	HaveBtf           *ebpf.VariableSpec `ebpf:"have_btf"`
+	MaxCapture        *ebpf.VariableSpec `ebpf:"max_capture"`
+	TargComm          *ebpf.VariableSpec `ebpf:"targ_comm"`
+	TargTgid          *ebpf.VariableSpec `ebpf:"targ_tgid"`
+	UnusedEventHeader *ebpf.VariableSpec `ebpf:"unused_event_header"`
 }
 
 // snoopyObjects contains all objects after they have been loaded into the kernel.
@@ -208,22 +214,20 @@ func (o *snoopyObjects) Close() error {
 //
 // It can be passed to loadSnoopyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type snoopyMaps struct {
-	ActiveCalls   *ebpf.Map `ebpf:"active_calls"`
-	ConnInfos     *ebpf.Map `ebpf:"conn_infos"`
-	Events        *ebpf.Map `ebpf:"events"`
-	GoActiveCalls *ebpf.Map `ebpf:"go_active_calls"`
-	LostEvents    *ebpf.Map `ebpf:"lost_events"`
-	Scratch       *ebpf.Map `ebpf:"scratch"`
+	ActiveCalls *ebpf.Map `ebpf:"active_calls"`
+	CallDepth   *ebpf.Map `ebpf:"call_depth"`
+	ConnInfos   *ebpf.Map `ebpf:"conn_infos"`
+	Events      *ebpf.Map `ebpf:"events"`
+	LostEvents  *ebpf.Map `ebpf:"lost_events"`
 }
 
 func (m *snoopyMaps) Close() error {
 	return _SnoopyClose(
 		m.ActiveCalls,
+		m.CallDepth,
 		m.ConnInfos,
 		m.Events,
-		m.GoActiveCalls,
 		m.LostEvents,
-		m.Scratch,
 	)
 }
 
@@ -231,12 +235,12 @@ func (m *snoopyMaps) Close() error {
 //
 // It can be passed to loadSnoopyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type snoopyVariables struct {
-	FilterComm   *ebpf.Variable `ebpf:"filter_comm"`
-	MaxCapture   *ebpf.Variable `ebpf:"max_capture"`
-	ResolveAddrs *ebpf.Variable `ebpf:"resolve_addrs"`
-	TargComm     *ebpf.Variable `ebpf:"targ_comm"`
-	TargTgid     *ebpf.Variable `ebpf:"targ_tgid"`
-	UnusedEvent  *ebpf.Variable `ebpf:"unused_event"`
+	FilterComm        *ebpf.Variable `ebpf:"filter_comm"`
+	HaveBtf           *ebpf.Variable `ebpf:"have_btf"`
+	MaxCapture        *ebpf.Variable `ebpf:"max_capture"`
+	TargComm          *ebpf.Variable `ebpf:"targ_comm"`
+	TargTgid          *ebpf.Variable `ebpf:"targ_tgid"`
+	UnusedEventHeader *ebpf.Variable `ebpf:"unused_event_header"`
 }
 
 // snoopyPrograms contains all programs after they have been loaded into the kernel.

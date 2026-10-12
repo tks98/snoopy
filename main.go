@@ -164,8 +164,15 @@ func run(cfg config) error {
 		}
 		attached++
 		desc := fmt.Sprintf("%-7s %s", target.Library, target.Path)
+		var notes []string
+		if target.Note != "" {
+			notes = append(notes, target.Note)
+		}
 		if target.Go != nil {
-			desc += " (" + target.Go.Version + ")"
+			notes = append(notes, target.Go.Version)
+		}
+		if len(notes) > 0 {
+			desc += " (" + strings.Join(notes, ", ") + ")"
 		}
 		if cfg.verbose {
 			desc += ": " + strings.Join(funcs, ", ")

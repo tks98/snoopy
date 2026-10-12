@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// rawHeader mirrors struct event in bpf/snoopy.c up to its data field. Each
-// ring buffer record is a header followed by ChunkLen bytes of payload.
+// rawHeader mirrors struct event_header in bpf/snoopy.c. Each ring buffer
+// record is a header followed by ChunkLen bytes of payload (and possibly
+// unused space).
 type rawHeader struct {
 	TimestampNs uint64
 	LatencyNs   uint64
@@ -29,6 +30,7 @@ type rawHeader struct {
 	Laddr       [16]byte
 	Raddr       [16]byte
 	Comm        [16]byte
+	_           [4]byte
 }
 
 // Address families as reported in rawHeader.Family.

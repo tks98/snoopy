@@ -12,17 +12,19 @@ import (
 )
 
 // The hand-written header must match the layout bpf2go derived from the C
-// struct, up to the payload.
+// struct.
 func TestHeaderMatchesBPFLayout(t *testing.T) {
-	gen := reflect.TypeOf(snoopyEvent{})
-	data, _ := gen.FieldByName("Data")
-	if headerSize != int(data.Offset) {
-		t.Fatalf("header is %d bytes, but data starts at %d", headerSize, data.Offset)
+	gen := reflect.TypeOf(snoopyEventHeader{})
+	if headerSize != int(gen.Size()) {
+		t.Fatalf("header is %d bytes, the C struct %d", headerSize, gen.Size())
 	}
 
 	hdr := reflect.TypeOf(rawHeader{})
 	for i := 0; i < hdr.NumField(); i++ {
 		f := hdr.Field(i)
+		if f.Name == "_" {
+			continue
+		}
 		name := strings.Replace(f.Name, "ConnID", "ConnId", 1)
 		g, ok := gen.FieldByName(name)
 		if !ok {

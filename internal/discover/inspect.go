@@ -4,6 +4,7 @@ import (
 	"debug/buildinfo"
 	"debug/elf"
 	"debug/gosym"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"runtime"
@@ -174,6 +175,11 @@ func FindGoFunc(f *elf.File, name string) (GoFunc, error) {
 	if _, err := text.ReadAt(code, int64(start-text.Addr)); err != nil {
 		return GoFunc{}, err
 	}
+	// A probe in the wrong place would corrupt the traced program, so make
+	// sure this really is the start of a Go function.
+	if err := checkGoPrologue(f.Machine, code); err != nil {
+		return GoFunc{}, fmt.Errorf("%s at %#x: %w", name, start, err)
+	}
 
 	rets, err := FindReturns(f.Machine, code)
 	if err != nil {
@@ -187,14 +193,27 @@ func FindGoFunc(f *elf.File, name string) (GoFunc, error) {
 }
 
 func goFuncBounds(f *elf.File, name string) (start, end uint64, err error) {
-	if syms, err := f.Symbols(); err == nil {
-		for _, s := range syms {
-			if s.Name == name && s.Size > 0 {
-				return s.Value, s.Value + s.Size, nil
-			}
+	start, end, err = symtabBounds(f, name)
+	if err == nil {
+		return start, end, nil
+	}
+	return pclntabBounds(f, name)
+}
+
+func symtabBounds(f *elf.File, name string) (start, end uint64, err error) {
+	syms, err := f.Symbols()
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, s := range syms {
+		if s.Name == name && s.Size > 0 {
+			return s.Value, s.Value + s.Size, nil
 		}
 	}
+	return 0, 0, errNoFunc
+}
 
+func pclntabBounds(f *elf.File, name string) (start, end uint64, err error) {
 	pcln := f.Section(".gopclntab")
 	text := f.Section(".text")
 	if pcln == nil || text == nil {
@@ -204,7 +223,11 @@ func goFuncBounds(f *elf.File, name string) (start, end uint64, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	table, err := gosym.NewTable(nil, gosym.NewLineTable(data, text.Addr))
+	textStart := text.Addr
+	if ts, ok := pclntabTextStart(data); ok {
+		textStart = ts
+	}
+	table, err := gosym.NewTable(nil, gosym.NewLineTable(data, textStart))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -213,6 +236,58 @@ func goFuncBounds(f *elf.File, name string) (start, end uint64, err error) {
 		return 0, 0, errNoFunc
 	}
 	return fn.Entry, fn.End, nil
+}
+
+// pclntabTextStart returns the address of runtime.text recorded in a Go
+// 1.18+ pclntab header, which function offsets are relative to. It is not
+// the start of .text when the program was linked externally (cgo), where C
+// code comes first.
+func pclntabTextStart(pclntab []byte) (uint64, bool) {
+	// magic uint32; pad1, pad2, minLC, ptrSize uint8; nfunc int; nfiles uint; textStart uintptr
+	if len(pclntab) < 8 {
+		return 0, false
+	}
+	switch binary.LittleEndian.Uint32(pclntab) {
+	case 0xfffffff0, 0xfffffff1: // Go 1.18-1.19, 1.20+
+	default:
+		return 0, false // older formats store absolute addresses
+	}
+	ptrSize := int(pclntab[7])
+	off := 8 + 2*ptrSize
+	if ptrSize != 8 || len(pclntab) < off+8 {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint64(pclntab[off:]), true
+}
+
+// checkGoPrologue verifies that code starts like a Go function that checks
+// for stack growth, comparing the stack pointer to g.stackguard0 (16 bytes
+// into the g, which lives in R14 on amd64 and R28 on arm64).
+func checkGoPrologue(machine elf.Machine, code []byte) error {
+	switch machine {
+	case elf.EM_X86_64:
+		// CMP RSP, [R14+16], possibly after LEA R12, [RSP-framesize].
+		for off, i := 0, 0; i < 2 && off < len(code); i++ {
+			inst, err := x86asm.Decode(code[off:], 64)
+			if err != nil {
+				break
+			}
+			for _, arg := range inst.Args {
+				if m, ok := arg.(x86asm.Mem); ok && inst.Op == x86asm.CMP && m.Base == x86asm.R14 && m.Disp == 16 {
+					return nil
+				}
+			}
+			off += inst.Len
+		}
+	case elf.EM_AARCH64:
+		// MOVD 16(R28), R16
+		if len(code) >= 4 {
+			if inst, err := arm64asm.Decode(code[:4]); err == nil && strings.HasSuffix(inst.String(), "[X28,#16]") {
+				return nil
+			}
+		}
+	}
+	return errors.New("doesn't start with a Go stack check; not attaching")
 }
 
 // FindReturns returns the offsets of the return instructions in code.

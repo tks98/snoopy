@@ -1,7 +1,8 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+KERNEL ?= 6.1
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build generate test integration lint run clean help
+.PHONY: all build generate test integration integration-vm lint run clean help
 
 all: build
 
@@ -17,6 +18,10 @@ test: ## Run unit tests
 integration: ## Run the eBPF integration tests (uses sudo)
 	go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
 	cd internal/tracer && sudo ./tracer.test -test.v
+
+integration-vm: ## Run the integration tests on another kernel, e.g. KERNEL=5.10 (needs vimto and QEMU)
+	go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+	cd internal/tracer && vimto -kernel :$(KERNEL) exec -- ./tracer.test -test.v
 
 lint: ## Run golangci-lint
 	golangci-lint run ./...

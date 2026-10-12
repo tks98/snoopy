@@ -9,6 +9,9 @@
 // CHUNK_SIZE bytes. A syscall tracepoint that fires while a thread is inside
 // a TLS call tells us which file descriptor (socket) the call used, and the
 // socket's addresses are read from the kernel's struct sock (via CO-RE).
+//
+// Every struct passed to a helper is zeroed first: kernels before 6.3 reject
+// programs that pass uninitialized stack memory, padding included.
 
 #include "vmlinux.h"
 #include "bpf_helpers.h"
@@ -20,6 +23,7 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define TASK_COMM_LEN 16
 #define CHUNK_SIZE 16384 // one maximum-size TLS record
 #define MAX_CHUNKS 64	 // CHUNK_SIZE * MAX_CHUNKS = 1 MiB per call
+#define MAX_DEPTH 4	 // TLS calls nested in TLS calls, e.g. through an HTTPS proxy
 
 // Keep in sync with the Function constants in internal/tracer/event.go.
 enum fn_id {
@@ -46,7 +50,9 @@ enum ret_kind {
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
 
-struct event {
+// Each ring buffer record is this header followed by chunk_len bytes of
+// payload, in a record of one of the sizes defined below.
+struct event_header {
 	__u64 timestamp_ns; // CLOCK_MONOTONIC when the call returned
 	__u64 latency_ns;   // time spent inside the call
 	__u64 conn_id;	    // SSL*, gnutls_session_t, PRFileDesc* or *tls.Conn
@@ -54,8 +60,8 @@ struct event {
 	__u32 tid;
 	__u32 size;	    // bytes transferred by the call
 	__u32 captured;	    // bytes captured for the call (<= size)
-	__u32 chunk_offset; // offset of data[] within the captured bytes
-	__u32 chunk_len;    // valid bytes in data[]
+	__u32 chunk_offset; // offset of this chunk within the captured bytes
+	__u32 chunk_len;    // valid payload bytes in this record
 	__s32 fd;	    // socket fd, or -1 if unknown
 	__u16 family;	    // AF_INET, AF_INET6, or 0 if the addresses are unknown
 	__u16 lport;
@@ -64,49 +70,69 @@ struct event {
 	__u8 flags;
 	__u8 laddr[16];	    // IPv4 addresses use the first 4 bytes
 	__u8 raddr[16];
-	char comm[TASK_COMM_LEN];
-	__u8 data[CHUNK_SIZE];
+	char comm[TASK_COMM_LEN]; // process name
+	__u8 _pad[4];	    // so the payload starts at sizeof(struct event_header)
 };
+
+#define DEFINE_EVENT(size)                                                    \
+	struct event_##size {                                                 \
+		struct event_header h;                                        \
+		__u8 data[size];                                              \
+	}
+DEFINE_EVENT(256);
+DEFINE_EVENT(2048);
+DEFINE_EVENT(16384); // CHUNK_SIZE
 
 // Configuration, set from user space before the program is loaded.
 const volatile __u32 targ_tgid = 0;
 const volatile __u32 max_capture = CHUNK_SIZE;
 const volatile bool filter_comm = false;
 const volatile char targ_comm[TASK_COMM_LEN] = {};
-// Off on kernels without BTF, where the CO-RE socket lookup can't be relocated.
-const volatile bool resolve_addrs = false;
+// Whether the kernel has BTF. Without it, the CO-RE reads of kernel structs
+// (socket addresses, process names) can't be relocated and are skipped.
+const volatile bool have_btf = false;
 
 struct active_call {
 	__u64 start_ns;
 	__u64 conn;
 	__u64 buf;
 	__u64 len_ptr; // SSL_*_ex: where the byte count is written
+	__u64 sp;      // stack pointer on entry (C libraries)
 	__s32 fd;
 	__u8 fn;
 	__u8 ret;      // enum ret_kind
+	__u8 _pad[2];
 };
 
-// In-flight C library calls, keyed by pid_tgid.
+// A thread (C libraries) or goroutine (Go) with TLS calls in flight.
+// Goroutines can move between threads while blocked inside a call, so Go
+// calls are tracked by the goroutine's g pointer instead of the thread.
+struct depth_key {
+	__u64 thread; // pid_tgid for C libraries, tgid for Go
+	__u64 g;      // g pointer for Go, 0 for C libraries
+};
+
+struct call_key {
+	__u64 thread;
+	__u64 g;
+	__u32 depth; // nesting level of the call
+	__u32 _pad;
+};
+
+// Number of nested calls in flight per thread or goroutine.
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 16384);
-	__type(key, __u64);
+	__uint(max_entries, 32768);
+	__type(key, struct depth_key);
+	__type(value, __u32);
+} call_depth SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 32768);
+	__type(key, struct call_key);
 	__type(value, struct active_call);
 } active_calls SEC(".maps");
-
-// Goroutines can move between threads while blocked inside a call, so Go
-// calls are keyed by the goroutine's g pointer instead of the thread.
-struct go_key {
-	__u64 tgid;
-	__u64 g;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 16384);
-	__type(key, struct go_key);
-	__type(value, struct active_call);
-} go_active_calls SEC(".maps");
 
 // The socket last seen for each TLS connection. A TLS read that is served
 // from the library's internal buffer makes no syscall, so remember it.
@@ -122,6 +148,7 @@ struct conn_info {
 	__u16 rport;
 	__u8 laddr[16];
 	__u8 raddr[16];
+	__u8 _pad[2];
 };
 
 struct {
@@ -130,14 +157,6 @@ struct {
 	__type(key, struct conn_key);
 	__type(value, struct conn_info);
 } conn_infos SEC(".maps");
-
-// Scratch space for building events; too large for the BPF stack.
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct event);
-} scratch SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -152,8 +171,21 @@ struct {
 	__type(value, __u64);
 } lost_events SEC(".maps");
 
-// Force bpf2go to emit a Go type for struct event.
-const struct event *unused_event __attribute__((unused));
+// Force bpf2go to emit a Go type for struct event_header.
+const struct event_header *unused_event_header __attribute__((unused));
+
+// The name of the current process (its main thread), which is what
+// /proc/<pid>/comm shows. Threads can have names of their own.
+static __always_inline void get_process_name(char *buf)
+{
+	if (have_btf) {
+		struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+		struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+		if (leader && !bpf_core_read(buf, TASK_COMM_LEN, &leader->comm))
+			return;
+	}
+	bpf_get_current_comm(buf, TASK_COMM_LEN);
+}
 
 static __always_inline bool should_trace(__u64 pid_tgid)
 {
@@ -162,7 +194,7 @@ static __always_inline bool should_trace(__u64 pid_tgid)
 
 	if (filter_comm) {
 		char comm[TASK_COMM_LEN];
-		bpf_get_current_comm(comm, sizeof(comm));
+		get_process_name(comm);
 		for (int i = 0; i < TASK_COMM_LEN; i++) {
 			if (comm[i] != targ_comm[i])
 				return false;
@@ -229,9 +261,15 @@ static __always_inline void track_conn(__u64 pid_tgid, __u64 conn, __s32 fd)
 	if (!conn || fd < 0)
 		return;
 
-	struct conn_key key = { .tgid = pid_tgid >> 32, .conn = conn };
-	struct conn_info info = { .fd = fd };
-	if (resolve_addrs)
+	struct conn_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.conn = conn;
+
+	struct conn_info info;
+	__builtin_memset(&info, 0, sizeof(info));
+	info.fd = fd;
+	if (have_btf)
 		resolve_socket(fd, &info);
 
 	// Once a socket is closed (e.g. reset by the peer), the kernel releases
@@ -243,42 +281,82 @@ static __always_inline void track_conn(__u64 pid_tgid, __u64 conn, __s32 fd)
 	bpf_map_update_elem(&conn_infos, &key, &info, BPF_ANY);
 }
 
+// Copies one chunk into a ring buffer record of the smallest size that fits.
+// Each chunk gets its own reserved record rather than being assembled in
+// shared per-CPU space, where a preempted program could have its data
+// overwritten. Returns 0, -1 if the payload couldn't be read, or -2 if the
+// ring buffer is full.
+#define OUTPUT_CHUNK(cap)                                                     \
+	do {                                                                  \
+		struct event_##cap *r = bpf_ringbuf_reserve(&events, sizeof(*r), 0); \
+		if (!r)                                                       \
+			return -2;                                            \
+		r->h = *h;                                                    \
+		r->h.chunk_len = len;                                         \
+		if (bpf_probe_read_user(r->data, len, src)) {                 \
+			r->h.flags |= EVENT_FLAG_READ_ERROR;                  \
+			r->h.chunk_len = 0;                                   \
+			bpf_ringbuf_submit(r, 0);                             \
+			return -1;                                            \
+		}                                                             \
+		bpf_ringbuf_submit(r, 0);                                     \
+		return 0;                                                     \
+	} while (0)
+
+static __always_inline int output_full_chunk(const struct event_header *h, const void *src)
+{
+	const __u32 len = CHUNK_SIZE;
+	OUTPUT_CHUNK(16384);
+}
+
+// The last chunk of a call can be smaller. Only it picks a record size, so
+// each iteration of the chunk loop has a single path that continues; the
+// verifier would otherwise have to explore every combination of sizes.
+static __always_inline int output_last_chunk(const struct event_header *h, const void *src, __u32 len)
+{
+	if (len <= 256)
+		OUTPUT_CHUNK(256);
+	if (len <= 2048)
+		OUTPUT_CHUNK(2048);
+	if (len <= CHUNK_SIZE)
+		OUTPUT_CHUNK(16384);
+	return -1;
+}
+
 static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
 {
 	if (n <= 0)
 		return;
 
-	__u32 zero = 0;
-	struct event *e = bpf_map_lookup_elem(&scratch, &zero);
-	if (!e)
-		return;
-
+	struct event_header h;
+	__builtin_memset(&h, 0, sizeof(h));
 	__u64 now = bpf_ktime_get_ns();
-	e->timestamp_ns = now;
-	e->latency_ns = now - call->start_ns;
-	e->conn_id = call->conn;
-	e->pid = pid_tgid >> 32;
-	e->tid = (__u32)pid_tgid;
-	e->size = n > 0xffffffff ? 0xffffffff : (__u32)n;
-	e->fn = call->fn;
-	e->flags = 0;
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	h.timestamp_ns = now;
+	h.latency_ns = now - call->start_ns;
+	h.conn_id = call->conn;
+	h.pid = pid_tgid >> 32;
+	h.tid = (__u32)pid_tgid;
+	h.size = n > 0xffffffff ? 0xffffffff : (__u32)n;
+	h.fn = call->fn;
+	get_process_name(h.comm);
 
-	e->fd = call->fd;
-	e->family = 0;
-	struct conn_key key = { .tgid = pid_tgid >> 32, .conn = call->conn };
+	h.fd = call->fd;
+	struct conn_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.conn = call->conn;
 	struct conn_info *info = bpf_map_lookup_elem(&conn_infos, &key);
-	if (info && (e->fd < 0 || e->fd == info->fd)) {
-		e->fd = info->fd;
-		e->family = info->family;
-		e->lport = info->lport;
-		e->rport = info->rport;
-		__builtin_memcpy(e->laddr, info->laddr, sizeof(e->laddr));
-		__builtin_memcpy(e->raddr, info->raddr, sizeof(e->raddr));
+	if (info && (h.fd < 0 || h.fd == info->fd)) {
+		h.fd = info->fd;
+		h.family = info->family;
+		h.lport = info->lport;
+		h.rport = info->rport;
+		__builtin_memcpy(h.laddr, info->laddr, sizeof(h.laddr));
+		__builtin_memcpy(h.raddr, info->raddr, sizeof(h.raddr));
 	}
 
-	__u32 captured = e->size < max_capture ? e->size : max_capture;
-	e->captured = captured;
+	__u32 captured = h.size < max_capture ? h.size : max_capture;
+	h.captured = captured;
 
 	for (__u32 i = 0; i < MAX_CHUNKS; i++) {
 		__u32 off = i * CHUNK_SIZE;
@@ -286,56 +364,136 @@ static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64
 			break;
 
 		__u32 len = captured - off;
-		if (len > CHUNK_SIZE)
-			len = CHUNK_SIZE;
-
-		e->chunk_offset = off;
-		e->chunk_len = len;
-		if (bpf_probe_read_user(e->data, len, (void *)(call->buf + off))) {
-			e->flags |= EVENT_FLAG_READ_ERROR;
-			e->chunk_len = 0;
-			len = 0;
-		}
-
-		if (bpf_ringbuf_output(&events, e, __builtin_offsetof(struct event, data) + len, 0)) {
+		const void *src = (const void *)(call->buf + off);
+		h.chunk_offset = off;
+		int err = len > CHUNK_SIZE ? output_full_chunk(&h, src) : output_last_chunk(&h, src, len);
+		if (err == -2)
 			count_lost();
+		if (err || len <= CHUNK_SIZE)
 			break;
+	}
+}
+
+/* Bookkeeping for calls in flight */
+
+static __always_inline __u32 get_depth(struct depth_key *dk)
+{
+	__u32 *depth = bpf_map_lookup_elem(&call_depth, dk);
+	return depth ? *depth : 0;
+}
+
+static __always_inline void set_depth(struct depth_key *dk, __u32 depth)
+{
+	if (depth)
+		bpf_map_update_elem(&call_depth, dk, &depth, BPF_ANY);
+	else
+		bpf_map_delete_elem(&call_depth, dk);
+}
+
+static __always_inline void call_key_at(struct call_key *key, struct depth_key *dk, __u32 depth)
+{
+	__builtin_memset(key, 0, sizeof(*key));
+	key->thread = dk->thread;
+	key->g = dk->g;
+	key->depth = depth;
+}
+
+static __always_inline void push_call(struct depth_key *dk, __u32 depth, struct active_call *call)
+{
+	// Deeper nesting than this means returns were missed; start over.
+	if (depth >= MAX_DEPTH)
+		depth = 0;
+
+	struct call_key key;
+	call_key_at(&key, dk, depth);
+	bpf_map_update_elem(&active_calls, &key, call, BPF_ANY);
+	set_depth(dk, depth + 1);
+}
+
+// Calls that the innermost call is nested in (TLS tunneled through TLS) go
+// over the same socket; give those that don't know theirs this one.
+static __always_inline void propagate_fd(__u64 pid_tgid, struct depth_key *dk, __u32 depth, __s32 fd)
+{
+	struct call_key key;
+	for (int i = 0; i < MAX_DEPTH; i++) {
+		if ((__u32)i >= depth)
+			break;
+		call_key_at(&key, dk, i);
+		struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
+		if (call && call->fd < 0) {
+			call->fd = fd;
+			track_conn(pid_tgid, call->conn, fd);
 		}
-		if (e->flags & EVENT_FLAG_READ_ERROR)
-			break;
 	}
 }
 
 /* C libraries (OpenSSL, GnuTLS, NSS) */
 
-static __always_inline int enter_call(__u8 fn, __u8 ret, __u64 conn, const void *buf, __u64 len_ptr)
+// The stack pointer a uretprobe sees, which is the entry stack pointer
+// minus the popped return address on x86 and unchanged on arm64. Matching
+// it pairs each return with its own call even when calls nest.
+#if defined(__TARGET_ARCH_x86)
+#define RETURN_TO_ENTRY_SP(sp) ((sp) - 8)
+#elif defined(__TARGET_ARCH_arm64)
+#define RETURN_TO_ENTRY_SP(sp) (sp)
+#endif
+
+static __always_inline int enter_call(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
+				      __u64 len_ptr)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid))
 		return 0;
 
-	struct active_call call = {
-		.start_ns = bpf_ktime_get_ns(),
-		.conn = conn,
-		.buf = (__u64)buf,
-		.len_ptr = len_ptr,
-		.fd = -1,
-		.fn = fn,
-		.ret = ret,
-	};
-	bpf_map_update_elem(&active_calls, &pid_tgid, &call, BPF_ANY);
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	call.start_ns = bpf_ktime_get_ns();
+	call.conn = conn;
+	call.buf = (__u64)buf;
+	call.len_ptr = len_ptr;
+	call.sp = PT_REGS_SP(ctx);
+	call.fd = -1;
+	call.fn = fn;
+	call.ret = ret;
+
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	push_call(&dk, get_depth(&dk), &call);
 	return 0;
 }
 
 static __always_inline int exit_call(struct pt_regs *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct active_call *active = bpf_map_lookup_elem(&active_calls, &pid_tgid);
-	if (!active)
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	__u32 depth = get_depth(&dk);
+	if (!depth)
 		return 0;
 
-	struct active_call call = *active;
-	bpf_map_delete_elem(&active_calls, &pid_tgid);
+	// Find this return's call, innermost first.
+	__u64 sp = RETURN_TO_ENTRY_SP(PT_REGS_SP(ctx));
+	struct call_key key;
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	int found = -1;
+	for (int i = MAX_DEPTH - 1; i >= 0; i--) {
+		if ((__u32)i >= depth)
+			continue;
+		call_key_at(&key, &dk, i);
+		struct active_call *active = bpf_map_lookup_elem(&active_calls, &key);
+		if (active && active->sp == sp) {
+			call = *active;
+			found = i;
+			break;
+		}
+	}
+	if (found < 0)
+		return 0;
+	bpf_map_delete_elem(&active_calls, &key);
+	set_depth(&dk, found); // calls nested deeper than this one never returned
 
 	__s64 n;
 	switch (call.ret) {
@@ -358,16 +516,25 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 	return 0;
 }
 
-// Remember which fd a TLS call is doing I/O on.
+// Remember which fd the thread's innermost TLS call is doing I/O on.
 static __always_inline int record_fd(__u64 fd)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct active_call *call = bpf_map_lookup_elem(&active_calls, &pid_tgid);
-	if (!call)
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	__u32 depth = get_depth(&dk);
+	if (!depth || depth > MAX_DEPTH)
 		return 0;
 
+	struct call_key key;
+	call_key_at(&key, &dk, depth - 1);
+	struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
+	if (!call)
+		return 0;
 	call->fd = (__s32)fd;
 	track_conn(pid_tgid, call->conn, call->fd);
+	propagate_fd(pid_tgid, &dk, depth - 1, call->fd);
 	return 0;
 }
 
@@ -412,25 +579,25 @@ int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 SEC("uprobe/SSL_read")
 int BPF_UPROBE(ssl_read_enter, void *ssl, void *buf)
 {
-	return enter_call(FN_SSL_READ, RET_INT, (__u64)ssl, buf, 0);
+	return enter_call(ctx, FN_SSL_READ, RET_INT, (__u64)ssl, buf, 0);
 }
 
 SEC("uprobe/SSL_write")
 int BPF_UPROBE(ssl_write_enter, void *ssl, const void *buf)
 {
-	return enter_call(FN_SSL_WRITE, RET_INT, (__u64)ssl, buf, 0);
+	return enter_call(ctx, FN_SSL_WRITE, RET_INT, (__u64)ssl, buf, 0);
 }
 
 SEC("uprobe/SSL_read_ex")
 int BPF_UPROBE(ssl_read_ex_enter, void *ssl, void *buf, __u64 num, __u64 *readbytes)
 {
-	return enter_call(FN_SSL_READ_EX, RET_BOOL_EX, (__u64)ssl, buf, (__u64)readbytes);
+	return enter_call(ctx, FN_SSL_READ_EX, RET_BOOL_EX, (__u64)ssl, buf, (__u64)readbytes);
 }
 
 SEC("uprobe/SSL_write_ex")
 int BPF_UPROBE(ssl_write_ex_enter, void *ssl, const void *buf, __u64 num, __u64 *written)
 {
-	return enter_call(FN_SSL_WRITE_EX, RET_BOOL_EX, (__u64)ssl, buf, (__u64)written);
+	return enter_call(ctx, FN_SSL_WRITE_EX, RET_BOOL_EX, (__u64)ssl, buf, (__u64)written);
 }
 
 // GnuTLS.
@@ -439,13 +606,13 @@ int BPF_UPROBE(ssl_write_ex_enter, void *ssl, const void *buf, __u64 num, __u64 
 SEC("uprobe/gnutls_record_recv")
 int BPF_UPROBE(gnutls_record_recv_enter, void *session, void *data)
 {
-	return enter_call(FN_GNUTLS_RECORD_RECV, RET_SSIZE, (__u64)session, data, 0);
+	return enter_call(ctx, FN_GNUTLS_RECORD_RECV, RET_SSIZE, (__u64)session, data, 0);
 }
 
 SEC("uprobe/gnutls_record_send")
 int BPF_UPROBE(gnutls_record_send_enter, void *session, const void *data)
 {
-	return enter_call(FN_GNUTLS_RECORD_SEND, RET_SSIZE, (__u64)session, data, 0);
+	return enter_call(ctx, FN_GNUTLS_RECORD_SEND, RET_SSIZE, (__u64)session, data, 0);
 }
 
 // NSS (via NSPR). PR_Read and friends are used for all kinds of descriptors;
@@ -475,7 +642,7 @@ static __always_inline bool nspr_is_layered(const void *fd)
 	{                                                                     \
 		if (!nspr_is_layered(fd))                                     \
 			return 0;                                             \
-		return enter_call(fn, RET_INT, (__u64)fd, buf, 0);            \
+		return enter_call(ctx, fn, RET_INT, (__u64)fd, buf, 0);       \
 	}
 
 NSPR_PROBE(PR_Read, FN_PR_READ)
@@ -543,32 +710,51 @@ static __always_inline int go_enter(struct pt_regs *ctx, __u8 fn)
 	if (!should_trace(pid_tgid))
 		return 0;
 
-	struct go_key key = { .tgid = pid_tgid >> 32, .g = GO_G(ctx) };
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid >> 32;
+	dk.g = GO_G(ctx);
+	__u32 depth = get_depth(&dk);
+
 	__u64 conn = GO_ARG1(ctx);
-	struct active_call call = {
-		.start_ns = bpf_ktime_get_ns(),
-		.conn = conn,
-		.buf = GO_ARG2(ctx),
-		.fd = go_conn_fd(conn),
-		.fn = fn,
-	};
-	track_conn(pid_tgid, conn, call.fd);
-	bpf_map_update_elem(&go_active_calls, &key, &call, BPF_ANY);
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	call.start_ns = bpf_ktime_get_ns();
+	call.conn = conn;
+	call.buf = GO_ARG2(ctx);
+	call.fd = go_conn_fd(conn);
+	call.fn = fn;
+
+	if (call.fd >= 0) {
+		track_conn(pid_tgid, conn, call.fd);
+		propagate_fd(pid_tgid, &dk, depth, call.fd);
+	}
+	push_call(&dk, depth, &call);
 	return 0;
 }
 
 // Attached to every RET instruction of the function: uretprobes corrupt Go
-// stacks, which the runtime moves when they grow.
+// stacks, which the runtime moves when they grow. For the same reason the
+// stack pointer can't identify the call, so calls are matched by depth.
 static __always_inline int go_exit(struct pt_regs *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct go_key key = { .tgid = pid_tgid >> 32, .g = GO_G(ctx) };
-	struct active_call *active = bpf_map_lookup_elem(&go_active_calls, &key);
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid >> 32;
+	dk.g = GO_G(ctx);
+	__u32 depth = get_depth(&dk);
+	if (!depth)
+		return 0;
+	set_depth(&dk, depth - 1);
+
+	struct call_key key;
+	call_key_at(&key, &dk, depth - 1);
+	struct active_call *active = bpf_map_lookup_elem(&active_calls, &key);
 	if (!active)
 		return 0;
-
 	struct active_call call = *active;
-	bpf_map_delete_elem(&go_active_calls, &key);
+	bpf_map_delete_elem(&active_calls, &key);
 	emit(&call, pid_tgid, (__s64)GO_RET1(ctx));
 	return 0;
 }

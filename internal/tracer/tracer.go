@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -51,12 +52,13 @@ type Options struct {
 
 // Tracer is a loaded eBPF program with its probes.
 type Tracer struct {
-	opts         Options
-	objs         snoopyObjects
-	links        []link.Link
-	reader       *ringbuf.Reader
-	clock        func(monoNs uint64) time.Time
-	resolveAddrs bool
+	opts    Options
+	objs    snoopyObjects
+	links   []link.Link
+	reader  *ringbuf.Reader
+	clock   func(monoNs uint64) time.Time
+	haveBTF bool
+	names   map[uint32]string // process names, when the kernel can't tell
 }
 
 // New loads the eBPF program into the kernel. Call Attach and AttachSyscalls
@@ -88,10 +90,10 @@ func New(opts Options) (*Tracer, error) {
 		return nil, fmt.Errorf("parse BPF object: %w", err)
 	}
 
-	// Socket addresses are read from kernel structures whose layout is
-	// found through the kernel's BTF. Without BTF, give the loader an empty
-	// spec instead: the relocations it can't resolve are poisoned, and the
-	// verifier drops that code because resolve_addrs is false.
+	// Socket addresses and process names are read from kernel structures
+	// whose layout is found through the kernel's BTF. Without BTF, give the
+	// loader an empty spec instead: the relocations it can't resolve are
+	// poisoned, and the verifier drops that code because have_btf is false.
 	var loadOpts ebpf.CollectionOptions
 	_, btfErr := btf.LoadKernelSpec()
 	if opts.ignoreKernelBTF {
@@ -107,11 +109,13 @@ func New(opts Options) (*Tracer, error) {
 	var comm [16]byte
 	copy(comm[:], opts.Comm)
 	for name, value := range map[string]any{
-		"targ_tgid":     uint32(opts.PID),
-		"max_capture":   uint32(opts.MaxCapture),
-		"filter_comm":   opts.Comm != "",
-		"targ_comm":     comm,
-		"resolve_addrs": btfErr == nil,
+		"targ_tgid":   uint32(opts.PID),
+		"max_capture": uint32(opts.MaxCapture),
+		// Without BTF the kernel only knows thread names, so the process
+		// name is filtered on in user space instead.
+		"filter_comm": opts.Comm != "" && btfErr == nil,
+		"targ_comm":   comm,
+		"have_btf":    btfErr == nil,
 	} {
 		if err := spec.Variables[name].Set(value); err != nil {
 			return nil, fmt.Errorf("set %s: %w", name, err)
@@ -119,7 +123,7 @@ func New(opts Options) (*Tracer, error) {
 	}
 	spec.Maps["events"].MaxEntries = uint32(opts.RingBufferSize)
 
-	t := &Tracer{opts: opts, clock: monotonicClock(), resolveAddrs: btfErr == nil}
+	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{}}
 	if err := spec.LoadAndAssign(&t.objs, &loadOpts); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
@@ -152,12 +156,30 @@ func emptyBTFSpec() (*btf.Spec, error) {
 // If not (the kernel has no BTF), events carry no addresses and callers have
 // to look them up in /proc, which fails for connections closed by then.
 func (t *Tracer) ResolvesAddresses() bool {
-	return t.resolveAddrs
+	return t.haveBTF
+}
+
+// processName returns the name of a process from /proc, for kernels without
+// BTF, where the BPF program only sees the name of the calling thread.
+func (t *Tracer) processName(pid uint32, fallback string) string {
+	if name, ok := t.names[pid]; ok {
+		return name
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return fallback // the process may have exited; don't cache
+	}
+	if len(t.names) >= 4096 {
+		clear(t.names)
+	}
+	name := strings.TrimSuffix(string(data), "\n")
+	t.names[pid] = name
+	return name
 }
 
 func permissionHint(err error) error {
 	if errors.Is(err, unix.EPERM) || errors.Is(err, os.ErrPermission) {
-		return fmt.Errorf("%w (snoopy needs root, or CAP_BPF, CAP_PERFMON and CAP_SYS_RESOURCE)", err)
+		return fmt.Errorf("%w (snoopy needs root, or at least CAP_BPF, CAP_PERFMON, CAP_SYS_RESOURCE and CAP_SYS_PTRACE)", err)
 	}
 	return err
 }
@@ -297,10 +319,20 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 	lastExpire := time.Now()
 	var rec ringbuf.Record
 
+	deliver := func(ev *Event) {
+		if !t.haveBTF {
+			ev.Comm = t.processName(ev.PID, ev.Comm)
+			if t.opts.Comm != "" && ev.Comm != t.opts.Comm {
+				return
+			}
+		}
+		handle(ev)
+	}
+
 	for {
 		if ctx.Err() != nil {
 			for _, ev := range asm.expire(time.Now(), 0) {
-				handle(ev)
+				deliver(ev)
 			}
 			return nil
 		}
@@ -320,13 +352,13 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 				return err
 			}
 			for _, ev := range asm.add(c, now) {
-				handle(ev)
+				deliver(ev)
 			}
 		}
 
 		if now.Sub(lastExpire) >= pollInterval {
 			for _, ev := range asm.expire(now, maxChunkWait) {
-				handle(ev)
+				deliver(ev)
 			}
 			lastExpire = now
 		}

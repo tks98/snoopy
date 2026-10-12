@@ -85,7 +85,8 @@ struct bpf_raw_tracepoint_args {
 	__u64 args[0];
 };
 
-/* Just enough to get from the current task to a socket's addresses. */
+/* Just enough to get from the current task to its process name and to a
+ * socket's addresses. */
 typedef unsigned short umode_t;
 
 struct in6_addr {
@@ -130,6 +131,8 @@ struct files_struct {
 
 struct task_struct {
 	struct files_struct *files;
+	struct task_struct *group_leader;
+	char comm[16];
 } __attribute__((preserve_access_index));
 
 #endif /* __VMLINUX_H__ */

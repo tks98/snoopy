@@ -11,15 +11,18 @@
 package tracer
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -333,5 +336,133 @@ func TestWithoutKernelBTF(t *testing.T) {
 	}
 	if ev.FD < 0 {
 		t.Error("fd missing")
+	}
+}
+
+// newHTTPSProxy starts an HTTPS proxy that handles CONNECT, so clients
+// tunnel TLS to the target through TLS to the proxy.
+func newHTTPSProxy(t *testing.T, cfg *tls.Config) string {
+	t.Helper()
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil || req.Method != http.MethodConnect {
+					return
+				}
+				up, err := net.Dial("tcp", req.Host)
+				if err != nil {
+					return
+				}
+				defer up.Close()
+				io.WriteString(c, "HTTP/1.1 200 Connection established\r\n\r\n")
+				go io.Copy(up, br)
+				io.Copy(c, up)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// A TLS write tunneled through an HTTPS proxy makes a nested TLS write to
+// the proxy; both must be reported, the outer one with the plaintext.
+func TestNestedGo(t *testing.T) {
+	requireRoot(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := discover.Inspect(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := startTracer(t, Options{PID: os.Getpid()}, targets)
+
+	srv, _ := newServer(t)
+	proxy := newHTTPSProxy(t, srv.TLS)
+	client := &http.Client{Transport: &http.Transport{
+		Proxy:           http.ProxyURL(&url.URL{Scheme: "https", Host: proxy}),
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}}
+	resp, err := client.Get(srv.URL + "/nested-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	write := waitFor(t, events, "tunneled write", func(ev *Event) bool {
+		return ev.Function == FuncGoWrite && contains("GET /nested-go HTTP/1.1")(ev)
+	})
+	// The tunneled connection goes over the socket to the proxy.
+	checkConnection(t, write, proxy)
+	waitFor(t, events, "tunneled read", func(ev *Event) bool {
+		return ev.Function == FuncGoRead && contains("served /nested-go")(ev) && ev.PID == write.PID && ev.ConnID == write.ConnID
+	})
+}
+
+func TestNestedOpenSSL(t *testing.T) {
+	requireRoot(t)
+	curl := requireTool(t, "curl")
+	events := startTracer(t, Options{Comm: "curl"}, systemTargets(t, discover.OpenSSL))
+	srv, _ := newServer(t)
+	proxy := newHTTPSProxy(t, srv.TLS)
+
+	// --noproxy '' keeps a no_proxy variable from bypassing the proxy.
+	out, err := exec.Command(curl, "-sk", "--http1.1", "--noproxy", "", "--proxy", "https://"+proxy, "--proxy-insecure", srv.URL+"/nested-curl").CombinedOutput()
+	if err != nil {
+		t.Fatalf("curl: %v: %s", err, out)
+	}
+	write := waitFor(t, events, "tunneled SSL_write", func(ev *Event) bool {
+		return ev.Function == FuncSSLWrite && contains("GET /nested-curl HTTP/1.1")(ev)
+	})
+	checkConnection(t, write, proxy)
+	waitFor(t, events, "tunneled SSL_read", func(ev *Event) bool {
+		return ev.Function == FuncSSLRead && contains("served /nested-curl")(ev)
+	})
+}
+
+// --comm and the reported name are the process's, even when the calling
+// thread has a name of its own.
+func TestThreadName(t *testing.T) {
+	requireRoot(t)
+	python := requireTool(t, "python3")
+	events := startTracer(t, Options{Comm: "python3"}, systemTargets(t, discover.OpenSSL))
+	_, port := newServer(t)
+
+	script := `
+import ctypes, socket, ssl, sys, threading
+def run():
+    ctypes.CDLL(None).prctl(15, b"tls-worker", 0, 0, 0)  # PR_SET_NAME
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", int(sys.argv[1]))))
+    s.sendall(b"GET /thread-name HTTP/1.0\r\nHost: x\r\n\r\n")
+    while s.recv(4096): pass
+t = threading.Thread(target=run)
+t.start()
+t.join()
+`
+	if out, err := exec.Command(python, "-c", script, port).CombinedOutput(); err != nil {
+		t.Fatalf("python: %v: %s", err, out)
+	}
+	ev := waitFor(t, events, "write from a named thread", contains("GET /thread-name"))
+	if ev.Comm != "python3" {
+		t.Errorf("process name %q", ev.Comm)
+	}
+	if ev.PID == ev.TID {
+		t.Error("expected the write to come from a thread")
 	}
 }

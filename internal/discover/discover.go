@@ -43,8 +43,11 @@ func (l Library) String() string {
 // Target is a file snoopy can attach probes to.
 type Target struct {
 	// Path to the file as seen by snoopy. Files of containerized processes
-	// are reached through /proc/<pid>/root.
-	Path    string
+	// are reached through /proc/<pid>/root, and files that were deleted or
+	// replaced while in use through /proc/<pid>/map_files or /proc/<pid>/exe.
+	Path string
+	// Note says what Path is, if that isn't obvious from it.
+	Note    string
 	Library Library
 	// Go holds the probe locations for GoTLS targets.
 	Go *GoInfo
@@ -82,7 +85,7 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 		proc = "/proc"
 	}
 
-	var candidates []string
+	var candidates []candidate
 	for _, p := range opts.Extra {
 		if _, err := os.Stat(p); err != nil {
 			return nil, nil, fmt.Errorf("--lib %s: %w", p, err)
@@ -90,44 +93,57 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 	}
 
 	if opts.PID > 0 {
-		paths, err := processFiles(proc, opts.PID)
+		files, err := processFiles(proc, opts.PID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("pid %d: %w", opts.PID, err)
 		}
-		candidates = append(candidates, paths...)
+		candidates = append(candidates, files...)
 	} else {
-		candidates = append(candidates, systemLibraries()...)
+		for _, path := range systemLibraries() {
+			candidates = append(candidates, candidate{path: path})
+		}
 		if !opts.NoScan {
-			candidates = append(candidates, allProcessFiles(proc)...)
+			files, denied := allProcessFiles(proc)
+			candidates = append(candidates, files...)
+			if denied > 0 {
+				msg := fmt.Sprintf("permission denied inspecting %d processes; TLS libraries and Go programs only they use are missed", denied)
+				if os.Geteuid() != 0 {
+					msg += " (run as root)"
+				}
+				warnings = append(warnings, errors.New(msg))
+			}
 		}
 	}
 
 	seen := map[fileID]bool{}
-	inspect := func(path string, explicit bool) {
-		id, err := idOf(path)
+	inspect := func(c candidate, explicit bool) {
+		id, err := idOf(c.path)
 		if err != nil || seen[id] {
 			return
 		}
 		seen[id] = true
 
-		found, err := Inspect(path)
+		found, err := Inspect(c.path)
 		if err != nil {
 			if explicit {
-				warnings = append(warnings, fmt.Errorf("%s: %w", path, err))
+				warnings = append(warnings, fmt.Errorf("%s: %w", c.path, err))
 			}
 			return
 		}
 		if len(found) == 0 && explicit {
-			warnings = append(warnings, fmt.Errorf("%s: no supported TLS functions found", path))
+			warnings = append(warnings, fmt.Errorf("%s: no supported TLS functions found", c.path))
+		}
+		for i := range found {
+			found[i].Note = c.note
 		}
 		targets = append(targets, found...)
 	}
 
 	for _, p := range opts.Extra {
-		inspect(p, true)
+		inspect(candidate{path: p}, true)
 	}
-	for _, p := range candidates {
-		inspect(p, false)
+	for _, c := range candidates {
+		inspect(c, false)
 	}
 
 	sort.SliceStable(targets, func(i, j int) bool { return targets[i].Library < targets[j].Library })
@@ -152,55 +168,88 @@ func systemLibraries() []string {
 	return out
 }
 
+type candidate struct {
+	path string
+	note string
+}
+
+const deletedSuffix = " (deleted)"
+
 // processFiles returns the TLS libraries mapped by a process and its
 // executable, as paths reachable from snoopy's mount namespace.
-func processFiles(proc string, pid int) ([]string, error) {
-	root := filepath.Join(proc, strconv.Itoa(pid), "root")
-	maps, err := os.Open(filepath.Join(proc, strconv.Itoa(pid), "maps"))
+//
+// A file that was deleted or replaced (e.g. by a package upgrade) while the
+// process kept using it is no longer reachable by name. Uprobes attach to
+// the file's inode, so it is reached through the process instead.
+func processFiles(proc string, pid int) ([]candidate, error) {
+	dir := filepath.Join(proc, strconv.Itoa(pid))
+	maps, err := os.Open(filepath.Join(dir, "maps"))
 	if err != nil {
 		return nil, err
 	}
 	defer maps.Close()
 
 	libs := MappedLibraries(maps)
-	out := make([]string, 0, len(libs)+1)
+	out := make([]candidate, 0, len(libs)+1)
 	for _, lib := range libs {
-		out = append(out, filepath.Join(root, lib))
+		if lib.Deleted {
+			out = append(out, candidate{
+				path: filepath.Join(dir, "map_files", lib.Range),
+				note: "deleted " + lib.Path,
+			})
+		} else {
+			out = append(out, candidate{path: filepath.Join(dir, "root", lib.Path)})
+		}
 	}
-	if exe, err := os.Readlink(filepath.Join(proc, strconv.Itoa(pid), "exe")); err == nil {
-		out = append(out, filepath.Join(root, strings.TrimSuffix(exe, " (deleted)")))
+
+	exe, err := os.Readlink(filepath.Join(dir, "exe"))
+	switch {
+	case err != nil:
+	case strings.HasSuffix(exe, deletedSuffix):
+		out = append(out, candidate{
+			path: filepath.Join(dir, "exe"),
+			note: "deleted " + strings.TrimSuffix(exe, deletedSuffix),
+		})
+	default:
+		out = append(out, candidate{path: filepath.Join(dir, "root", exe)})
 	}
 	return out, nil
 }
 
 // allProcessFiles runs processFiles for every process, ignoring processes
-// that exit or can't be read.
-func allProcessFiles(proc string) []string {
+// that exit. It also returns how many processes it wasn't allowed to inspect.
+func allProcessFiles(proc string) (files []candidate, denied int) {
 	entries, err := os.ReadDir(proc)
 	if err != nil {
-		return nil
+		return nil, 0
 	}
 	self := os.Getpid()
-	var out []string
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid == self {
 			continue
 		}
-		paths, err := processFiles(proc, pid)
-		if err != nil {
-			continue
+		f, err := processFiles(proc, pid)
+		if errors.Is(err, os.ErrPermission) {
+			denied++
 		}
-		out = append(out, paths...)
+		files = append(files, f...)
 	}
-	return out
+	return files, denied
+}
+
+// Mapping is a file mapped into a process.
+type Mapping struct {
+	Path    string // the file's name, without " (deleted)"
+	Range   string // the address range of its first mapping, e.g. "7f3e1d200000-7f3e1d222000"
+	Deleted bool   // the file was deleted or replaced since it was mapped
 }
 
 // MappedLibraries parses a /proc/<pid>/maps file and returns the distinct
 // mapped files whose names look like supported TLS libraries.
-func MappedLibraries(maps io.Reader) []string {
+func MappedLibraries(maps io.Reader) []Mapping {
 	seen := map[string]bool{}
-	var out []string
+	var out []Mapping
 	sc := bufio.NewScanner(maps)
 	for sc.Scan() {
 		// address perms offset dev inode pathname
@@ -208,13 +257,14 @@ func MappedLibraries(maps io.Reader) []string {
 		if len(fields) < 6 || !strings.HasPrefix(fields[5], "/") {
 			continue
 		}
-		path := strings.Join(fields[5:], " ")
-		if strings.HasSuffix(path, " (deleted)") || seen[path] {
+		name := strings.Join(fields[5:], " ")
+		if seen[name] {
 			continue
 		}
+		path, deleted := strings.CutSuffix(name, deletedSuffix)
 		if isTLSLibraryName(filepath.Base(path)) {
-			seen[path] = true
-			out = append(out, path)
+			seen[name] = true
+			out = append(out, Mapping{Path: path, Range: fields[0], Deleted: deleted})
 		}
 	}
 	return out

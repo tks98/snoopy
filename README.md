@@ -35,8 +35,10 @@ HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_S
 - **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS and Go's
   `crypto/tls`, including stripped Go binaries.
 - **Finds what to trace:** system libraries, libraries loaded by running
-  processes (including inside containers), Go programs, and anything you
-  point it at with `--lib`.
+  processes (including inside containers, and copies that an upgrade has
+  since replaced), Go programs, and anything you point it at with `--lib`.
+- **Tunnels:** traffic sent through an HTTPS proxy shows up as plaintext,
+  not as the TLS records sent to the proxy.
 - **Connection details:** process, thread, socket and local and remote
   address for every call, plus the container ID when the process runs in one.
 - **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 frames are
@@ -49,12 +51,15 @@ HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_S
 
 ## Requirements
 
-- Linux 5.8 or later on x86_64 or arm64.
-- Root, or the `CAP_BPF`, `CAP_PERFMON` and `CAP_SYS_RESOURCE` capabilities.
+- Linux 5.10 or later on x86_64 or arm64. CI tests 5.10, 5.15, 6.1, 6.6 and
+  current kernels; 5.8 and 5.9 should work but aren't tested.
+- Root. The minimal set of capabilities is `CAP_BPF`, `CAP_PERFMON`,
+  `CAP_SYS_RESOURCE` and `CAP_SYS_PTRACE` (to inspect other processes), plus
+  `CAP_SYS_ADMIN` to trace libraries that were replaced while in use.
 - Kernel BTF (`/sys/kernel/btf/vmlinux`), which most distributions have
-  shipped since around 2020, for socket addresses. Without it snoopy still
-  works but looks addresses up in `/proc`, which misses connections that
-  close quickly.
+  shipped since around 2020. Without it snoopy still works, but it looks
+  socket addresses and process names up in `/proc`, which misses connections
+  and processes that end quickly.
 
 ## Install
 
@@ -199,7 +204,8 @@ make generate     # recompile bpf/snoopy.c after changing it (needs clang 18 and
 
 The integration tests use whichever of `curl`, `python3`, `gnutls-cli` and the
 NSS development files (`libnss3-dev`) are installed, and skip the rest. CI runs
-them on x86_64 and arm64.
+them on x86_64 and arm64, and on older kernels in VMs with
+[vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
 
 To release, push a tag like `v2.0.0`. GoReleaser builds and publishes the
 binaries.

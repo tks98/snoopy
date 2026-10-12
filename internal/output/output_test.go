@@ -326,6 +326,43 @@ func TestPcap(t *testing.T) {
 	}
 }
 
+func TestPcapSyntheticAddressesAndEviction(t *testing.T) {
+	var buf bytes.Buffer
+	p, _ := NewPcap(&buf)
+	for i := 0; i < maxStreams+1; i++ {
+		ev := event(tracer.FuncGoWrite, "x")
+		ev.ConnID = uint64(i)
+		ev.Local, ev.Remote = netip.AddrPort{}, netip.AddrPort{}
+		ev.Time = ev.Time.Add(time.Duration(i) * time.Millisecond)
+		if err := p.Print(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(p.streams) != maxStreams {
+		t.Errorf("%d streams remembered", len(p.streams))
+	}
+
+	ports := map[uint16]bool{}
+	fins := 0
+	for _, pkt := range readPcap(t, buf.Bytes()) {
+		if pkt.flags == tcpSYN {
+			if ports[pkt.src.Port()] {
+				t.Fatalf("port %d used twice", pkt.src.Port())
+			}
+			ports[pkt.src.Port()] = true
+		}
+		if pkt.flags&tcpFIN != 0 {
+			fins++
+			if pkt.src.Port() != 10000 {
+				t.Errorf("evicted port %d, want the oldest (10000)", pkt.src.Port())
+			}
+		}
+	}
+	if fins != 1 {
+		t.Errorf("%d streams ended, want 1", fins)
+	}
+}
+
 func TestPcapIPv6AndLargePayload(t *testing.T) {
 	var buf bytes.Buffer
 	p, _ := NewPcap(&buf)
