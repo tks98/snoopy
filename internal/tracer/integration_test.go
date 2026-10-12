@@ -1,0 +1,337 @@
+//go:build integration
+
+// Integration tests load the BPF program into the running kernel and trace
+// real TLS clients against an in-process server. They need root:
+//
+//	go test -c -tags integration -o tracer.test ./internal/tracer
+//	sudo ./tracer.test -test.v
+//
+// Tests for clients that aren't installed (curl, python3, gnutls-cli, an NSS
+// toolchain) are skipped.
+package tracer
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/tks98/snoopy/internal/discover"
+)
+
+func requireRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+}
+
+func requireTool(t *testing.T, name string) string {
+	t.Helper()
+	path, err := exec.LookPath(name)
+	if err != nil {
+		t.Skipf("%s not installed", name)
+	}
+	return path
+}
+
+// startTracer attaches to the given library kinds and collects events.
+func startTracer(t *testing.T, opts Options, targets []discover.Target) <-chan *Event {
+	t.Helper()
+	tr, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attached := 0
+	for _, target := range targets {
+		if _, err := tr.Attach(target); err != nil {
+			t.Logf("attach %s %s: %v", target.Library, target.Path, err)
+			continue
+		}
+		attached++
+	}
+	if attached == 0 {
+		tr.Close()
+		t.Skip("no matching TLS library to attach to")
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+
+	events := make(chan *Event, 4096)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- tr.Run(ctx, func(ev *Event) { events <- ev }) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+		tr.Close()
+	})
+	return events
+}
+
+func systemTargets(t *testing.T, lib discover.Library) []discover.Target {
+	t.Helper()
+	all, _, err := discover.Find(discover.Options{NoScan: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []discover.Target
+	for _, target := range all {
+		if target.Library == lib {
+			out = append(out, target)
+		}
+	}
+	return out
+}
+
+func waitFor(t *testing.T, events <-chan *Event, desc string, match func(*Event) bool) *Event {
+	t.Helper()
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case ev := <-events:
+			if match(ev) {
+				return ev
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for %s", desc)
+		}
+	}
+}
+
+func contains(s string) func(*Event) bool {
+	return func(ev *Event) bool { return bytes.Contains(ev.Data, []byte(s)) }
+}
+
+func newServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		fmt.Fprintf(w, "served %s with %d body bytes", r.URL.Path, n)
+	}))
+	t.Cleanup(srv.Close)
+	_, port, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	return srv, port
+}
+
+func checkConnection(t *testing.T, ev *Event, server string) {
+	t.Helper()
+	if ev.FD < 0 {
+		t.Errorf("%s: no fd", ev.Function)
+	}
+	want := netip.MustParseAddrPort(server)
+	if ev.Remote != want && ev.Local != want {
+		t.Errorf("%s: addresses %s -> %s, want one to be %s", ev.Function, ev.Local, ev.Remote, want)
+	}
+}
+
+func TestGoCryptoTLS(t *testing.T) {
+	requireRoot(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := discover.Inspect(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := startTracer(t, Options{PID: os.Getpid()}, targets)
+
+	srv, _ := newServer(t)
+	resp, err := srv.Client().Post(srv.URL+"/go-test", "text/plain", strings.NewReader("ping"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	server := srv.Listener.Addr().String()
+	write := waitFor(t, events, "client write", func(ev *Event) bool {
+		return ev.Function == FuncGoWrite && contains("POST /go-test HTTP/1.1")(ev)
+	})
+	checkConnection(t, write, server)
+	waitFor(t, events, "server read", func(ev *Event) bool {
+		return ev.Function == FuncGoRead && contains("POST /go-test HTTP/1.1")(ev)
+	})
+	read := waitFor(t, events, "client read", func(ev *Event) bool {
+		return ev.Function == FuncGoRead && contains("served /go-test with 4 body bytes")(ev)
+	})
+	checkConnection(t, read, server)
+	if read.Latency <= 0 || read.PID != uint32(os.Getpid()) {
+		t.Errorf("bad event metadata: %+v", read)
+	}
+}
+
+func TestOpenSSL(t *testing.T) {
+	requireRoot(t)
+	curl := requireTool(t, "curl")
+	events := startTracer(t, Options{Comm: "curl"}, systemTargets(t, discover.OpenSSL))
+	srv, _ := newServer(t)
+
+	if out, err := exec.Command(curl, "-sk", "--http1.1", srv.URL+"/curl-test").CombinedOutput(); err != nil {
+		t.Fatalf("curl: %v: %s", err, out)
+	}
+	write := waitFor(t, events, "SSL_write", func(ev *Event) bool {
+		return ev.Function == FuncSSLWrite && contains("GET /curl-test HTTP/1.1")(ev)
+	})
+	checkConnection(t, write, srv.Listener.Addr().String())
+	if write.Comm != "curl" {
+		t.Errorf("comm %q", write.Comm)
+	}
+	waitFor(t, events, "SSL_read", func(ev *Event) bool {
+		return ev.Function == FuncSSLRead && contains("served /curl-test")(ev)
+	})
+}
+
+func TestOpenSSLLargePayload(t *testing.T) {
+	requireRoot(t)
+	curl := requireTool(t, "curl")
+	events := startTracer(t, Options{Comm: "curl", MaxCapture: MaxCaptureLimit}, systemTargets(t, discover.OpenSSL))
+	srv, _ := newServer(t)
+
+	body := make([]byte, 200<<10)
+	rand.Read(body)
+	file := filepath.Join(t.TempDir(), "body")
+	os.WriteFile(file, body, 0o600)
+	if out, err := exec.Command(curl, "-sk", "--http1.1", "--data-binary", "@"+file, srv.URL+"/upload").CombinedOutput(); err != nil {
+		t.Fatalf("curl: %v: %s", err, out)
+	}
+
+	// curl sends the body in several SSL_write calls of up to 64 KiB, each
+	// captured as multiple ring buffer chunks.
+	var got []byte
+	timeout := time.After(10 * time.Second)
+	for len(got) < len(body) {
+		select {
+		case ev := <-events:
+			if ev.Function != FuncSSLWrite || bytes.HasPrefix(ev.Data, []byte("POST ")) {
+				continue
+			}
+			if ev.Truncated() || ev.Incomplete {
+				t.Fatalf("partial capture: size %d, captured %d, incomplete %v", ev.Size, len(ev.Data), ev.Incomplete)
+			}
+			got = append(got, ev.Data...)
+		case <-timeout:
+			t.Fatalf("timed out with %d of %d bytes", len(got), len(body))
+		}
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatal("captured body differs from what was sent")
+	}
+}
+
+func TestOpenSSLEx(t *testing.T) {
+	requireRoot(t)
+	python := requireTool(t, "python3")
+	events := startTracer(t, Options{Comm: "python3"}, systemTargets(t, discover.OpenSSL))
+	_, port := newServer(t)
+
+	script := `
+import socket, ssl, sys
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", int(sys.argv[1]))))
+s.sendall(b"GET /python-test HTTP/1.0\r\nHost: x\r\n\r\n")
+while s.recv(4096): pass
+`
+	if out, err := exec.Command(python, "-c", script, port).CombinedOutput(); err != nil {
+		t.Fatalf("python: %v: %s", err, out)
+	}
+	// Python 3.10+ uses SSL_write_ex; older versions SSL_write.
+	waitFor(t, events, "python write", func(ev *Event) bool {
+		return (ev.Function == FuncSSLWriteEx || ev.Function == FuncSSLWrite) && contains("GET /python-test")(ev)
+	})
+}
+
+func TestGnuTLS(t *testing.T) {
+	requireRoot(t)
+	gnutls := requireTool(t, "gnutls-cli")
+	events := startTracer(t, Options{}, systemTargets(t, discover.GnuTLS))
+	_, port := newServer(t)
+
+	cmd := exec.Command(gnutls, "--insecure", "--logfile=/dev/null", "-p", port, "127.0.0.1")
+	cmd.Stdin = strings.NewReader("GET /gnutls-test HTTP/1.0\r\nHost: x\r\n\r\n")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("gnutls-cli: %v: %s", err, out) // exits non-zero when the server closes
+	}
+	waitFor(t, events, "gnutls_record_send", func(ev *Event) bool {
+		return ev.Function == FuncGnuTLSSend && contains("GET /gnutls-test")(ev)
+	})
+	waitFor(t, events, "gnutls_record_recv", func(ev *Event) bool {
+		return ev.Function == FuncGnuTLSRecv && contains("served /gnutls-test")(ev)
+	})
+}
+
+func TestNSS(t *testing.T) {
+	requireRoot(t)
+	cc := requireTool(t, "cc")
+	pkgConfig := requireTool(t, "pkg-config")
+	flags, err := exec.Command(pkgConfig, "--cflags", "--libs", "nss").Output()
+	if err != nil {
+		t.Skip("NSS development files not installed")
+	}
+	client := filepath.Join(t.TempDir(), "nssclient")
+	args := append([]string{"testdata/nssclient.c", "-o", client}, strings.Fields(string(flags))...)
+	if out, err := exec.Command(cc, args...).CombinedOutput(); err != nil {
+		t.Fatalf("build NSS client: %v: %s", err, out)
+	}
+
+	events := startTracer(t, Options{Comm: "nssclient"}, systemTargets(t, discover.NSS))
+	_, port := newServer(t)
+	if out, err := exec.Command(client, port, "/nss-test").CombinedOutput(); err != nil {
+		t.Fatalf("nssclient: %v: %s", err, out)
+	}
+	waitFor(t, events, "PR_Write", func(ev *Event) bool {
+		return ev.Function == FuncPRWrite && contains("GET /nss-test")(ev)
+	})
+	waitFor(t, events, "PR_Read", func(ev *Event) bool {
+		return ev.Function == FuncPRRead && contains("served /nss-test")(ev)
+	})
+}
+
+// Without kernel BTF the CO-RE socket lookup is compiled out; everything
+// else must still work.
+func TestWithoutKernelBTF(t *testing.T) {
+	requireRoot(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := discover.Inspect(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := startTracer(t, Options{PID: os.Getpid(), ignoreKernelBTF: true}, targets)
+
+	srv, _ := newServer(t)
+	resp, err := srv.Client().Get(srv.URL + "/no-btf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	ev := waitFor(t, events, "client write", func(ev *Event) bool {
+		return ev.Function == FuncGoWrite && contains("GET /no-btf")(ev)
+	})
+	if ev.Remote.IsValid() {
+		t.Errorf("addresses resolved without BTF: %s", ev.Remote)
+	}
+	if ev.FD < 0 {
+		t.Error("fd missing")
+	}
+}
