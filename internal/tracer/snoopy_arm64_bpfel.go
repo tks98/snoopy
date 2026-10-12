@@ -88,6 +88,7 @@ const (
 	snoopyMapCallDepth              = "call_depth"
 	snoopyMapConnInfos              = "conn_infos"
 	snoopyMapEvents                 = "events"
+	snoopyMapExecs                  = "execs"
 	snoopyMapLostEvents             = "lost_events"
 	snoopyProgPR_ReadEnter          = "PR_Read_enter"
 	snoopyProgPR_RecvEnter          = "PR_Recv_enter"
@@ -102,6 +103,7 @@ const (
 	snoopyProgMbedtlsSslWriteEnter  = "mbedtls_ssl_write_enter"
 	snoopyProgS2nRecvEnter          = "s2n_recv_enter"
 	snoopyProgS2nSendEnter          = "s2n_send_enter"
+	snoopyProgSchedProcessExec      = "sched_process_exec"
 	snoopyProgSslReadEnter          = "ssl_read_enter"
 	snoopyProgSslReadExEnter        = "ssl_read_ex_enter"
 	snoopyProgSslWriteEnter         = "ssl_write_enter"
@@ -173,6 +175,7 @@ type snoopyProgramSpecs struct {
 	MbedtlsSslWriteEnter  *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_write_enter"`
 	S2nRecvEnter          *ebpf.ProgramSpec `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.ProgramSpec `ebpf:"s2n_send_enter"`
+	SchedProcessExec      *ebpf.ProgramSpec `ebpf:"sched_process_exec"`
 	SslReadEnter          *ebpf.ProgramSpec `ebpf:"ssl_read_enter"`
 	SslReadExEnter        *ebpf.ProgramSpec `ebpf:"ssl_read_ex_enter"`
 	SslWriteEnter         *ebpf.ProgramSpec `ebpf:"ssl_write_enter"`
@@ -191,6 +194,7 @@ type snoopyMapSpecs struct {
 	CallDepth   *ebpf.MapSpec `ebpf:"call_depth"`
 	ConnInfos   *ebpf.MapSpec `ebpf:"conn_infos"`
 	Events      *ebpf.MapSpec `ebpf:"events"`
+	Execs       *ebpf.MapSpec `ebpf:"execs"`
 	LostEvents  *ebpf.MapSpec `ebpf:"lost_events"`
 }
 
@@ -230,6 +234,7 @@ type snoopyMaps struct {
 	CallDepth   *ebpf.Map `ebpf:"call_depth"`
 	ConnInfos   *ebpf.Map `ebpf:"conn_infos"`
 	Events      *ebpf.Map `ebpf:"events"`
+	Execs       *ebpf.Map `ebpf:"execs"`
 	LostEvents  *ebpf.Map `ebpf:"lost_events"`
 }
 
@@ -239,6 +244,7 @@ func (m *snoopyMaps) Close() error {
 		m.CallDepth,
 		m.ConnInfos,
 		m.Events,
+		m.Execs,
 		m.LostEvents,
 	)
 }
@@ -272,6 +278,7 @@ type snoopyPrograms struct {
 	MbedtlsSslWriteEnter  *ebpf.Program `ebpf:"mbedtls_ssl_write_enter"`
 	S2nRecvEnter          *ebpf.Program `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.Program `ebpf:"s2n_send_enter"`
+	SchedProcessExec      *ebpf.Program `ebpf:"sched_process_exec"`
 	SslReadEnter          *ebpf.Program `ebpf:"ssl_read_enter"`
 	SslReadExEnter        *ebpf.Program `ebpf:"ssl_read_ex_enter"`
 	SslWriteEnter         *ebpf.Program `ebpf:"ssl_write_enter"`
@@ -297,6 +304,7 @@ func (p *snoopyPrograms) Close() error {
 		p.MbedtlsSslWriteEnter,
 		p.S2nRecvEnter,
 		p.S2nSendEnter,
+		p.SchedProcessExec,
 		p.SslReadEnter,
 		p.SslReadExEnter,
 		p.SslWriteEnter,

@@ -68,7 +68,7 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	fs.StringVar(&c.comm, "comm", "", "trace only processes with this exact name (as in /proc/<pid>/comm)")
 	fs.StringVar(&c.container, "container", "", "trace only processes in the container with this ID (or ID prefix)")
 	fs.Var(&c.libs, "lib", "also attach to this library or executable, e.g. a binary with OpenSSL linked in statically (repeatable)")
-	fs.BoolVar(&c.noScan, "no-scan", false, "don't scan running processes for TLS libraries and Go binaries; only use system libraries and --lib")
+	fs.BoolVar(&c.noScan, "no-scan", false, "don't scan running or newly started processes for TLS libraries and Go binaries; only use system libraries and --lib")
 	fs.BoolVar(&c.json, "json", false, "print events as JSON, one object per line")
 	fs.BoolVar(&c.hex, "hex", false, "always print payloads as a hex dump")
 	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, fmt.Sprintf("maximum bytes to capture per call (up to %d)", tracer.MaxCaptureLimit))
@@ -157,34 +157,26 @@ func run(cfg config) error {
 	attached := 0
 	for _, target := range targets {
 		funcs, err := t.Attach(target)
-		if err != nil {
-			logf("warning: %s %s: %v", target.Library, target.Path, err)
+		if reportAttach(cfg, target, funcs, err) {
+			attached++
 		}
-		if len(funcs) == 0 {
-			continue
-		}
-		attached++
-		desc := fmt.Sprintf("%-7s %s", target.Library, target.Path)
-		var notes []string
-		if target.Note != "" {
-			notes = append(notes, target.Note)
-		}
-		if target.Go != nil {
-			notes = append(notes, target.Go.Version)
-		}
-		if len(notes) > 0 {
-			desc += " (" + strings.Join(notes, ", ") + ")"
-		}
-		if cfg.verbose {
-			desc += ": " + strings.Join(funcs, ", ")
-		}
-		logf("attached to %s", desc)
 	}
 	if attached == 0 {
 		return errors.New("could not attach to any TLS library")
 	}
 	if err := t.AttachSyscalls(); err != nil {
 		logf("warning: socket addresses will be missing for C libraries: %v", err)
+	}
+	// With --pid, the one process is already running; otherwise also attach
+	// to what processes started from now on use.
+	if cfg.pid == 0 && !cfg.noScan {
+		stopWatching, err := t.WatchNewProcesses(discover.NewWatcher(targets), acceptProcess(cfg),
+			func(target discover.Target, funcs []string, err error) { reportAttach(cfg, target, funcs, err) })
+		if err != nil {
+			logf("warning: programs started from now on are only traced if they use a library already attached to: %v", err)
+		} else {
+			defer stopWatching()
+		}
 	}
 	if !t.ResolvesAddresses() {
 		logf("warning: the kernel has no BTF, so socket addresses are looked up in /proc and may be missing for short-lived connections")
@@ -222,6 +214,51 @@ func run(cfg config) error {
 		logf("warning: %d chunks were dropped because the ring buffer was full", lost)
 	}
 	return err
+}
+
+// reportAttach logs the result of attaching to a target and reports whether
+// any function was attached to.
+func reportAttach(cfg config, target discover.Target, funcs []string, err error) bool {
+	if err != nil {
+		logf("warning: %s %s: %v", target.Library, target.Path, err)
+	}
+	if len(funcs) == 0 {
+		return false
+	}
+	desc := fmt.Sprintf("%-7s %s", target.Library, target.Path)
+	var notes []string
+	if target.Note != "" {
+		notes = append(notes, target.Note)
+	}
+	if target.Go != nil {
+		notes = append(notes, target.Go.Version)
+	}
+	if len(notes) > 0 {
+		desc += " (" + strings.Join(notes, ", ") + ")"
+	}
+	if cfg.verbose {
+		desc += ": " + strings.Join(funcs, ", ")
+	}
+	logf("attached to %s", desc)
+	return true
+}
+
+// acceptProcess returns which new processes are worth inspecting: those
+// that --comm and --container would trace.
+func acceptProcess(cfg config) func(pid int) bool {
+	if cfg.comm == "" && cfg.container == "" {
+		return nil
+	}
+	resolver := procinfo.NewResolver("/proc") // not shared: Resolver isn't safe for concurrent use
+	return func(pid int) bool {
+		if cfg.comm != "" {
+			comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+			if err != nil || strings.TrimSuffix(string(comm), "\n") != cfg.comm {
+				return false
+			}
+		}
+		return cfg.container == "" || strings.HasPrefix(resolver.ContainerID(uint32(pid)), cfg.container)
+	}
 }
 
 // openPrinters sets up the requested outputs and returns a function that

@@ -159,6 +159,52 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 	return targets, warnings, nil
 }
 
+// Watcher finds targets in processes that start after Find ran. Each file is
+// inspected once, however many processes use it.
+type Watcher struct {
+	proc string
+	seen map[fileID]bool
+}
+
+// NewWatcher returns a Watcher that skips the files of known, which are
+// already attached to.
+func NewWatcher(known []Target) *Watcher {
+	w := &Watcher{proc: "/proc", seen: map[fileID]bool{}}
+	for _, t := range known {
+		if id, err := idOf(t.Path); err == nil {
+			w.seen[id] = true
+		}
+	}
+	return w
+}
+
+// Process returns the targets among a process's executable and mapped TLS
+// libraries that haven't been seen before. Errors (typically, the process
+// has exited) are ignored. It isn't safe for concurrent use.
+func (w *Watcher) Process(pid int) []Target {
+	files, err := processFiles(w.proc, pid)
+	if err != nil {
+		return nil
+	}
+	var targets []Target
+	for _, c := range files {
+		id, err := idOf(c.path)
+		if err != nil || w.seen[id] {
+			continue
+		}
+		found, err := Inspect(c.path)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+			continue // gone with the process, or not ours to see; maybe next time
+		}
+		w.seen[id] = true
+		for i := range found {
+			found[i].Note = c.note
+		}
+		targets = append(targets, found...)
+	}
+	return targets
+}
+
 // systemLibraries returns the TLS libraries installed in the usual places.
 func systemLibraries() []string {
 	var out []string

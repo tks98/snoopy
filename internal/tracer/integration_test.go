@@ -117,7 +117,12 @@ func startTracer(t *testing.T, opts Options, targets []discover.Target) *eventLo
 	if err := tr.AttachSyscalls(); err != nil {
 		t.Fatal(err)
 	}
+	return runTracer(t, tr)
+}
 
+// runTracer collects a tracer's events until the test ends, then closes it.
+func runTracer(t *testing.T, tr *Tracer) *eventLog {
+	t.Helper()
 	events := &eventLog{added: make(chan struct{}, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -673,5 +678,71 @@ t.join()
 	}
 	if ev.PID == ev.TID {
 		t.Error("expected the write to come from a thread")
+	}
+}
+
+// A program started after the tracer, using a library nothing has attached
+// to yet (a private copy of libssl), is found through its exec and traced.
+func TestNewProcess(t *testing.T) {
+	requireRoot(t)
+	curl := requireTool(t, "curl")
+	system := systemTargets(t, discover.OpenSSL)
+	if len(system) == 0 {
+		t.Skip("no system OpenSSL")
+	}
+	libDir := t.TempDir()
+	lib, err := os.ReadFile(system[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(libDir, filepath.Base(system[0].Path)), lib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tr, err := New(Options{Comm: "curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var attached []string
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil), nil, func(target discover.Target, funcs []string, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		attached = append(attached, fmt.Sprintf("%s %s %v %v", target.Library, target.Path, funcs, err))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := runTracer(t, tr)
+	t.Cleanup(stop) // runs before runTracer's cleanup closes the tracer
+
+	// Answer late, so the response arrives after the copy was attached.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Second)
+		fmt.Fprintf(w, "served %s late", r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	cmd := exec.Command(curl, "-sk", "--http1.1", srv.URL+"/new-process")
+	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+libDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("curl: %v: %s", err, out)
+	}
+	ev := waitFor(t, events, "SSL_read from the private libssl", func(ev *Event) bool {
+		return ev.Function == FuncSSLRead && contains("served /new-process late")(ev)
+	})
+	checkConnection(t, ev, srv.Listener.Addr().String())
+
+	mu.Lock()
+	defer mu.Unlock()
+	t.Logf("attached: %q", attached)
+	found := false
+	for _, a := range attached {
+		found = found || strings.Contains(a, libDir)
+	}
+	if !found {
+		t.Errorf("the private libssl in %s wasn't attached to", libDir)
 	}
 }

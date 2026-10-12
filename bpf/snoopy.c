@@ -169,6 +169,13 @@ struct {
 	__uint(max_entries, 16 << 20); // resized from user space
 } events SEC(".maps");
 
+// PIDs of processes that executed a new program, so user space can attach
+// to TLS libraries and programs that start after it did.
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 64 << 10);
+} execs SEC(".maps");
+
 // Chunks that could not be written because the ring buffer was full.
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -561,6 +568,16 @@ static __always_inline int record_fd(__u64 fd)
 	 (id) == 206 /* sendto */ || (id) == 207 /* recvfrom */ ||            \
 	 (id) == 211 /* sendmsg */ || (id) == 212 /* recvmsg */)
 #endif
+
+// sched:sched_process_exec, raised after a successful execve. It runs in the
+// process itself, which by then has a single thread, so its PID is the TGID.
+SEC("raw_tracepoint/sched_process_exec")
+int sched_process_exec(struct bpf_raw_tracepoint_args *ctx)
+{
+	__u32 pid = bpf_get_current_pid_tgid() >> 32;
+	bpf_ringbuf_output(&execs, &pid, sizeof(pid), 0);
+	return 0;
+}
 
 // raw_syscalls:sys_enter(struct pt_regs *regs, long id). A raw tracepoint
 // needs neither tracefs nor BTF, unlike the per-syscall tracepoints.

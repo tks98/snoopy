@@ -37,6 +37,8 @@ HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_S
 - **Finds what to trace:** system libraries, libraries loaded by running
   processes (including inside containers, and copies that an upgrade has
   since replaced), Go programs, and anything you point it at with `--lib`.
+  Programs and containers started while snoopy runs are picked up as they
+  start.
 - **Tunnels:** traffic sent through an HTTPS proxy shows up as plaintext,
   not as the TLS records sent to the proxy.
 - **Connection details:** process, thread, socket and local and remote
@@ -90,7 +92,7 @@ sudo snoopy --lib /usr/bin/node     # also attach to a binary with OpenSSL linke
 | `--comm NAME` | Trace only processes with exactly this name, as in `/proc/<pid>/comm` (at most 15 characters). |
 | `--container ID` | Trace only processes in this container, given as an ID or ID prefix. |
 | `--lib PATH` | Also attach to this library or executable. Can be repeated. |
-| `--no-scan` | Don't scan running processes; attach only to system libraries and `--lib`. |
+| `--no-scan` | Don't scan running or newly started processes; attach only to system libraries and `--lib`. |
 | `--json` | Print one JSON object per line. |
 | `--hex` | Always hex-dump payloads. |
 | `--max-size N` | Maximum bytes captured per call, up to 1 MiB. Defaults to 16384. |
@@ -100,10 +102,13 @@ sudo snoopy --lib /usr/bin/node     # also attach to a binary with OpenSSL linke
 | `--verbose` | List the functions attached in each file. |
 | `--version` | Print the version. |
 
-snoopy attaches to what exists when it starts. A process that starts later is
-traced if it uses a library snoopy already attached to, such as the system
-`libssl`. A new Go program or container image is not traced until you restart
-snoopy.
+snoopy also watches for programs that start while it runs and attaches to
+the TLS libraries and Go programs they use. It looks at a new process right
+after its `exec` and again after 50 ms, 500 ms and 3 s, since shared libraries
+are loaded after the `exec`. TLS calls a new program makes before then are
+missed, unless it uses a library snoopy was already attached to, such as the
+system `libssl`. With `--pid`, only that process is traced and nothing new is
+picked up.
 
 ### Wireshark
 
@@ -179,7 +184,8 @@ through its BIO layer (e.g. `openssl s_server -www`).
 1. snoopy finds the files to probe: shared libraries in the usual system
    directories, the libraries and executables mapped by running processes
    (reached through `/proc/<pid>/root`, which also covers containers), and any
-   `--lib` paths.
+   `--lib` paths. While it runs, a `sched_process_exec` tracepoint reports
+   new programs, whose files are inspected the same way.
 2. A uprobe on each read/write function records the buffer pointer and the
    connection handle. A return probe copies the bytes actually transferred
    into a ring buffer, in chunks of up to 16 KiB. Go programs can't use return
