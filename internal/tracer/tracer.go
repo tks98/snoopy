@@ -256,9 +256,16 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 		return nil, fmt.Errorf("unsupported library %v", target.Library)
 	}
 
-	opts := &link.UprobeOptions{PID: t.opts.PID}
 	var attached []string
 	for _, p := range probes {
+		opts := &link.UprobeOptions{PID: t.opts.PID}
+		if target.Offsets != nil { // a stripped copy: functions found by signature
+			off, ok := target.Offsets[p.symbol]
+			if !ok {
+				continue
+			}
+			opts.Address = off
+		}
 		// Attach the return probe first so no entry goes unmatched.
 		ret, err := ex.Uretprobe(p.symbol, t.objs.TlsReturn, opts)
 		if errors.Is(err, link.ErrNoSymbol) {

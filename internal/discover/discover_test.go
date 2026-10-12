@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -325,5 +326,62 @@ func TestRustlsSymbols(t *testing.T) {
 		if got := rustlsWrite.MatchString(tc.name); got != tc.write {
 			t.Errorf("write %v for %s", got, tc.name)
 		}
+	}
+}
+
+// TestBoringSSLBinaries runs findBoringSSL on real binaries, which are too
+// large to keep here, e.g. Chrome, Brave or Edge from their .deb packages:
+//
+//	SNOOPY_BORINGSSL_TEST=chrome=chrome.debug,brave go test -run BoringSSLBinaries ./internal/discover
+//
+// A debug file after "=" (from Chrome's debug-info zips) is checked against.
+func TestBoringSSLBinaries(t *testing.T) {
+	spec := os.Getenv("SNOOPY_BORINGSSL_TEST")
+	if spec == "" {
+		t.Skip("set SNOOPY_BORINGSSL_TEST to binaries to check")
+	}
+	for _, item := range strings.Split(spec, ",") {
+		path, debug, _ := strings.Cut(item, "=")
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			f, err := elf.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			got, err := findBoringSSL(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("SSL_read at %#x, SSL_write at %#x", got["SSL_read"], got["SSL_write"])
+			if debug == "" {
+				return
+			}
+			d, err := elf.Open(debug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Close()
+			syms, err := d.Symbols()
+			if err != nil {
+				t.Fatal(err)
+			}
+			checked := 0
+			for _, s := range syms {
+				if s.Name != "SSL_read" && s.Name != "SSL_write" {
+					continue
+				}
+				want, err := fileOffset(f, s.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got[s.Name] != want {
+					t.Errorf("%s at %#x, debug symbols say %#x", s.Name, got[s.Name], want)
+				}
+				checked++
+			}
+			if checked != 2 {
+				t.Errorf("debug file has %d of SSL_read and SSL_write", checked)
+			}
+		})
 	}
 }

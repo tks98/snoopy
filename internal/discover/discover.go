@@ -65,10 +65,33 @@ type Target struct {
 	Go *GoInfo
 	// Rust holds the probe locations for Rustls targets.
 	Rust *RustInfo
+	// Offsets, if set, are the file offsets of a C library's functions,
+	// for a stripped copy whose functions were found by signature.
+	Offsets map[string]uint64
 }
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
 var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*"}
+
+// knownPrograms are where Chromium-based browsers and Electron apps are
+// installed. They link BoringSSL statically, so they are found by signature
+// (see findBoringSSL), which takes a moment for these large binaries: doing
+// it at startup means they are traced from the moment they start.
+var knownPrograms = []string{
+	"/opt/google/chrome/chrome",
+	"/opt/google/chrome-beta/chrome",
+	"/opt/google/chrome-unstable/chrome",
+	"/opt/brave.com/brave/brave",
+	"/opt/microsoft/msedge/msedge",
+	"/opt/vivaldi/vivaldi-bin",
+	"/usr/lib/chromium/chromium",
+	"/usr/lib/chromium-browser/chromium-browser",
+	"/usr/lib64/chromium-browser/chromium-browser",
+	"/usr/share/code/code",
+	"/usr/lib/slack/slack",
+	"/usr/share/discord/Discord",
+	"/opt/Signal/signal-desktop",
+}
 
 // libDirs are searched for system-wide libraries.
 var libDirs = []string{
@@ -148,7 +171,7 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 			warnings = append(warnings, fmt.Errorf("%s: no supported TLS functions found", c.path))
 		}
 		for i := range found {
-			found[i].Note = c.note
+			found[i].Note = joinNotes(found[i].Note, c.note)
 		}
 		targets = append(targets, found...)
 	}
@@ -203,7 +226,7 @@ func (w *Watcher) Process(pid int) []Target {
 		}
 		w.seen[id] = true
 		for i := range found {
-			found[i].Note = c.note
+			found[i].Note = joinNotes(found[i].Note, c.note)
 		}
 		targets = append(targets, found...)
 	}
@@ -213,6 +236,11 @@ func (w *Watcher) Process(pid int) []Target {
 // systemLibraries returns the TLS libraries installed in the usual places.
 func systemLibraries() []string {
 	var out []string
+	for _, p := range knownPrograms {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			out = append(out, real)
+		}
+	}
 	for _, dir := range libDirs {
 		for _, pat := range libPatterns {
 			matches, _ := filepath.Glob(filepath.Join(dir, pat))
@@ -356,4 +384,11 @@ func idOf(path string) (fileID, error) {
 		return fileID{}, errors.New("no inode information")
 	}
 	return fileID{dev: uint64(st.Dev), ino: st.Ino}, nil
+}
+
+func joinNotes(a, b string) string {
+	if a == "" || b == "" {
+		return a + b
+	}
+	return a + ", " + b
 }

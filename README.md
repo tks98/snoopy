@@ -36,7 +36,8 @@ server: cloudflare
 
 - **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS, wolfSSL,
   Mbed TLS, s2n-tls, rustls (synchronous use) and Go's `crypto/tls`,
-  including stripped Go binaries.
+  including stripped Go binaries, and the stripped BoringSSL inside Chrome,
+  other Chromium-based browsers and Electron apps (x86_64).
 - **Finds what to trace:** system libraries, libraries loaded by running
   processes (including inside containers, and copies that an upgrade has
   since replaced), Go programs, and anything you point it at with `--lib`.
@@ -170,6 +171,7 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | Library | Functions | Notes |
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
+| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 only. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer. Checked on Chrome 155 and 156 (against Google's debug symbols), Brave 1.97 and Edge 155. Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Start Chrome with `--disable-quic`: its HTTP/3 traffic doesn't go through these functions. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. Includes the copy bundled with Firefox, also when Firefox starts after snoopy. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
@@ -181,8 +183,8 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
-Not supported: rustls under tokio (see above), Java, TLS libraries with stripped symbols (such as the
-BoringSSL inside Chrome), QUIC/HTTP/3, and programs that use OpenSSL only
+Not supported: rustls under tokio (see above), Java, stripped TLS libraries
+other than BoringSSL (and BoringSSL on arm64), QUIC/HTTP/3, and programs that use OpenSSL only
 through its BIO layer (e.g. `openssl s_server -www`).
 
 Browsers use HTTP/3 (QUIC) with many sites, and that traffic doesn't pass
@@ -207,6 +209,19 @@ To see it in Firefox, set `network.http.http3.enable` to `false` in
    (BTF-based relocation) so one compiled program works on every kernel
    version.
 4. User space reassembles the chunks and adds the container ID.
+
+Stripped programs that link BoringSSL statically, like Chrome, have no
+`SSL_read` or `SSL_write` symbols, so snoopy recognizes the functions by what
+they do (`internal/funcfind`). BoringSSL reports errors with the source file's
+name and a reason code, and those codes are fixed constants. Among the
+functions that load the address of `ssl/ssl_lib.cc`, `SSL_write` is the one
+that reports "bad length" besides "uninitialized" and "protocol is shutdown",
+and `SSL_read` reports "uninitialized", "protocol is shutdown" and "should not
+have been called", counting the BoringSSL functions they call (the compiler
+inlines differently from build to build). Both must take three arguments,
+which rules out callers that BoringSSL code was inlined into. Function starts
+are frame pointer prologues that are called directly. If any of this doesn't
+give exactly one answer for each function, snoopy doesn't attach.
 
 The eBPF program is `bpf/snoopy.c`. It is compiled with `bpf2go` into the
 `internal/tracer/snoopy_*_bpfel.{o,go}` files, which are committed so that a

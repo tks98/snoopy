@@ -175,6 +175,24 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   waiting for the next one (which teaches `conn_infos` its socket, so only
   a connection's first write lacks it). Returns are `io::Result<usize>` in
   two registers (`RET_RUST_RESULT`).
+- **Stripped BoringSSL** (Chrome, Brave, Edge, Electron) is found by
+  signature: `internal/discover/boringssl.go` on top of
+  `internal/funcfind`, a small library for locating functions in stripped
+  x86-64 binaries (strings, the instructions that load them, function starts
+  from frame pointer prologues at direct call targets, constant call
+  arguments, which arguments a function reads). The README's "How it works"
+  has the rules. Results are cached by build ID in the user's cache dir.
+  Check new browser releases with `SNOOPY_BORINGSSL_TEST` (see
+  `TestBoringSSLBinaries`): Google publishes debug symbols for official
+  Chrome builds at
+  `https://edgedl.me.gvt1.com/chrome/linux/symbols/google-chrome-debug-info-linux64-<version>.zip`
+  (stable, beta, dev), so the answers can be checked exactly. Chrome 156
+  changed what was inlined, which is why reason codes count callees and
+  candidates must read three arguments.
+- **x86 testing on an Apple Silicon Mac:** `limactl start --arch=x86_64
+  --vm-type=qemu template://ubuntu-24.04` gives an emulated x86 VM where
+  uprobes work (Docker's amd64 emulation is user-space only). Slow, but fine
+  for running Chrome headless.
 
 ## Review findings (all addressed in commit `a35431f`)
 
