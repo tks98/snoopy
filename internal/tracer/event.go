@@ -1,0 +1,121 @@
+package tracer
+
+import (
+	"net/netip"
+	"time"
+
+	"github.com/tks98/snoopy/internal/discover"
+)
+
+// Function is a traced TLS function. Keep in sync with enum fn_id in
+// bpf/snoopy.c.
+type Function uint8
+
+const (
+	FuncSSLRead Function = iota + 1
+	FuncSSLWrite
+	FuncSSLReadEx
+	FuncSSLWriteEx
+	FuncGnuTLSRecv
+	FuncGnuTLSSend
+	FuncPRRead
+	FuncPRWrite
+	FuncPRRecv
+	FuncPRSend
+	FuncGoRead
+	FuncGoWrite
+)
+
+var functionNames = map[Function]string{
+	FuncSSLRead:    "SSL_read",
+	FuncSSLWrite:   "SSL_write",
+	FuncSSLReadEx:  "SSL_read_ex",
+	FuncSSLWriteEx: "SSL_write_ex",
+	FuncGnuTLSRecv: "gnutls_record_recv",
+	FuncGnuTLSSend: "gnutls_record_send",
+	FuncPRRead:     "PR_Read",
+	FuncPRWrite:    "PR_Write",
+	FuncPRRecv:     "PR_Recv",
+	FuncPRSend:     "PR_Send",
+	FuncGoRead:     "crypto/tls.(*Conn).Read",
+	FuncGoWrite:    "crypto/tls.(*Conn).Write",
+}
+
+func (f Function) String() string {
+	if name, ok := functionNames[f]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+// Library returns the TLS library the function belongs to.
+func (f Function) Library() discover.Library {
+	switch f {
+	case FuncSSLRead, FuncSSLWrite, FuncSSLReadEx, FuncSSLWriteEx:
+		return discover.OpenSSL
+	case FuncGnuTLSRecv, FuncGnuTLSSend:
+		return discover.GnuTLS
+	case FuncPRRead, FuncPRWrite, FuncPRRecv, FuncPRSend:
+		return discover.NSS
+	case FuncGoRead, FuncGoWrite:
+		return discover.GoTLS
+	}
+	return 0
+}
+
+// Direction is whether data was received or sent.
+type Direction int
+
+const (
+	Read  Direction = iota // received from the peer
+	Write                  // sent to the peer
+)
+
+func (d Direction) String() string {
+	if d == Write {
+		return "write"
+	}
+	return "read"
+}
+
+// Direction returns whether the function receives or sends data.
+func (f Function) Direction() Direction {
+	switch f {
+	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite:
+		return Write
+	}
+	return Read
+}
+
+// Event is one completed call to a TLS read or write function.
+type Event struct {
+	Time     time.Time
+	Latency  time.Duration // time spent inside the call
+	Function Function
+	PID      uint32
+	TID      uint32
+	Comm     string // process name, truncated to 15 bytes by the kernel
+	ConnID   uint64 // library connection handle, stable for a connection's lifetime
+	FD       int32  // socket file descriptor, or -1 if unknown
+
+	// Size is the number of plaintext bytes the call transferred. Data holds
+	// the captured bytes, which may be fewer (see Truncated).
+	Size uint32
+	Data []byte
+
+	// ReadError is set if the payload could not be copied from the process.
+	ReadError bool
+	// Incomplete is set if part of the payload was dropped because the ring
+	// buffer was full.
+	Incomplete bool
+
+	// Filled in by enrichment, if available.
+	ContainerID string
+	Local       netip.AddrPort
+	Remote      netip.AddrPort
+}
+
+// Truncated reports whether fewer bytes were captured than transferred.
+func (e *Event) Truncated() bool {
+	return len(e.Data) < int(e.Size)
+}
