@@ -103,7 +103,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 gnutls-bin libnss3-dev pkg-config
       - run: sudo chmod 0666 /dev/kvm
       - run: go install lmb.io/vimto@v0.4.0
-      - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      # vimto only runs statically linked binaries.
+      - run: CGO_ENABLED=0 go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
       # vimto boots the kernel in a VM that sees the host's files; see .vimto.toml.
       - name: Run on Linux ${{ matrix.kernel }}
         working-directory: internal/tracer

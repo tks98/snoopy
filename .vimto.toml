@@ -1,7 +1,7 @@
 # Settings for running the integration tests on other kernels with vimto
 # (https://github.com/lmb/vimto), which boots one in a VM, e.g.:
 #
-#   go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+#   CGO_ENABLED=0 go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
 #   cd internal/tracer && vimto -kernel :5.10 exec -- ./tracer.test -test.v
 #
 # Kernel images come from github.com/cilium/ci-kernels.

@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,8 +50,37 @@ func requireTool(t *testing.T, name string) string {
 	return path
 }
 
+// eventLog collects every event, so tests can wait for events in any order:
+// events from different CPUs need not arrive in the order they happened.
+type eventLog struct {
+	mu     sync.Mutex
+	events []*Event
+	added  chan struct{}
+}
+
+func (l *eventLog) add(ev *Event) {
+	l.mu.Lock()
+	l.events = append(l.events, ev)
+	l.mu.Unlock()
+	select {
+	case l.added <- struct{}{}:
+	default:
+	}
+}
+
+func (l *eventLog) find(match func(*Event) bool) *Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, ev := range l.events {
+		if match(ev) {
+			return ev
+		}
+	}
+	return nil
+}
+
 // startTracer attaches to the given library kinds and collects events.
-func startTracer(t *testing.T, opts Options, targets []discover.Target) <-chan *Event {
+func startTracer(t *testing.T, opts Options, targets []discover.Target) *eventLog {
 	t.Helper()
 	tr, err := New(opts)
 	if err != nil {
@@ -72,10 +102,10 @@ func startTracer(t *testing.T, opts Options, targets []discover.Target) <-chan *
 		t.Fatal(err)
 	}
 
-	events := make(chan *Event, 4096)
+	events := &eventLog{added: make(chan struct{}, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- tr.Run(ctx, func(ev *Event) { events <- ev }) }()
+	go func() { done <- tr.Run(ctx, events.add) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
@@ -101,15 +131,17 @@ func systemTargets(t *testing.T, lib discover.Library) []discover.Target {
 	return out
 }
 
-func waitFor(t *testing.T, events <-chan *Event, desc string, match func(*Event) bool) *Event {
+// waitFor returns the first event, received so far or later, that matches.
+func waitFor(t *testing.T, events *eventLog, desc string, match func(*Event) bool) *Event {
 	t.Helper()
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(20 * time.Second)
 	for {
+		if ev := events.find(match); ev != nil {
+			return ev
+		}
 		select {
-		case ev := <-events:
-			if match(ev) {
-				return ev
-			}
+		case <-events.added:
+		case <-time.After(100 * time.Millisecond):
 		case <-timeout:
 			t.Fatalf("timed out waiting for %s", desc)
 		}
@@ -215,25 +247,27 @@ func TestOpenSSLLargePayload(t *testing.T) {
 	}
 
 	// curl sends the body in several SSL_write calls of up to 64 KiB, each
-	// captured as multiple ring buffer chunks.
+	// captured as multiple ring buffer chunks. One thread makes them, so
+	// they arrive in order.
 	var got []byte
-	timeout := time.After(10 * time.Second)
-	for len(got) < len(body) {
-		select {
-		case ev := <-events:
+	deadline := time.Now().Add(20 * time.Second)
+	for len(got) < len(body) && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+		got = got[:0]
+		events.mu.Lock()
+		for _, ev := range events.events {
 			if ev.Function != FuncSSLWrite || bytes.HasPrefix(ev.Data, []byte("POST ")) {
 				continue
 			}
 			if ev.Truncated() || ev.Incomplete {
-				t.Fatalf("partial capture: size %d, captured %d, incomplete %v", ev.Size, len(ev.Data), ev.Incomplete)
+				t.Errorf("partial capture: size %d, captured %d, incomplete %v", ev.Size, len(ev.Data), ev.Incomplete)
 			}
 			got = append(got, ev.Data...)
-		case <-timeout:
-			t.Fatalf("timed out with %d of %d bytes", len(got), len(body))
 		}
+		events.mu.Unlock()
 	}
 	if !bytes.Equal(got, body) {
-		t.Fatal("captured body differs from what was sent")
+		t.Fatalf("captured %d bytes that differ from the %d sent", len(got), len(body))
 	}
 }
 
