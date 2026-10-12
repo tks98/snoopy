@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, test and build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Run gofmt on:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./... && go vet -tags integration ./...
+
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+
+      - run: go test -race ./...
+
+      - name: Build for amd64 and arm64
+        run: |
+          CGO_ENABLED=0 GOARCH=amd64 go build -o /dev/null .
+          CGO_ENABLED=0 GOARCH=arm64 go build -o /dev/null .
+
+  generate:
+    name: BPF objects are up to date
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 llvm-18
+      # The committed objects were built with clang 18; other versions
+      # produce different (but equivalent) bytes.
+      - run: go generate ./...
+        env:
+          BPF2GO_CC: clang-18
+          BPF2GO_STRIP: llvm-strip-18
+      - name: Check for differences
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::Generated BPF code is stale; run 'make generate' with clang 18 and commit the result."
+            exit 1
+          fi
+
+  integration:
+    name: Integration tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install TLS clients
+        run: sudo apt-get update && sudo apt-get install -y curl python3 gnutls-bin libnss3-dev pkg-config
+      - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      - name: Run (as root)
+        working-directory: internal/tracer
+        run: sudo ./tracer.test -test.v -test.timeout 5m
+      # --quiet: the runner's own TLS traffic, including its credentials,
+      # must not end up in the (public) log.
+      - name: Smoke-test the binary
+        run: |
+          go build -o snoopy .
+          ./snoopy --version
+          sudo timeout -s INT 5 ./snoopy --no-scan --quiet || [ $? -eq 124 ]
+
+  kernels:
+    name: Integration tests (Linux ${{ matrix.kernel }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Long-term kernels, oldest first. Images from github.com/cilium/ci-kernels.
+        kernel: ["5.10", "5.15", "6.1", "6.6", "6.12"]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install QEMU and TLS clients
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 gnutls-bin libnss3-dev pkg-config
+      - run: sudo chmod 0666 /dev/kvm
+      # vimto refuses to run unless it was itself built without cgo.
+      - run: CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0
+      # vimto only runs statically linked binaries.
+      - run: CGO_ENABLED=0 go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      # vimto boots the kernel in a VM that sees the host's files; see .vimto.toml.
+      - name: Run on Linux ${{ matrix.kernel }}
+        working-directory: internal/tracer
+        run: vimto -kernel :${{ matrix.kernel }} exec -- ./tracer.test -test.v -test.timeout 5m

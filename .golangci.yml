@@ -1,0 +1,9 @@
+version: "2"
+
+linters:
+  exclusions:
+    presets:
+      - std-error-handling # unchecked Close, Fprint, ...
+    rules:
+      - path: _test\.go
+        linters: [errcheck]

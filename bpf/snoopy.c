@@ -1,137 +1,779 @@
-#include <linux/ptrace.h>
+// SPDX-License-Identifier: (MIT OR GPL-2.0-only)
+//go:build ignore
+
+// snoopy's eBPF program.
+//
+// Uprobes on the plaintext read/write functions of TLS libraries record the
+// buffer pointer on entry; the matching return probe copies the bytes that
+// were actually transferred into a ring buffer, split into chunks of up to
+// CHUNK_SIZE bytes. A syscall tracepoint that fires while a thread is inside
+// a TLS call tells us which file descriptor (socket) the call used, and the
+// socket's addresses are read from the kernel's struct sock (via CO-RE).
+//
+// Every struct passed to a helper is zeroed first: kernels before 6.3 reject
+// programs that pass uninitialized stack memory, padding included.
+
+#include "vmlinux.h"
+#include "bpf_helpers.h"
+#include "bpf_tracing.h"
+#include "bpf_core_read.h"
+
+char LICENSE[] SEC("license") = "Dual MIT/GPL";
 
 #define TASK_COMM_LEN 16
-#define MAX_DATA_SIZE 10000
+#define CHUNK_SIZE 16384 // one maximum-size TLS record
+#define MAX_CHUNKS 64	 // CHUNK_SIZE * MAX_CHUNKS = 1 MiB per call
+#define MAX_DEPTH 4	 // TLS calls nested in TLS calls, e.g. through an HTTPS proxy
 
-// Struct for storing TLS related data.
-struct TLS_MESSAGE {
-    uint64_t elapsed;
-    uint32_t pid;              // Process ID
-    uint32_t tid;              // Thread ID
-    int retval;
-    char function_name[20];    // Function name
-    char process_name[TASK_COMM_LEN];
-    char message[MAX_DATA_SIZE];
+// Keep in sync with the Function constants in internal/tracer/event.go.
+enum fn_id {
+	FN_SSL_READ = 1,
+	FN_SSL_WRITE,
+	FN_SSL_READ_EX,
+	FN_SSL_WRITE_EX,
+	FN_GNUTLS_RECORD_RECV,
+	FN_GNUTLS_RECORD_SEND,
+	FN_PR_READ,
+	FN_PR_WRITE,
+	FN_PR_RECV,
+	FN_PR_SEND,
+	FN_GO_READ,
+	FN_GO_WRITE,
 };
 
-// eBPF data structures.
-BPF_HASH(tls_map_data, u64, const char *);
-BPF_HASH(tls_map_timestamp, u64, u64);
-BPF_PERF_OUTPUT(TLS_DATA_PERF_OUTPUT);
-BPF_PERCPU_ARRAY(tls_data_array, struct TLS_MESSAGE);
+// How to interpret a function's return value.
+enum ret_kind {
+	RET_INT,     // int: bytes transferred, <= 0 on error
+	RET_SSIZE,   // ssize_t: bytes transferred, < 0 on error
+	RET_BOOL_EX, // 1 on success, byte count written through a size_t*
+};
 
-// Utility function to extract the process ID from a PID-TID combo.
-static inline u32 extractProcessID(u64 ptID) {
-    return ptID >> 32;
+#define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
+
+// Each ring buffer record is this header followed by chunk_len bytes of
+// payload, in a record of one of the sizes defined below.
+struct event_header {
+	__u64 timestamp_ns; // CLOCK_MONOTONIC when the call returned
+	__u64 latency_ns;   // time spent inside the call
+	__u64 conn_id;	    // SSL*, gnutls_session_t, PRFileDesc* or *tls.Conn
+	__u32 pid;
+	__u32 tid;
+	__u32 size;	    // bytes transferred by the call
+	__u32 captured;	    // bytes captured for the call (<= size)
+	__u32 chunk_offset; // offset of this chunk within the captured bytes
+	__u32 chunk_len;    // valid payload bytes in this record
+	__s32 fd;	    // socket fd, or -1 if unknown
+	__u16 family;	    // AF_INET, AF_INET6, or 0 if the addresses are unknown
+	__u16 lport;
+	__u16 rport;
+	__u8 fn;	    // enum fn_id
+	__u8 flags;
+	__u8 laddr[16];	    // IPv4 addresses use the first 4 bytes
+	__u8 raddr[16];
+	char comm[TASK_COMM_LEN]; // process name
+	__u8 _pad[4];	    // so the payload starts at sizeof(struct event_header)
+};
+
+#define DEFINE_EVENT(size)                                                    \
+	struct event_##size {                                                 \
+		struct event_header h;                                        \
+		__u8 data[size];                                              \
+	}
+DEFINE_EVENT(256);
+DEFINE_EVENT(2048);
+DEFINE_EVENT(16384); // CHUNK_SIZE
+
+// Configuration, set from user space before the program is loaded.
+const volatile __u32 targ_tgid = 0;
+const volatile __u32 max_capture = CHUNK_SIZE;
+const volatile bool filter_comm = false;
+const volatile char targ_comm[TASK_COMM_LEN] = {};
+// Whether the kernel has BTF. Without it, the CO-RE reads of kernel structs
+// (socket addresses, process names) can't be relocated and are skipped.
+const volatile bool have_btf = false;
+
+struct active_call {
+	__u64 start_ns;
+	__u64 conn;
+	__u64 buf;
+	__u64 len_ptr; // SSL_*_ex: where the byte count is written
+	__u64 sp;      // stack pointer on entry (C libraries)
+	__s32 fd;
+	__u8 fn;
+	__u8 ret;      // enum ret_kind
+	__u8 _pad[2];
+};
+
+// A thread (C libraries) or goroutine (Go) with TLS calls in flight.
+// Goroutines can move between threads while blocked inside a call, so Go
+// calls are tracked by the goroutine's g pointer instead of the thread.
+struct depth_key {
+	__u64 thread; // pid_tgid for C libraries, tgid for Go
+	__u64 g;      // g pointer for Go, 0 for C libraries
+};
+
+struct call_key {
+	__u64 thread;
+	__u64 g;
+	__u32 depth; // nesting level of the call
+	__u32 _pad;
+};
+
+// Number of nested calls in flight per thread or goroutine.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 32768);
+	__type(key, struct depth_key);
+	__type(value, __u32);
+} call_depth SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 32768);
+	__type(key, struct call_key);
+	__type(value, struct active_call);
+} active_calls SEC(".maps");
+
+// The socket last seen for each TLS connection. A TLS read that is served
+// from the library's internal buffer makes no syscall, so remember it.
+struct conn_key {
+	__u64 tgid;
+	__u64 conn;
+};
+
+struct conn_info {
+	__s32 fd;
+	__u16 family;
+	__u16 lport;
+	__u16 rport;
+	__u8 laddr[16];
+	__u8 raddr[16];
+	__u8 _pad[2];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct conn_key);
+	__type(value, struct conn_info);
+} conn_infos SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 16 << 20); // resized from user space
+} events SEC(".maps");
+
+// Chunks that could not be written because the ring buffer was full.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} lost_events SEC(".maps");
+
+// Force bpf2go to emit a Go type for struct event_header.
+const struct event_header *unused_event_header __attribute__((unused));
+
+// The name of the current process (its main thread), which is what
+// /proc/<pid>/comm shows. Threads can have names of their own.
+static __always_inline void get_process_name(char *buf)
+{
+	if (have_btf) {
+		struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+		struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+		if (leader && !bpf_core_read(buf, TASK_COMM_LEN, &leader->comm))
+			return;
+	}
+	bpf_get_current_comm(buf, TASK_COMM_LEN);
 }
 
-// Utility function to extract the thread ID from a PID-TID combo.
-static inline u32 extractThreadID(u64 ptID) {
-    return (u32) ptID;
+static __always_inline bool should_trace(__u64 pid_tgid)
+{
+	if (targ_tgid && (__u32)(pid_tgid >> 32) != targ_tgid)
+		return false;
+
+	if (filter_comm) {
+		char comm[TASK_COMM_LEN];
+		get_process_name(comm);
+		for (int i = 0; i < TASK_COMM_LEN; i++) {
+			if (comm[i] != targ_comm[i])
+				return false;
+			if (comm[i] == 0)
+				break;
+		}
+	}
+	return true;
 }
 
-// Function to send TLS message data to a perf event.
-static inline int send_tls_message_to_perf(struct pt_regs* ctx, u32 bufferLen, u64 id, const char * buffer, const char * function_name) {
-    u32 zeroPointer = 0;
-    struct TLS_MESSAGE* tlsMessage = tls_data_array.lookup(&zeroPointer);
-
-    if (!tlsMessage) {
-        return 0;
-    }
-
-    // Extract and populate PID and TID from the combined ID.
-    tlsMessage->pid = extractProcessID(id);
-    tlsMessage->tid = extractThreadID(id);
-
-    u64 *et = tls_map_timestamp.lookup(&id);
-    if (!et) {
-        return 0;
-    }
-
-    // Get the current command name and elapsed time.
-    bpf_get_current_comm(&tlsMessage->process_name, sizeof(tlsMessage->process_name));
-    tlsMessage->elapsed = bpf_ktime_get_ns() - *et;
-
-    // Populate function_name.
-    __builtin_memcpy(tlsMessage->function_name, function_name, sizeof(tlsMessage->function_name));
-
-    // Copy data from user space to kernel space.
-    u32 outputBufferLen = bufferLen < MAX_DATA_SIZE ? bufferLen : MAX_DATA_SIZE;
-    bpf_probe_read(&tlsMessage->retval, sizeof(int), (void*)PT_REGS_RC(ctx));
-    bpf_probe_read(tlsMessage->message, outputBufferLen, buffer);
-
-    // Submit data to perf event.
-    TLS_DATA_PERF_OUTPUT.perf_submit(ctx, tlsMessage, sizeof(*tlsMessage));
-
-    // Clean up maps.
-    tls_map_data.delete(&id);
-    tls_map_timestamp.delete(&id);
-
-    return 0;
+static __always_inline void count_lost(void)
+{
+	__u32 zero = 0;
+	__u64 *lost = bpf_map_lookup_elem(&lost_events, &zero);
+	if (lost)
+		*lost += 1;
 }
 
-// Function to handle entry into SSL functions.
-static inline int handle_uprobe_entry(struct pt_regs* ctx, const char * function_name) {
-    u64 processThreadID = bpf_get_current_pid_tgid();
-    u64 ts = bpf_ktime_get_ns();
-    const char* buffer = (const char*)PT_REGS_PARM2(ctx);
+#define AF_INET 2
+#define AF_INET6 10
+#define S_IFMT 0170000
+#define S_IFSOCK 0140000
 
-    // Store timestamp and buffer pointer in maps.
-    tls_map_timestamp.update(&processThreadID, &ts);
-    tls_map_data.update(&processThreadID, &buffer);
+// Fills in the addresses of the current task's socket fd, if it is a TCP/IP
+// socket: current->files->fdt->fd[fd]->private_data is its struct socket.
+static __always_inline void resolve_socket(__s32 fd, struct conn_info *info)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct fdtable *fdt = BPF_CORE_READ(task, files, fdt);
+	if (!fdt || fd < 0 || (unsigned int)fd >= BPF_CORE_READ(fdt, max_fds))
+		return;
 
-    return 0;
+	struct file **fds = BPF_CORE_READ(fdt, fd);
+	struct file *file = NULL;
+	if (bpf_core_read(&file, sizeof(file), &fds[fd]) || !file)
+		return;
+	if ((BPF_CORE_READ(file, f_inode, i_mode) & S_IFMT) != S_IFSOCK)
+		return;
+
+	struct socket *sock = BPF_CORE_READ(file, private_data);
+	struct sock *sk = BPF_CORE_READ(sock, sk);
+	if (!sk)
+		return;
+
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (family == AF_INET) {
+		BPF_CORE_READ_INTO(&info->laddr, sk, __sk_common.skc_rcv_saddr);
+		BPF_CORE_READ_INTO(&info->raddr, sk, __sk_common.skc_daddr);
+	} else if (family == AF_INET6 && bpf_core_field_exists(sk->__sk_common.skc_v6_daddr)) {
+		BPF_CORE_READ_INTO(&info->laddr, sk, __sk_common.skc_v6_rcv_saddr);
+		BPF_CORE_READ_INTO(&info->raddr, sk, __sk_common.skc_v6_daddr);
+	} else {
+		return;
+	}
+	info->family = family;
+	info->lport = BPF_CORE_READ(sk, __sk_common.skc_num);
+	// skc_dport is in network byte order; both supported arches are little-endian.
+	info->rport = __builtin_bswap16(BPF_CORE_READ(sk, __sk_common.skc_dport));
 }
 
-// Function to handle return from SSL functions.
-static inline int handle_uprobe_return(struct pt_regs* ctx, const char * function_name) {
-    u64 processThreadID = bpf_get_current_pid_tgid();
-    const char** buffer = tls_map_data.lookup(&processThreadID);
+// Records the socket a TLS connection is using.
+static __always_inline void track_conn(__u64 pid_tgid, __u64 conn, __s32 fd)
+{
+	if (!conn || fd < 0)
+		return;
 
-    if (!buffer) {
-        return 0;
-    }
+	struct conn_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.conn = conn;
 
-    int len = (int)PT_REGS_RC(ctx);
-    if (len >= 0) {
-        send_tls_message_to_perf(ctx, len, processThreadID, *buffer, function_name);
-    }
+	struct conn_info info;
+	__builtin_memset(&info, 0, sizeof(info));
+	info.fd = fd;
+	if (have_btf)
+		resolve_socket(fd, &info);
 
-    return 0;
+	// Once a socket is closed (e.g. reset by the peer), the kernel releases
+	// its port and skc_num reads 0, yet buffered data can still be read.
+	// Keep what we learned while it was open.
+	struct conn_info *known = bpf_map_lookup_elem(&conn_infos, &key);
+	if (known && known->fd == fd && known->family && (!info.family || !info.lport || !info.rport))
+		return;
+	bpf_map_update_elem(&conn_infos, &key, &info, BPF_ANY);
 }
 
-// Uprobe functions for SSL write (OpenSSL).
-int uprobe_entry_SSL_write(struct pt_regs* ctx) {
-    return handle_uprobe_entry(ctx, "SSL_write");
+// Copies one chunk into a ring buffer record of the smallest size that fits.
+// Each chunk gets its own reserved record rather than being assembled in
+// shared per-CPU space, where a preempted program could have its data
+// overwritten. Returns 0, -1 if the payload couldn't be read, or -2 if the
+// ring buffer is full.
+#define OUTPUT_CHUNK(cap)                                                     \
+	do {                                                                  \
+		struct event_##cap *r = bpf_ringbuf_reserve(&events, sizeof(*r), 0); \
+		if (!r)                                                       \
+			return -2;                                            \
+		r->h = *h;                                                    \
+		r->h.chunk_len = len;                                         \
+		if (bpf_probe_read_user(r->data, len, src)) {                 \
+			r->h.flags |= EVENT_FLAG_READ_ERROR;                  \
+			r->h.chunk_len = 0;                                   \
+			bpf_ringbuf_submit(r, 0);                             \
+			return -1;                                            \
+		}                                                             \
+		bpf_ringbuf_submit(r, 0);                                     \
+		return 0;                                                     \
+	} while (0)
+
+static __always_inline int output_full_chunk(const struct event_header *h, const void *src)
+{
+	const __u32 len = CHUNK_SIZE;
+	OUTPUT_CHUNK(16384);
 }
 
-int uprobe_return_SSL_write(struct pt_regs* ctx) {
-    return handle_uprobe_return(ctx, "SSL_write");
+// The last chunk of a call can be smaller. Only it picks a record size, so
+// each iteration of the chunk loop has a single path that continues; the
+// verifier would otherwise have to explore every combination of sizes.
+static __always_inline int output_last_chunk(const struct event_header *h, const void *src, __u32 len)
+{
+	if (len <= 256)
+		OUTPUT_CHUNK(256);
+	if (len <= 2048)
+		OUTPUT_CHUNK(2048);
+	if (len <= CHUNK_SIZE)
+		OUTPUT_CHUNK(16384);
+	return -1;
 }
 
-// Uprobe functions for SSL read (OpenSSL).
-int uprobe_entry_SSL_read(struct pt_regs* ctx) {
-    return handle_uprobe_entry(ctx, "SSL_read");
+static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
+{
+	if (n <= 0)
+		return;
+
+	struct event_header h;
+	__builtin_memset(&h, 0, sizeof(h));
+	__u64 now = bpf_ktime_get_ns();
+	h.timestamp_ns = now;
+	h.latency_ns = now - call->start_ns;
+	h.conn_id = call->conn;
+	h.pid = pid_tgid >> 32;
+	h.tid = (__u32)pid_tgid;
+	h.size = n > 0xffffffff ? 0xffffffff : (__u32)n;
+	h.fn = call->fn;
+	get_process_name(h.comm);
+
+	h.fd = call->fd;
+	struct conn_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.conn = call->conn;
+	struct conn_info *info = bpf_map_lookup_elem(&conn_infos, &key);
+	if (info && (h.fd < 0 || h.fd == info->fd)) {
+		h.fd = info->fd;
+		h.family = info->family;
+		h.lport = info->lport;
+		h.rport = info->rport;
+		__builtin_memcpy(h.laddr, info->laddr, sizeof(h.laddr));
+		__builtin_memcpy(h.raddr, info->raddr, sizeof(h.raddr));
+	}
+
+	__u32 captured = h.size < max_capture ? h.size : max_capture;
+	h.captured = captured;
+
+	for (__u32 i = 0; i < MAX_CHUNKS; i++) {
+		__u32 off = i * CHUNK_SIZE;
+		if (off >= captured)
+			break;
+
+		__u32 len = captured - off;
+		const void *src = (const void *)(call->buf + off);
+		h.chunk_offset = off;
+		int err = len > CHUNK_SIZE ? output_full_chunk(&h, src) : output_last_chunk(&h, src, len);
+		if (err == -2)
+			count_lost();
+		if (err || len <= CHUNK_SIZE)
+			break;
+	}
 }
 
-int uprobe_return_SSL_read(struct pt_regs* ctx) {
-    return handle_uprobe_return(ctx, "SSL_read");
+/* Bookkeeping for calls in flight */
+
+static __always_inline __u32 get_depth(struct depth_key *dk)
+{
+	__u32 *depth = bpf_map_lookup_elem(&call_depth, dk);
+	return depth ? *depth : 0;
 }
 
-// Uprobe functions for record recv (GnuTLS).
-int uprobe_entry_gnutls_record_recv(struct pt_regs* ctx) {
-    return handle_uprobe_entry(ctx, "gnutls_record_recv");
+static __always_inline void set_depth(struct depth_key *dk, __u32 depth)
+{
+	if (depth)
+		bpf_map_update_elem(&call_depth, dk, &depth, BPF_ANY);
+	else
+		bpf_map_delete_elem(&call_depth, dk);
 }
 
-int uprobe_return_gnutls_record_recv(struct pt_regs* ctx) {
-    return handle_uprobe_return(ctx, "gnutls_record_recv");
+static __always_inline void call_key_at(struct call_key *key, struct depth_key *dk, __u32 depth)
+{
+	__builtin_memset(key, 0, sizeof(*key));
+	key->thread = dk->thread;
+	key->g = dk->g;
+	key->depth = depth;
 }
 
-// Uprobe functions for record send (GnuTLS).
-int uprobe_entry_gnutls_record_send(struct pt_regs* ctx) {
-    return handle_uprobe_entry(ctx, "gnutls_record_send");
+static __always_inline void push_call(struct depth_key *dk, __u32 depth, struct active_call *call)
+{
+	// Deeper nesting than this means returns were missed; start over.
+	if (depth >= MAX_DEPTH)
+		depth = 0;
+
+	struct call_key key;
+	call_key_at(&key, dk, depth);
+	bpf_map_update_elem(&active_calls, &key, call, BPF_ANY);
+	set_depth(dk, depth + 1);
 }
 
-int uprobe_return_gnutls_record_send(struct pt_regs* ctx) {
-    return handle_uprobe_return(ctx, "gnutls_record_send");
+// Calls that the innermost call is nested in (TLS tunneled through TLS) go
+// over the same socket; give those that don't know theirs this one.
+static __always_inline void propagate_fd(__u64 pid_tgid, struct depth_key *dk, __u32 depth, __s32 fd)
+{
+	struct call_key key;
+	for (int i = 0; i < MAX_DEPTH; i++) {
+		if ((__u32)i >= depth)
+			break;
+		call_key_at(&key, dk, i);
+		struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
+		if (call && call->fd < 0) {
+			call->fd = fd;
+			track_conn(pid_tgid, call->conn, fd);
+		}
+	}
+}
+
+/* C libraries (OpenSSL, GnuTLS, NSS) */
+
+// The stack pointer a uretprobe sees, which is the entry stack pointer
+// minus the popped return address on x86 and unchanged on arm64. Matching
+// it pairs each return with its own call even when calls nest.
+#if defined(__TARGET_ARCH_x86)
+#define RETURN_TO_ENTRY_SP(sp) ((sp) - 8)
+#elif defined(__TARGET_ARCH_arm64)
+#define RETURN_TO_ENTRY_SP(sp) (sp)
+#endif
+
+static __always_inline int enter_call(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
+				      __u64 len_ptr)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	call.start_ns = bpf_ktime_get_ns();
+	call.conn = conn;
+	call.buf = (__u64)buf;
+	call.len_ptr = len_ptr;
+	call.sp = PT_REGS_SP(ctx);
+	call.fd = -1;
+	call.fn = fn;
+	call.ret = ret;
+
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	push_call(&dk, get_depth(&dk), &call);
+	return 0;
+}
+
+static __always_inline int exit_call(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	__u32 depth = get_depth(&dk);
+	if (!depth)
+		return 0;
+
+	// Find this return's call, innermost first.
+	__u64 sp = RETURN_TO_ENTRY_SP(PT_REGS_SP(ctx));
+	struct call_key key;
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	int found = -1;
+	for (int i = MAX_DEPTH - 1; i >= 0; i--) {
+		if ((__u32)i >= depth)
+			continue;
+		call_key_at(&key, &dk, i);
+		struct active_call *active = bpf_map_lookup_elem(&active_calls, &key);
+		if (active && active->sp == sp) {
+			call = *active;
+			found = i;
+			break;
+		}
+	}
+	if (found < 0)
+		return 0;
+	bpf_map_delete_elem(&active_calls, &key);
+	set_depth(&dk, found); // calls nested deeper than this one never returned
+
+	__s64 n;
+	switch (call.ret) {
+	case RET_INT:
+		n = (int)PT_REGS_RC(ctx);
+		break;
+	case RET_SSIZE:
+		n = (long)PT_REGS_RC(ctx);
+		break;
+	default: {
+		__u64 len = 0;
+		if ((int)PT_REGS_RC(ctx) != 1 || !call.len_ptr ||
+		    bpf_probe_read_user(&len, sizeof(len), (void *)call.len_ptr))
+			return 0;
+		n = len;
+	}
+	}
+
+	emit(&call, pid_tgid, n);
+	return 0;
+}
+
+// Remember which fd the thread's innermost TLS call is doing I/O on.
+static __always_inline int record_fd(__u64 fd)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	__u32 depth = get_depth(&dk);
+	if (!depth || depth > MAX_DEPTH)
+		return 0;
+
+	struct call_key key;
+	call_key_at(&key, &dk, depth - 1);
+	struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
+	if (!call)
+		return 0;
+	call->fd = (__s32)fd;
+	track_conn(pid_tgid, call->conn, call->fd);
+	propagate_fd(pid_tgid, &dk, depth - 1, call->fd);
+	return 0;
+}
+
+// Syscalls a TLS library may use to move data over its socket. They all take
+// the file descriptor as their first argument.
+#if defined(__TARGET_ARCH_x86)
+#define SYSCALL_FD(regs) ((regs)->di)
+#define IS_SOCKET_IO_SYSCALL(id)                                              \
+	((id) == 0 /* read */ || (id) == 1 /* write */ ||                     \
+	 (id) == 19 /* readv */ || (id) == 20 /* writev */ ||                 \
+	 (id) == 44 /* sendto */ || (id) == 45 /* recvfrom */ ||              \
+	 (id) == 46 /* sendmsg */ || (id) == 47 /* recvmsg */)
+#elif defined(__TARGET_ARCH_arm64)
+#define SYSCALL_FD(regs) ((regs)->orig_x0)
+#define IS_SOCKET_IO_SYSCALL(id)                                              \
+	((id) == 63 /* read */ || (id) == 64 /* write */ ||                   \
+	 (id) == 65 /* readv */ || (id) == 66 /* writev */ ||                 \
+	 (id) == 206 /* sendto */ || (id) == 207 /* recvfrom */ ||            \
+	 (id) == 211 /* sendmsg */ || (id) == 212 /* recvmsg */)
+#endif
+
+// raw_syscalls:sys_enter(struct pt_regs *regs, long id). A raw tracepoint
+// needs neither tracefs nor BTF, unlike the per-syscall tracepoints.
+SEC("raw_tracepoint/sys_enter")
+int sys_enter(struct bpf_raw_tracepoint_args *ctx)
+{
+	long id = (long)ctx->args[1];
+	if (!IS_SOCKET_IO_SYSCALL(id))
+		return 0;
+
+	struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
+	__u64 fd = 0;
+	if (bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD(regs)))
+		return 0;
+	return record_fd(fd);
+}
+
+// OpenSSL, BoringSSL and LibreSSL.
+// int SSL_read(SSL *ssl, void *buf, int num) and SSL_write alike.
+// int SSL_read_ex(SSL *ssl, void *buf, size_t num, size_t *readbytes) and SSL_write_ex alike.
+
+SEC("uprobe/SSL_read")
+int BPF_UPROBE(ssl_read_enter, void *ssl, void *buf)
+{
+	return enter_call(ctx, FN_SSL_READ, RET_INT, (__u64)ssl, buf, 0);
+}
+
+SEC("uprobe/SSL_write")
+int BPF_UPROBE(ssl_write_enter, void *ssl, const void *buf)
+{
+	return enter_call(ctx, FN_SSL_WRITE, RET_INT, (__u64)ssl, buf, 0);
+}
+
+SEC("uprobe/SSL_read_ex")
+int BPF_UPROBE(ssl_read_ex_enter, void *ssl, void *buf, __u64 num, __u64 *readbytes)
+{
+	return enter_call(ctx, FN_SSL_READ_EX, RET_BOOL_EX, (__u64)ssl, buf, (__u64)readbytes);
+}
+
+SEC("uprobe/SSL_write_ex")
+int BPF_UPROBE(ssl_write_ex_enter, void *ssl, const void *buf, __u64 num, __u64 *written)
+{
+	return enter_call(ctx, FN_SSL_WRITE_EX, RET_BOOL_EX, (__u64)ssl, buf, (__u64)written);
+}
+
+// GnuTLS.
+// ssize_t gnutls_record_recv(gnutls_session_t session, void *data, size_t data_size) and _send alike.
+
+SEC("uprobe/gnutls_record_recv")
+int BPF_UPROBE(gnutls_record_recv_enter, void *session, void *data)
+{
+	return enter_call(ctx, FN_GNUTLS_RECORD_RECV, RET_SSIZE, (__u64)session, data, 0);
+}
+
+SEC("uprobe/gnutls_record_send")
+int BPF_UPROBE(gnutls_record_send_enter, void *session, const void *data)
+{
+	return enter_call(ctx, FN_GNUTLS_RECORD_SEND, RET_SSIZE, (__u64)session, data, 0);
+}
+
+// NSS (via NSPR). PR_Read and friends are used for all kinds of descriptors;
+// only layered ones (the SSL layer sits on top of a TCP socket) carry TLS
+// plaintext.
+// PRInt32 PR_Read(PRFileDesc *fd, void *buf, PRInt32 amount) and PR_Write,
+// PR_Recv, PR_Send alike in their first three arguments.
+
+#define PR_DESC_LAYERED 4
+
+static __always_inline bool nspr_is_layered(const void *fd)
+{
+	// struct PRFileDesc { const PRIOMethods *methods; ... }
+	// struct PRIOMethods { PRDescType file_type; ... }
+	__u64 methods = 0;
+	__u32 type = 0;
+	if (bpf_probe_read_user(&methods, sizeof(methods), fd) || !methods)
+		return false;
+	if (bpf_probe_read_user(&type, sizeof(type), (void *)methods))
+		return false;
+	return type == PR_DESC_LAYERED;
+}
+
+#define NSPR_PROBE(fn_name, fn)                                               \
+	SEC("uprobe/" #fn_name)                                               \
+	int BPF_UPROBE(fn_name##_enter, void *fd, void *buf)                  \
+	{                                                                     \
+		if (!nspr_is_layered(fd))                                     \
+			return 0;                                             \
+		return enter_call(ctx, fn, RET_INT, (__u64)fd, buf, 0);       \
+	}
+
+NSPR_PROBE(PR_Read, FN_PR_READ)
+NSPR_PROBE(PR_Write, FN_PR_WRITE)
+NSPR_PROBE(PR_Recv, FN_PR_RECV)
+NSPR_PROBE(PR_Send, FN_PR_SEND)
+
+// One return probe serves every C function: the entry probe recorded how
+// to interpret the return value.
+SEC("uretprobe/tls_return")
+int tls_return(struct pt_regs *ctx)
+{
+	return exit_call(ctx);
+}
+
+/* Go crypto/tls */
+
+// Go's register ABI (Go 1.17+): integer arguments and results in
+// RAX, RBX, RCX, ... on amd64 and R0, R1, R2, ... on arm64. The current
+// goroutine's g pointer lives in R14 (amd64) or R28 (arm64).
+#if defined(__TARGET_ARCH_x86)
+#define GO_ARG1(x) ((x)->ax)
+#define GO_ARG2(x) ((x)->bx)
+#define GO_RET1(x) ((x)->ax)
+#define GO_G(x) ((x)->r14)
+#elif defined(__TARGET_ARCH_arm64)
+#define GO_ARG1(x) ((x)->user_regs.regs[0])
+#define GO_ARG2(x) ((x)->user_regs.regs[1])
+#define GO_RET1(x) ((x)->user_regs.regs[0])
+#define GO_G(x) ((x)->user_regs.regs[28])
+#endif
+
+// Best-effort socket fd of a *tls.Conn whose underlying net.Conn is a
+// *net.TCPConn: tls.Conn.conn is the first field, an interface whose data
+// word points at a struct starting with *netFD. The layouts have been stable
+// since Go 1.12:
+//
+//	netFD   {pfd poll.FD; family int; sotype int; ...}    (family at 56)
+//	poll.FD {fdmu fdMutex (16 bytes); Sysfd int; ...}     (56 bytes)
+//
+// Checking family and sotype guards against other net.Conn implementations,
+// whose memory would otherwise be misread as an fd.
+static __always_inline __s32 go_conn_fd(__u64 tls_conn)
+{
+	__u64 conn = 0, netfd = 0;
+	__s64 sysfd = -1, family = 0, sotype = 0;
+	if (bpf_probe_read_user(&conn, sizeof(conn), (void *)(tls_conn + 8)) || !conn)
+		return -1;
+	if (bpf_probe_read_user(&netfd, sizeof(netfd), (void *)conn) || !netfd)
+		return -1;
+	if (bpf_probe_read_user(&sysfd, sizeof(sysfd), (void *)(netfd + 16)) ||
+	    bpf_probe_read_user(&family, sizeof(family), (void *)(netfd + 56)) ||
+	    bpf_probe_read_user(&sotype, sizeof(sotype), (void *)(netfd + 64)))
+		return -1;
+	if ((family != AF_INET && family != AF_INET6) || sotype != 1 /* SOCK_STREAM */)
+		return -1;
+	if (sysfd < 0 || sysfd > (1 << 20))
+		return -1;
+	return (__s32)sysfd;
+}
+
+static __always_inline int go_enter(struct pt_regs *ctx, __u8 fn)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid >> 32;
+	dk.g = GO_G(ctx);
+	__u32 depth = get_depth(&dk);
+
+	__u64 conn = GO_ARG1(ctx);
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	call.start_ns = bpf_ktime_get_ns();
+	call.conn = conn;
+	call.buf = GO_ARG2(ctx);
+	call.fd = go_conn_fd(conn);
+	call.fn = fn;
+
+	if (call.fd >= 0) {
+		track_conn(pid_tgid, conn, call.fd);
+		propagate_fd(pid_tgid, &dk, depth, call.fd);
+	}
+	push_call(&dk, depth, &call);
+	return 0;
+}
+
+// Attached to every RET instruction of the function: uretprobes corrupt Go
+// stacks, which the runtime moves when they grow. For the same reason the
+// stack pointer can't identify the call, so calls are matched by depth.
+static __always_inline int go_exit(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid >> 32;
+	dk.g = GO_G(ctx);
+	__u32 depth = get_depth(&dk);
+	if (!depth)
+		return 0;
+	set_depth(&dk, depth - 1);
+
+	struct call_key key;
+	call_key_at(&key, &dk, depth - 1);
+	struct active_call *active = bpf_map_lookup_elem(&active_calls, &key);
+	if (!active)
+		return 0;
+	struct active_call call = *active;
+	bpf_map_delete_elem(&active_calls, &key);
+	emit(&call, pid_tgid, (__s64)GO_RET1(ctx));
+	return 0;
+}
+
+// func (c *tls.Conn) Read(b []byte) (int, error) and Write alike.
+SEC("uprobe/go_tls_read")
+int go_tls_read_enter(struct pt_regs *ctx)
+{
+	return go_enter(ctx, FN_GO_READ);
+}
+
+SEC("uprobe/go_tls_write")
+int go_tls_write_enter(struct pt_regs *ctx)
+{
+	return go_enter(ctx, FN_GO_WRITE);
+}
+
+SEC("uprobe/go_tls_return")
+int go_tls_return(struct pt_regs *ctx)
+{
+	return go_exit(ctx);
 }
