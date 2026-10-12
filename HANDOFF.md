@@ -14,7 +14,7 @@ automation, and fixes 8 issues found in an independent review.
 | Unit tests, lint, amd64 and arm64 builds | Green in CI |
 | Committed BPF objects match `bpf/snoopy.c` | Green in CI |
 | Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI (run #3) |
-| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | Red in CI run #3 only because vimto needs a static test binary. Fixed in the last commit (`CGO_ENABLED=0`). **Check CI run #4.** Locally (QEMU without KVM) 5.10, 5.15, 6.1 and 6.6 passed. 6.12 hit a test race (see below), also fixed in the last commit. |
+| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | All five pass locally (QEMU without KVM), after fixing a test race that showed on 6.12. Red in CI run #3 only because vimto needs a static test binary, fixed in `9015ae7` (`CGO_ENABLED=0`). **Check that the CI run for the latest commit is green.** |
 
 ### To do first
 
