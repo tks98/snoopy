@@ -22,6 +22,14 @@ const (
 	errProtocolIsShutdown      = 0xe2 // SSL_R_PROTOCOL_IS_SHUTDOWN
 )
 
+// Reason codes (CIPHER_R_*) that crypto/fipsmodule/cipher/aead.cc.inc
+// reports from EVP_AEAD_CTX_seal and EVP_AEAD_CTX_open; like all of
+// BoringSSL's, they keep their values.
+const (
+	aeadReasonSealOpen = 0x67 // reported by both
+	aeadReasonOpen     = 0x73 // reported by open only
+)
+
 var errNotBoringSSL = errors.New("no statically linked BoringSSL")
 
 // cachedFindBoringSSL is findBoringSSL with its results kept by build ID in
@@ -32,7 +40,7 @@ func cachedFindBoringSSL(f *elf.File) (map[string]uint64, error) {
 	var file string
 	if id := funcfind.BuildID(f); id != nil {
 		if dir, err := os.UserCacheDir(); err == nil {
-			file = filepath.Join(dir, "snoopy", "boringssl", hex.EncodeToString(id)+".json")
+			file = filepath.Join(dir, "snoopy", "boringssl", hex.EncodeToString(id)+"-v2.json")
 		}
 	}
 	if file != "" {
@@ -134,8 +142,12 @@ func findBoringSSL(f *elf.File) (map[string]uint64, error) {
 		return nil, err
 	}
 
+	found := map[string]*funcfind.Func{"SSL_read": read, "SSL_write": writes[0]}
+	if seal, open, err := findAEAD(b); err == nil {
+		found["EVP_AEAD_CTX_seal"], found["EVP_AEAD_CTX_open"] = seal, open
+	}
 	out := map[string]uint64{}
-	for name, fn := range map[string]*funcfind.Func{"SSL_read": read, "SSL_write": writes[0]} {
+	for name, fn := range found {
 		off, err := b.FileOffset(fn.Start)
 		if err != nil {
 			return nil, err
@@ -165,4 +177,49 @@ func pickSSLRead(b *funcfind.Binary, reads []*funcfind.Func) (*funcfind.Func, er
 		}
 	}
 	return nil, fmt.Errorf("BoringSSL: can't tell SSL_read among %d candidates", len(reads))
+}
+
+// findAEAD locates EVP_AEAD_CTX_seal and EVP_AEAD_CTX_open, which QUIC's
+// packet protection uses: Chrome encrypts and decrypts HTTP/3 packets with
+// them, while its TLS records go through EVP_AEAD_CTX_seal_scatter and, for
+// reading, also EVP_AEAD_CTX_open. Both take ten arguments (seal_scatter
+// takes thirteen); open is the one that reports aeadReasonOpen.
+func findAEAD(b *funcfind.Binary) (seal, open *funcfind.Func, err error) {
+	file, ok := b.FindString("/cipher/aead.cc.inc")
+	if !ok {
+		return nil, nil, errors.New("BoringSSL: no aead.cc.inc")
+	}
+	own := map[uint64][]int64{}
+	var fns []*funcfind.Func
+	for _, ref := range b.Refs(file) {
+		fn, ok := b.FuncAt(ref)
+		if !ok || own[fn.Start] != nil {
+			continue
+		}
+		reasons, err := b.ConstArgsNear(fn, file, 2)
+		if err != nil {
+			return nil, nil, err
+		}
+		fns = append(fns, fn)
+		own[fn.Start] = append(reasons, -1)
+	}
+	var seals, opens []*funcfind.Func
+	for _, fn := range fns {
+		if b.StackArgs(fn) != 10 {
+			continue
+		}
+		// Their own codes, without their callees': seal calls a helper that
+		// reports aeadReasonOpen too.
+		reasons := own[fn.Start]
+		switch {
+		case slices.Contains(reasons, aeadReasonOpen):
+			opens = append(opens, fn)
+		case slices.Contains(reasons, aeadReasonSealOpen):
+			seals = append(seals, fn)
+		}
+	}
+	if len(seals) != 1 || len(opens) != 1 {
+		return nil, nil, fmt.Errorf("BoringSSL: %d candidates for EVP_AEAD_CTX_seal, %d for open", len(seals), len(opens))
+	}
+	return seals[0], opens[0], nil
 }

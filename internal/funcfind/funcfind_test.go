@@ -80,6 +80,7 @@ func testBinary(t *testing.T) (*Binary, map[string]uint64) {
 	a.call("helper")
 	a.call("read3")
 	a.call("onearg")
+	a.call("eightargs")
 	a.bytes(0xc3) // ret
 	a.align()
 	a.label("report")
@@ -114,6 +115,14 @@ func testBinary(t *testing.T) (*Binary, map[string]uint64) {
 	a.bytes(0x49, 0x89, 0xf7) // mov r15, rsi
 	a.bytes(0x49, 0x89, 0xfe) // mov r14, rdi
 	a.call("helper")
+	a.bytes(0x5d, 0xc3)
+	a.align()
+	// eightargs(...): reads its 7th and 8th arguments from the stack.
+	a.label("eightargs")
+	a.bytes(0x55, 0x48, 0x89, 0xe5)
+	a.bytes(0x48, 0x8b, 0x45, 0x10) // mov rax, [rbp+0x10]
+	a.bytes(0x48, 0x8b, 0x4d, 0x18) // mov rcx, [rbp+0x18]
+	a.bytes(0x48, 0x8b, 0x55, 0xf8) // mov rdx, [rbp-8]: a local, not an argument
 	a.bytes(0x5d, 0xc3)
 	a.align()
 	// onearg(x): uses only its first argument, then sets up its own call.
@@ -211,6 +220,19 @@ func TestReadsArgs(t *testing.T) {
 		}
 		if got := b.ReadsArgs(fn, tc.n); got != tc.want {
 			t.Errorf("ReadsArgs(%s, %d) = %v", tc.fn, tc.n, got)
+		}
+	}
+}
+
+func TestStackArgs(t *testing.T) {
+	b, at := testBinary(t)
+	for name, want := range map[string]int{"eightargs": 8, "read3": 0, "report": 0} {
+		fn, ok := b.FuncAt(at[name])
+		if !ok {
+			t.Fatalf("%s not found", name)
+		}
+		if got := b.StackArgs(fn); got != want {
+			t.Errorf("StackArgs(%s) = %d, want %d", name, got, want)
 		}
 	}
 }

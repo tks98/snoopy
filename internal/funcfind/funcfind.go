@@ -400,3 +400,22 @@ func BuildID(f *elf.File) []byte {
 	}
 	return nil
 }
+
+// StackArgs returns how many arguments fn takes in all, judging by the
+// stack arguments it reads: the System V convention passes the first six in
+// registers and the rest on the stack, which with a frame pointer are at
+// [rbp+16], [rbp+24] and so on. A function that reads none returns 0.
+func (b *Binary) StackArgs(fn *Func) int {
+	most := 0
+	b.insts(fn, func(ip uint64, inst x86asm.Inst) bool {
+		for _, a := range inst.Args {
+			if m, ok := a.(x86asm.Mem); ok && m.Base == x86asm.RBP && m.Index == 0 {
+				if d := int64(int32(m.Disp)); d >= 16 && (d-16)%8 == 0 && d < 16+8*64 {
+					most = max(most, len(argRegs)+int(d-16)/8+1)
+				}
+			}
+		}
+		return true
+	})
+	return most
+}

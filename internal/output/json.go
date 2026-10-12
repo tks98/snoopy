@@ -12,14 +12,15 @@ import (
 
 // JSON prints one JSON object per line (NDJSON).
 type JSON struct {
-	enc *json.Encoder
-	h2  *http2Conns
+	enc  *json.Encoder
+	h2   *http2Conns
+	quic *quicConns
 }
 
 func NewJSON(w io.Writer) *JSON {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	return &JSON{enc: enc, h2: newHTTP2Conns()}
+	return &JSON{enc: enc, h2: newHTTP2Conns(), quic: newQUICConns()}
 }
 
 // jsonEvent is the documented JSON schema; see README.md.
@@ -49,6 +50,17 @@ type jsonEvent struct {
 	// The HTTP/2 frames in the data, for connections whose start was seen.
 	HTTP2      []jsonHTTP2Frame `json:"http2,omitempty"`
 	HTTP2Error string           `json:"http2_error,omitempty"`
+	// For QUIC packets: the frames, and the HTTP/3 frames they completed.
+	QUICFrames []string         `json:"quic_frames,omitempty"`
+	HTTP3      []jsonHTTP3Frame `json:"http3,omitempty"`
+}
+
+type jsonHTTP3Frame struct {
+	Type      string       `json:"type"`
+	Stream    uint64       `json:"stream"`
+	DataBytes int          `json:"data_bytes,omitempty"`
+	Headers   []jsonHeader `json:"headers,omitempty"`
+	Error     string       `json:"error,omitempty"`
 }
 
 type jsonHTTP2Frame struct {
@@ -101,6 +113,21 @@ func (j *JSON) Print(ev *tracer.Event) error {
 		} else {
 			out.DataBase64 = ev.Data
 		}
+	}
+	if ev.Function.IsQUIC() {
+		items, _ := j.quic.process(ev)
+		for _, it := range items {
+			if it.Frame != "" {
+				out.QUICFrames = append(out.QUICFrames, it.Frame)
+				continue
+			}
+			jf := jsonHTTP3Frame{Type: it.HTTP3, Stream: it.Stream, DataBytes: len(it.Data), Error: it.Err}
+			for _, h := range it.Headers {
+				jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
+			}
+			out.HTTP3 = append(out.HTTP3, jf)
+		}
+		return j.enc.Encode(out)
 	}
 	frames, _, note := j.h2.process(ev)
 	out.HTTP2Error = note

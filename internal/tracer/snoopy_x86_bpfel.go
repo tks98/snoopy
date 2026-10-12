@@ -80,7 +80,7 @@ type snoopyEventHeader struct {
 	Pad         [4]uint8
 }
 
-type snoopyRustThread struct {
+type snoopyIoThread struct {
 	_        structs.HostLayout
 	WantConn uint64
 	LastFd   int32
@@ -96,8 +96,8 @@ const (
 	snoopyMapConnInfos              = "conn_infos"
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
+	snoopyMapIoThreads              = "io_threads"
 	snoopyMapLostEvents             = "lost_events"
-	snoopyMapRustThreads            = "rust_threads"
 	snoopyProgPR_ReadEnter          = "PR_Read_enter"
 	snoopyProgPR_RecvEnter          = "PR_Recv_enter"
 	snoopyProgPR_SendEnter          = "PR_Send_enter"
@@ -109,6 +109,8 @@ const (
 	snoopyProgGoTlsWriteEnter       = "go_tls_write_enter"
 	snoopyProgMbedtlsSslReadEnter   = "mbedtls_ssl_read_enter"
 	snoopyProgMbedtlsSslWriteEnter  = "mbedtls_ssl_write_enter"
+	snoopyProgQuicOpenEnter         = "quic_open_enter"
+	snoopyProgQuicSealEnter         = "quic_seal_enter"
 	snoopyProgRustlsReadEnter       = "rustls_read_enter"
 	snoopyProgRustlsWriteEnter      = "rustls_write_enter"
 	snoopyProgS2nRecvEnter          = "s2n_recv_enter"
@@ -183,6 +185,8 @@ type snoopyProgramSpecs struct {
 	GoTlsWriteEnter       *ebpf.ProgramSpec `ebpf:"go_tls_write_enter"`
 	MbedtlsSslReadEnter   *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_read_enter"`
 	MbedtlsSslWriteEnter  *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_write_enter"`
+	QuicOpenEnter         *ebpf.ProgramSpec `ebpf:"quic_open_enter"`
+	QuicSealEnter         *ebpf.ProgramSpec `ebpf:"quic_seal_enter"`
 	RustlsReadEnter       *ebpf.ProgramSpec `ebpf:"rustls_read_enter"`
 	RustlsWriteEnter      *ebpf.ProgramSpec `ebpf:"rustls_write_enter"`
 	S2nRecvEnter          *ebpf.ProgramSpec `ebpf:"s2n_recv_enter"`
@@ -207,8 +211,8 @@ type snoopyMapSpecs struct {
 	ConnInfos   *ebpf.MapSpec `ebpf:"conn_infos"`
 	Events      *ebpf.MapSpec `ebpf:"events"`
 	Execs       *ebpf.MapSpec `ebpf:"execs"`
+	IoThreads   *ebpf.MapSpec `ebpf:"io_threads"`
 	LostEvents  *ebpf.MapSpec `ebpf:"lost_events"`
-	RustThreads *ebpf.MapSpec `ebpf:"rust_threads"`
 }
 
 // snoopyVariableSpecs contains global variables before they are loaded into the kernel.
@@ -248,8 +252,8 @@ type snoopyMaps struct {
 	ConnInfos   *ebpf.Map `ebpf:"conn_infos"`
 	Events      *ebpf.Map `ebpf:"events"`
 	Execs       *ebpf.Map `ebpf:"execs"`
+	IoThreads   *ebpf.Map `ebpf:"io_threads"`
 	LostEvents  *ebpf.Map `ebpf:"lost_events"`
-	RustThreads *ebpf.Map `ebpf:"rust_threads"`
 }
 
 func (m *snoopyMaps) Close() error {
@@ -259,8 +263,8 @@ func (m *snoopyMaps) Close() error {
 		m.ConnInfos,
 		m.Events,
 		m.Execs,
+		m.IoThreads,
 		m.LostEvents,
-		m.RustThreads,
 	)
 }
 
@@ -291,6 +295,8 @@ type snoopyPrograms struct {
 	GoTlsWriteEnter       *ebpf.Program `ebpf:"go_tls_write_enter"`
 	MbedtlsSslReadEnter   *ebpf.Program `ebpf:"mbedtls_ssl_read_enter"`
 	MbedtlsSslWriteEnter  *ebpf.Program `ebpf:"mbedtls_ssl_write_enter"`
+	QuicOpenEnter         *ebpf.Program `ebpf:"quic_open_enter"`
+	QuicSealEnter         *ebpf.Program `ebpf:"quic_seal_enter"`
 	RustlsReadEnter       *ebpf.Program `ebpf:"rustls_read_enter"`
 	RustlsWriteEnter      *ebpf.Program `ebpf:"rustls_write_enter"`
 	S2nRecvEnter          *ebpf.Program `ebpf:"s2n_recv_enter"`
@@ -319,6 +325,8 @@ func (p *snoopyPrograms) Close() error {
 		p.GoTlsWriteEnter,
 		p.MbedtlsSslReadEnter,
 		p.MbedtlsSslWriteEnter,
+		p.QuicOpenEnter,
+		p.QuicSealEnter,
 		p.RustlsReadEnter,
 		p.RustlsWriteEnter,
 		p.S2nRecvEnter,

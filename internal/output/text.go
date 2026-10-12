@@ -21,9 +21,10 @@ type Printer interface {
 // payload, pretty-printed if it is HTTP/1.x or HTTP/2 and hex-dumped if it
 // is binary.
 type Text struct {
-	w   io.Writer
-	hex bool
-	h2  *http2Conns
+	w    io.Writer
+	hex  bool
+	h2   *http2Conns
+	quic *quicConns
 
 	dim, title, fn, write, read, header, warn func(a ...any) string
 }
@@ -38,6 +39,7 @@ func NewText(w io.Writer, hex bool) *Text {
 		w:      w,
 		hex:    hex,
 		h2:     newHTTP2Conns(),
+		quic:   newQUICConns(),
 		dim:    s(color.Faint),
 		title:  s(color.Bold),
 		fn:     s(color.FgHiMagenta, color.Bold),
@@ -78,14 +80,22 @@ func (t *Text) Print(ev *tracer.Event) error {
 	}
 	fmt.Fprintf(&b, "  %s\n", t.dim(strings.Join(extra, ", ")))
 
-	frames, isHTTP2, note := t.h2.process(ev)
-	if note != "" {
-		fmt.Fprintln(&b, t.warn("["+note+"]"))
-	}
-	if isHTTP2 && !t.hex {
-		t.writeHTTP2(&b, frames, len(ev.Data))
+	if ev.Function.IsQUIC() {
+		if items, ok := t.quic.process(ev); ok && !t.hex {
+			t.writeQUIC(&b, items)
+		} else {
+			b.WriteString(hexdump(ev.Data) + "\n")
+		}
 	} else {
-		t.writePayload(&b, ev.Data)
+		frames, isHTTP2, note := t.h2.process(ev)
+		if note != "" {
+			fmt.Fprintln(&b, t.warn("["+note+"]"))
+		}
+		if isHTTP2 && !t.hex {
+			t.writeHTTP2(&b, frames, len(ev.Data))
+		} else {
+			t.writePayload(&b, ev.Data)
+		}
 	}
 
 	switch {
@@ -152,6 +162,43 @@ func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int)
 		}
 		if len(f.Data) > 0 {
 			t.writeBody(b, f.Data)
+		}
+	}
+}
+
+// writeQUIC prints a QUIC packet's frames on one line, then the HTTP/3
+// frames its stream data completed.
+func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
+	var frames []string
+	for _, it := range items {
+		if it.Frame != "" {
+			frames = append(frames, it.Frame)
+		}
+	}
+	b.WriteString(t.dim("QUIC: "+strings.Join(frames, ", ")) + "\n")
+	for _, it := range items {
+		if it.Frame != "" {
+			continue
+		}
+		line := fmt.Sprintf("HTTP/3 %s stream=%d", it.HTTP3, it.Stream)
+		switch {
+		case it.Err != "":
+			b.WriteString(t.warn(line+": "+it.Err) + "\n")
+		case it.Headers != nil:
+			b.WriteString(t.title(line) + "\n")
+			for _, h := range it.Headers {
+				fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), escapeText([]byte(h.Value)))
+			}
+		case it.HTTP3 == "SETTINGS":
+			b.WriteString(t.dim(line+" "+string(it.Data)) + "\n")
+		default:
+			if it.Data != nil {
+				line += fmt.Sprintf(" (%d bytes)", len(it.Data))
+			}
+			b.WriteString(t.dim(line) + "\n")
+			if len(it.Data) > 0 {
+				t.writeBody(b, it.Data)
+			}
 		}
 	}
 }

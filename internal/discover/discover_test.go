@@ -352,7 +352,8 @@ func TestBoringSSLBinaries(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Logf("SSL_read at %#x, SSL_write at %#x", got["SSL_read"], got["SSL_write"])
+			t.Logf("SSL_read %#x, SSL_write %#x, EVP_AEAD_CTX_seal %#x, EVP_AEAD_CTX_open %#x",
+				got["SSL_read"], got["SSL_write"], got["EVP_AEAD_CTX_seal"], got["EVP_AEAD_CTX_open"])
 			if debug == "" {
 				return
 			}
@@ -367,7 +368,7 @@ func TestBoringSSLBinaries(t *testing.T) {
 			}
 			checked := 0
 			for _, s := range syms {
-				if s.Name != "SSL_read" && s.Name != "SSL_write" {
+				if s.Name != "SSL_read" && s.Name != "SSL_write" && s.Name != "EVP_AEAD_CTX_seal" && s.Name != "EVP_AEAD_CTX_open" {
 					continue
 				}
 				want, err := fileOffset(f, s.Value)
@@ -379,8 +380,8 @@ func TestBoringSSLBinaries(t *testing.T) {
 				}
 				checked++
 			}
-			if checked != 2 {
-				t.Errorf("debug file has %d of SSL_read and SSL_write", checked)
+			if checked != 4 {
+				t.Errorf("debug file has %d of the 4 functions", checked)
 			}
 		})
 	}

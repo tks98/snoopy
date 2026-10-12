@@ -200,8 +200,9 @@ func monotonicClock() func(uint64) time.Time {
 }
 
 type cProbe struct {
-	symbol string
-	prog   *ebpf.Program
+	symbol    string
+	prog      *ebpf.Program
+	entryOnly bool // captures on entry; no return probe
 }
 
 // Attach attaches probes to a target and returns the names of the functions
@@ -216,37 +217,40 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 	switch target.Library {
 	case discover.OpenSSL:
 		probes = []cProbe{
-			{"SSL_read", t.objs.SslReadEnter},
-			{"SSL_write", t.objs.SslWriteEnter},
-			{"SSL_read_ex", t.objs.SslReadExEnter},
-			{"SSL_write_ex", t.objs.SslWriteExEnter},
+			{"SSL_read", t.objs.SslReadEnter, false},
+			{"SSL_write", t.objs.SslWriteEnter, false},
+			{"SSL_read_ex", t.objs.SslReadExEnter, false},
+			{"SSL_write_ex", t.objs.SslWriteExEnter, false},
+			// BoringSSL's packet encryption for QUIC (HTTP/3).
+			{"EVP_AEAD_CTX_seal", t.objs.QuicSealEnter, true},
+			{"EVP_AEAD_CTX_open", t.objs.QuicOpenEnter, false},
 		}
 	case discover.GnuTLS:
 		probes = []cProbe{
-			{"gnutls_record_recv", t.objs.GnutlsRecordRecvEnter},
-			{"gnutls_record_send", t.objs.GnutlsRecordSendEnter},
+			{"gnutls_record_recv", t.objs.GnutlsRecordRecvEnter, false},
+			{"gnutls_record_send", t.objs.GnutlsRecordSendEnter, false},
 		}
 	case discover.NSS:
 		probes = []cProbe{
-			{"PR_Read", t.objs.PR_ReadEnter},
-			{"PR_Write", t.objs.PR_WriteEnter},
-			{"PR_Recv", t.objs.PR_RecvEnter},
-			{"PR_Send", t.objs.PR_SendEnter},
+			{"PR_Read", t.objs.PR_ReadEnter, false},
+			{"PR_Write", t.objs.PR_WriteEnter, false},
+			{"PR_Recv", t.objs.PR_RecvEnter, false},
+			{"PR_Send", t.objs.PR_SendEnter, false},
 		}
 	case discover.WolfSSL:
 		probes = []cProbe{
-			{"wolfSSL_read", t.objs.WolfsslReadEnter},
-			{"wolfSSL_write", t.objs.WolfsslWriteEnter},
+			{"wolfSSL_read", t.objs.WolfsslReadEnter, false},
+			{"wolfSSL_write", t.objs.WolfsslWriteEnter, false},
 		}
 	case discover.MbedTLS:
 		probes = []cProbe{
-			{"mbedtls_ssl_read", t.objs.MbedtlsSslReadEnter},
-			{"mbedtls_ssl_write", t.objs.MbedtlsSslWriteEnter},
+			{"mbedtls_ssl_read", t.objs.MbedtlsSslReadEnter, false},
+			{"mbedtls_ssl_write", t.objs.MbedtlsSslWriteEnter, false},
 		}
 	case discover.S2N:
 		probes = []cProbe{
-			{"s2n_recv", t.objs.S2nRecvEnter},
-			{"s2n_send", t.objs.S2nSendEnter},
+			{"s2n_recv", t.objs.S2nRecvEnter, false},
+			{"s2n_send", t.objs.S2nSendEnter, false},
 		}
 	case discover.GoTLS:
 		return t.attachGo(ex, target.Go)
@@ -267,16 +271,21 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 			opts.Address = off
 		}
 		// Attach the return probe first so no entry goes unmatched.
-		ret, err := ex.Uretprobe(p.symbol, t.objs.TlsReturn, opts)
-		if errors.Is(err, link.ErrNoSymbol) {
-			continue // e.g. SSL_read_ex before OpenSSL 1.1.1
+		if !p.entryOnly {
+			ret, err := ex.Uretprobe(p.symbol, t.objs.TlsReturn, opts)
+			if errors.Is(err, link.ErrNoSymbol) {
+				continue // e.g. SSL_read_ex before OpenSSL 1.1.1
+			}
+			if err != nil {
+				return attached, fmt.Errorf("%s: %w", p.symbol, err)
+			}
+			t.addLink(ret)
 		}
-		if err != nil {
-			return attached, fmt.Errorf("%s: %w", p.symbol, err)
-		}
-		t.addLink(ret)
 
 		entry, err := ex.Uprobe(p.symbol, p.prog, opts)
+		if errors.Is(err, link.ErrNoSymbol) {
+			continue
+		}
 		if err != nil {
 			return attached, fmt.Errorf("%s: %w", p.symbol, err)
 		}

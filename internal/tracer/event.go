@@ -32,6 +32,8 @@ const (
 	FuncS2NSend
 	FuncRustlsRead
 	FuncRustlsWrite
+	FuncQUICSend
+	FuncQUICRecv
 )
 
 var functionNames = map[Function]string{
@@ -55,6 +57,8 @@ var functionNames = map[Function]string{
 	FuncS2NSend:      "s2n_send",
 	FuncRustlsRead:   "rustls::Reader::read",
 	FuncRustlsWrite:  "rustls::Writer::write",
+	FuncQUICSend:     "EVP_AEAD_CTX_seal",
+	FuncQUICRecv:     "EVP_AEAD_CTX_open",
 }
 
 func (f Function) String() string {
@@ -67,7 +71,7 @@ func (f Function) String() string {
 // Library returns the TLS library the function belongs to.
 func (f Function) Library() discover.Library {
 	switch f {
-	case FuncSSLRead, FuncSSLWrite, FuncSSLReadEx, FuncSSLWriteEx:
+	case FuncSSLRead, FuncSSLWrite, FuncSSLReadEx, FuncSSLWriteEx, FuncQUICSend, FuncQUICRecv:
 		return discover.OpenSSL
 	case FuncGnuTLSRecv, FuncGnuTLSSend:
 		return discover.GnuTLS
@@ -85,6 +89,12 @@ func (f Function) Library() discover.Library {
 		return discover.Rustls
 	}
 	return 0
+}
+
+// IsQUIC reports whether the function's data is the frames of a QUIC packet
+// (HTTP/3), captured where the packet is encrypted or decrypted.
+func (f Function) IsQUIC() bool {
+	return f == FuncQUICSend || f == FuncQUICRecv
 }
 
 // Direction is whether data was received or sent.
@@ -106,7 +116,7 @@ func (d Direction) String() string {
 func (f Function) Direction() Direction {
 	switch f {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
-		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite:
+		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend:
 		return Write
 	}
 	return Read

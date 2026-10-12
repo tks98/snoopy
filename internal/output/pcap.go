@@ -79,7 +79,8 @@ func NewPcap(w io.Writer) (*Pcap, error) {
 }
 
 func (p *Pcap) Print(ev *tracer.Event) error {
-	if ev.Size == 0 {
+	// QUIC events are packets of frames, not a byte stream.
+	if ev.Size == 0 || ev.Function.IsQUIC() {
 		return nil
 	}
 	key := streamKey{pid: ev.PID, conn: ev.ConnID}

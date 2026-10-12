@@ -47,8 +47,9 @@ server: cloudflare
   not as the TLS records sent to the proxy.
 - **Connection details:** process, thread, socket and local and remote
   address for every call, plus the container ID when the process runs in one.
-- **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 is shown frame by
-  frame with its headers decoded (HPACK), and binary data is hex-dumped. With
+- **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 and HTTP/3 are
+  shown frame by frame with their headers decoded (HPACK, QPACK), and binary
+  data is hex-dumped. With
   `--json` you get one JSON object per line instead.
 - **Wireshark:** `--pcap` writes the plaintext as TCP streams so Wireshark
   can dissect the application protocol.
@@ -153,6 +154,7 @@ Each line is one call to a TLS read or write function:
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. |
 | `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call) and decoded `headers` (`name`, `value`). Only for connections whose start snoopy saw: HPACK compresses headers against a table built up over the connection. |
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
+| `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal` and `_open` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers` and an `error` if they couldn't be decoded. |
 
 Fields that don't apply are left out.
 
@@ -171,7 +173,8 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | Library | Functions | Notes |
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
-| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 only. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer. Checked on Chrome 155 and 156 (against Google's debug symbols), Brave 1.97 and Edge 155. Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Start Chrome with `--disable-quic`: its HTTP/3 traffic doesn't go through these functions. |
+| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 only. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer. Checked on Chrome 155 and 156 (against Google's debug symbols), Brave 1.97 and Edge 155. Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Chrome's HTTP/3 traffic is captured too, see below. |
+| QUIC (HTTP/3) in Chrome, Brave, Edge, Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | x86_64. QUIC encrypts each packet with these, and the plaintext is the packet's frames, which snoopy reassembles into HTTP/3 with QPACK-decoded headers. Packets are told apart from TLS records and other callers by their header. The first packets a connection sends have no socket details. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. Includes the copy bundled with Firefox, also when Firefox starts after snoopy. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
@@ -184,13 +187,14 @@ Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
 Not supported: rustls under tokio (see above), Java, stripped TLS libraries
-other than BoringSSL (and BoringSSL on arm64), QUIC/HTTP/3, and programs that use OpenSSL only
-through its BIO layer (e.g. `openssl s_server -www`).
+other than BoringSSL (and BoringSSL on arm64), QUIC/HTTP/3 outside Chromium,
+and programs that use OpenSSL only through its BIO layer (e.g. `openssl
+s_server -www`).
 
-Browsers use HTTP/3 (QUIC) with many sites, and that traffic doesn't pass
-through the TLS library's read and write functions, so snoopy doesn't see it.
-To see it in Firefox, set `network.http.http3.enable` to `false` in
-`about:config`; Firefox then uses HTTP/2 or HTTP/1.1 over TLS.
+Firefox uses HTTP/3 (QUIC) with many sites, and its QUIC stack doesn't go
+through functions snoopy probes, so that traffic is missed. To see it, set
+`network.http.http3.enable` to `false` in `about:config`; Firefox then uses
+HTTP/2 or HTTP/1.1 over TLS.
 
 ## How it works
 

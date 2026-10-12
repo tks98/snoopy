@@ -170,7 +170,7 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   anywhere else, decoding stops for that direction with a note.
 - **rustls** is found by mangled symbol names (v0 and legacy;
   `inspectRustls`). Its Reader and Writer do no socket I/O, so
-  `rust_threads` remembers, per thread that called them, the last socket
+  `io_threads` remembers, per thread that called them, the last socket
   syscall (a read's socket is the one just read from) and which Writer is
   waiting for the next one (which teaches `conn_infos` its socket, so only
   a connection's first write lacks it). Returns are `io::Result<usize>` in
@@ -189,6 +189,19 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   (stable, beta, dev), so the answers can be checked exactly. Chrome 156
   changed what was inlined, which is why reason codes count callees and
   candidates must read three arguments.
+- **QUIC (HTTP/3)** in Chromium is captured at BoringSSL's
+  `EVP_AEAD_CTX_seal`/`open` (found by signature next to SSL_read: both take
+  10 arguments, which `funcfind.StackArgs` checks, and open reports reason
+  0x73). The associated data is the packet header; bit 0x40 of its first byte
+  separates QUIC from TLS records, which also use `open`. Seal encrypts in
+  place, so it captures at entry. The socket comes from `io_threads` (as for
+  rustls), with `recvmmsg`/`sendmmsg` added. User space (`output/quic.go`,
+  `qpack.go`) parses frames, reassembles streams per AEAD context (one per
+  connection direction; a key update starts over), and decodes HTTP/3 with a
+  QPACK dynamic table. The Required Insert Count is decoded assuming it
+  hasn't wrapped (the receiver's maximum table capacity isn't visible in the
+  same direction). `qpack_static.go` is generated from RFC 9204's text, and
+  `TestQPACKExamples` runs its Appendix B examples.
 - **x86 testing on an Apple Silicon Mac:** `limactl start --arch=x86_64
   --vm-type=qemu template://ubuntu-24.04` gives an emulated x86 VM where
   uprobes work (Docker's amd64 emulation is user-space only). Slow, but fine
@@ -215,7 +228,7 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   missed, and libraries a long-running process `dlopen`s more than 3 s after
   its exec aren't picked up.
 - **Not supported:** rustls under tokio (hyper, reqwest: `Reader::read` is
-  inlined into tokio-rustls, writes use `write_vectored`), Java, stripped BoringSSL (Chrome), QUIC/HTTP/3,
+  inlined into tokio-rustls, writes use `write_vectored`), Java, QUIC/HTTP/3 outside Chromium (Firefox's is in Rust, neqo),
   apps using OpenSSL only via its BIO layer (`openssl s_server -www`).
 - **No socket details** (fd or addresses) for apps that do their own socket
   I/O around OpenSSL with memory BIOs, e.g. .NET.
