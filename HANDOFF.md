@@ -178,10 +178,11 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 
 ## Known limitations and ideas for next steps
 
-- **New programs after startup:** processes started later are traced only if
-  they use an already-attached file (e.g. system libssl). New Go binaries or
-  container images need a restart. Idea: rescan `/proc` periodically, or
-  watch exec events, and attach incrementally.
+- **New programs after startup** are found through a `sched_process_exec`
+  raw tracepoint (`WatchNewProcesses`) and inspected at 0, 50 ms, 500 ms and
+  3 s after the exec. TLS calls made before a new library is attached are
+  missed, and libraries a long-running process `dlopen`s more than 3 s after
+  its exec aren't picked up.
 - **Not supported:** rustls, Java, stripped BoringSSL (Chrome), QUIC/HTTP/3,
   apps using OpenSSL only via its BIO layer (`openssl s_server -www`).
 - **No socket details** (fd or addresses) for apps that do their own socket

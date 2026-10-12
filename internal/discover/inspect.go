@@ -23,6 +23,9 @@ var readSymbols = []struct {
 	{OpenSSL, "SSL_read"},
 	{GnuTLS, "gnutls_record_recv"},
 	{NSS, "PR_Read"},
+	{WolfSSL, "wolfSSL_read"},
+	{MbedTLS, "mbedtls_ssl_read"},
+	{S2N, "s2n_recv"},
 }
 
 const (

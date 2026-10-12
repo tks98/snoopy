@@ -23,6 +23,9 @@ func TestMappedLibraries(t *testing.T) {
 		{"/usr/lib/x86_64-linux-gnu/libssl.so.3", "7f3e1d200000-7f3e1d222000", false},
 		{"/usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1", "7f3e1d400000-7f3e1d5c0000", false},
 		{"/opt/my app/lib/libnspr4.so", "7f3e1d600000-7f3e1d640000", false},
+		{"/usr/lib/x86_64-linux-gnu/libwolfssl.so.42.0.0", "7f3e1d740000-7f3e1d780000", false},
+		{"/usr/lib/x86_64-linux-gnu/libmbedtls.so.14", "7f3e1d790000-7f3e1d7a0000", false},
+		{"/usr/local/lib/libs2n.so.1", "7f3e1d7a0000-7f3e1d7c0000", false},
 		{"/tmp/libssl.so.1.1", "7f3e1d800000-7f3e1d840000", true},
 	}
 	if !reflect.DeepEqual(got, want) {

@@ -32,11 +32,13 @@ HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_S
 
 ## Features
 
-- **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS and Go's
-  `crypto/tls`, including stripped Go binaries.
+- **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS, wolfSSL,
+  Mbed TLS, s2n-tls and Go's `crypto/tls`, including stripped Go binaries.
 - **Finds what to trace:** system libraries, libraries loaded by running
   processes (including inside containers, and copies that an upgrade has
   since replaced), Go programs, and anything you point it at with `--lib`.
+  Programs and containers started while snoopy runs are picked up as they
+  start.
 - **Tunnels:** traffic sent through an HTTPS proxy shows up as plaintext,
   not as the TLS records sent to the proxy.
 - **Connection details:** process, thread, socket and local and remote
@@ -90,7 +92,7 @@ sudo snoopy --lib /usr/bin/node     # also attach to a binary with OpenSSL linke
 | `--comm NAME` | Trace only processes with exactly this name, as in `/proc/<pid>/comm` (at most 15 characters). |
 | `--container ID` | Trace only processes in this container, given as an ID or ID prefix. |
 | `--lib PATH` | Also attach to this library or executable. Can be repeated. |
-| `--no-scan` | Don't scan running processes; attach only to system libraries and `--lib`. |
+| `--no-scan` | Don't scan running or newly started processes; attach only to system libraries and `--lib`. |
 | `--json` | Print one JSON object per line. |
 | `--hex` | Always hex-dump payloads. |
 | `--max-size N` | Maximum bytes captured per call, up to 1 MiB. Defaults to 16384. |
@@ -100,10 +102,13 @@ sudo snoopy --lib /usr/bin/node     # also attach to a binary with OpenSSL linke
 | `--verbose` | List the functions attached in each file. |
 | `--version` | Print the version. |
 
-snoopy attaches to what exists when it starts. A process that starts later is
-traced if it uses a library snoopy already attached to, such as the system
-`libssl`. A new Go program or container image is not traced until you restart
-snoopy.
+snoopy also watches for programs that start while it runs and attaches to
+the TLS libraries and Go programs they use. It looks at a new process right
+after its `exec` and again after 50 ms, 500 ms and 3 s, since shared libraries
+are loaded after the `exec`. TLS calls a new program makes before then are
+missed, unless it uses a library snoopy was already attached to, such as the
+system `libssl`. With `--pid`, only that process is traced and nothing new is
+picked up.
 
 ### Wireshark
 
@@ -130,11 +135,11 @@ Each line is one call to a TLS read or write function:
 | Field | Description |
 | --- | --- |
 | `time` | When the call returned. |
-| `function`, `library` | The traced function, e.g. `SSL_read`, and its library: `openssl`, `gnutls`, `nss` or `go`. |
+| `function`, `library` | The traced function, e.g. `SSL_read`, and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n` or `go`. |
 | `direction` | `read` (received from the peer) or `write` (sent to it). |
 | `process_name`, `pid`, `tid` | The calling process and thread. |
 | `container_id` | The container the process runs in, if any. |
-| `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. |
+| `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*`, `WOLFSSL*`, `mbedtls_ssl_context*`, `struct s2n_connection*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. |
 | `fd`, `local_addr`, `remote_addr` | The socket, if known. |
 | `latency_ns` | Time spent inside the call. |
 | `size` | Bytes the call transferred. |
@@ -161,7 +166,10 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
-| NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. |
+| NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. Includes the copy bundled with Firefox, also when Firefox starts after snoopy. |
+| wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
+| Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
+| s2n-tls | `s2n_recv`, `s2n_send` | Data sent with `s2n_sendv` isn't captured. |
 | Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64. Works on stripped binaries. |
 
 Programs that do their own socket I/O around the TLS library, such as .NET's
@@ -171,12 +179,18 @@ Not supported: rustls, Java, TLS libraries with stripped symbols (such as the
 BoringSSL inside Chrome), QUIC/HTTP/3, and programs that use OpenSSL only
 through its BIO layer (e.g. `openssl s_server -www`).
 
+Browsers use HTTP/3 (QUIC) with many sites, and that traffic doesn't pass
+through the TLS library's read and write functions, so snoopy doesn't see it.
+To see it in Firefox, set `network.http.http3.enable` to `false` in
+`about:config`; Firefox then uses HTTP/2 or HTTP/1.1 over TLS.
+
 ## How it works
 
 1. snoopy finds the files to probe: shared libraries in the usual system
    directories, the libraries and executables mapped by running processes
    (reached through `/proc/<pid>/root`, which also covers containers), and any
-   `--lib` paths.
+   `--lib` paths. While it runs, a `sched_process_exec` tracepoint reports
+   new programs, whose files are inspected the same way.
 2. A uprobe on each read/write function records the buffer pointer and the
    connection handle. A return probe copies the bytes actually transferred
    into a ring buffer, in chunks of up to 16 KiB. Go programs can't use return
@@ -203,7 +217,9 @@ make generate     # recompile bpf/snoopy.c after changing it (needs clang 18 and
 ```
 
 The integration tests use whichever of `curl`, `python3`, `gnutls-cli` and the
-NSS development files (`libnss3-dev`) are installed, and skip the rest. CI runs
+NSS, wolfSSL, Mbed TLS and s2n-tls development files (`libnss3-dev`,
+`libwolfssl-dev`, `libmbedtls-dev`; s2n-tls has to be built from source) are
+installed, and skip the rest. CI runs
 them on x86_64 and arm64. To run them on an older kernel in a VM, use
 [vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
 Install vimto with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`; a build

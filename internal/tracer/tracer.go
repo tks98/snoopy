@@ -5,10 +5,12 @@ package tracer
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -54,6 +56,7 @@ type Options struct {
 type Tracer struct {
 	opts    Options
 	objs    snoopyObjects
+	mu      sync.Mutex // guards links: Attach may run while Run does
 	links   []link.Link
 	reader  *ringbuf.Reader
 	clock   func(monoNs uint64) time.Time
@@ -230,6 +233,21 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 			{"PR_Recv", t.objs.PR_RecvEnter},
 			{"PR_Send", t.objs.PR_SendEnter},
 		}
+	case discover.WolfSSL:
+		probes = []cProbe{
+			{"wolfSSL_read", t.objs.WolfsslReadEnter},
+			{"wolfSSL_write", t.objs.WolfsslWriteEnter},
+		}
+	case discover.MbedTLS:
+		probes = []cProbe{
+			{"mbedtls_ssl_read", t.objs.MbedtlsSslReadEnter},
+			{"mbedtls_ssl_write", t.objs.MbedtlsSslWriteEnter},
+		}
+	case discover.S2N:
+		probes = []cProbe{
+			{"s2n_recv", t.objs.S2nRecvEnter},
+			{"s2n_send", t.objs.S2nSendEnter},
+		}
 	case discover.GoTLS:
 		return t.attachGo(ex, target.Go)
 	default:
@@ -247,13 +265,13 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 		if err != nil {
 			return attached, fmt.Errorf("%s: %w", p.symbol, err)
 		}
-		t.links = append(t.links, ret)
+		t.addLink(ret)
 
 		entry, err := ex.Uprobe(p.symbol, p.prog, opts)
 		if err != nil {
 			return attached, fmt.Errorf("%s: %w", p.symbol, err)
 		}
-		t.links = append(t.links, entry)
+		t.addLink(entry)
 		attached = append(attached, p.symbol)
 	}
 	if len(attached) == 0 {
@@ -284,7 +302,7 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, e
 			if err != nil {
 				return attached, fmt.Errorf("%s+%#x: %w", fn.name, ret, err)
 			}
-			t.links = append(t.links, l)
+			t.addLink(l)
 		}
 		// The entry probe goes after the stack check: when the stack has to
 		// grow, runtime.morestack restarts the function from the top, and a
@@ -295,7 +313,7 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, e
 		if err != nil {
 			return attached, fmt.Errorf("%s+%#x: %w", fn.name, fn.f.Body, err)
 		}
-		t.links = append(t.links, l)
+		t.addLink(l)
 		attached = append(attached, fn.name)
 	}
 	return attached, nil
@@ -309,8 +327,83 @@ func (t *Tracer) AttachSyscalls() error {
 	if err != nil {
 		return fmt.Errorf("raw tracepoint sys_enter: %w", err)
 	}
-	t.links = append(t.links, l)
+	t.addLink(l)
 	return nil
+}
+
+// rescanDelays are when a new process's files are inspected, counted from
+// its exec. Its executable is there right away, which is enough for Go and
+// statically linked programs; the dynamic loader maps shared libraries a
+// little later, and programs may load more as they go.
+var rescanDelays = []time.Duration{0, 50 * time.Millisecond, 500 * time.Millisecond, 3 * time.Second}
+
+// WatchNewProcesses attaches, in the background, to the TLS libraries and
+// programs of processes that start from now on, as w finds them. accept, if
+// not nil, decides whether to look at a process at all; attached is called
+// with the result of every attempt to attach. TLS calls a process makes
+// before its files are inspected are missed. Call stop to stop watching and
+// wait for the watcher to finish.
+func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) bool,
+	attached func(target discover.Target, funcs []string, err error)) (stop func(), err error) {
+	l, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_exec", Program: t.objs.SchedProcessExec})
+	if err != nil {
+		return nil, fmt.Errorf("raw tracepoint sched_process_exec: %w", err)
+	}
+	t.addLink(l)
+	reader, err := ringbuf.NewReader(t.objs.Execs)
+	if err != nil {
+		return nil, fmt.Errorf("open exec ring buffer: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	pids := make(chan int)
+	wg.Add(2)
+	go func() { // read execs and schedule inspections
+		defer wg.Done()
+		var rec ringbuf.Record
+		for ctx.Err() == nil {
+			reader.SetDeadline(time.Now().Add(200 * time.Millisecond))
+			err := reader.ReadInto(&rec)
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			if err != nil || len(rec.RawSample) < 4 {
+				continue
+			}
+			pid := int(binary.NativeEndian.Uint32(rec.RawSample))
+			for _, d := range rescanDelays {
+				time.AfterFunc(d, func() {
+					select {
+					case pids <- pid:
+					case <-ctx.Done():
+					}
+				})
+			}
+		}
+	}()
+	go func() { // inspect and attach, one process at a time
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case pid := <-pids:
+				if accept != nil && !accept(pid) {
+					continue
+				}
+				for _, target := range w.Process(pid) {
+					funcs, err := t.Attach(target)
+					attached(target, funcs, err)
+				}
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		wg.Wait()
+		reader.Close()
+	}, nil
 }
 
 // Run delivers events to handle until ctx is cancelled. handle is called
@@ -385,7 +478,15 @@ func (t *Tracer) LostEvents() (uint64, error) {
 }
 
 // Close detaches all probes and unloads the program.
+func (t *Tracer) addLink(l link.Link) {
+	t.mu.Lock()
+	t.links = append(t.links, l)
+	t.mu.Unlock()
+}
+
 func (t *Tracer) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	var errs []error
 	for _, l := range t.links {
 		errs = append(errs, l.Close())
