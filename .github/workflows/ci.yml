@@ -78,8 +78,10 @@ jobs:
       - name: Run (as root)
         working-directory: internal/tracer
         run: sudo ./tracer.test -test.v -test.timeout 5m
+      # --quiet: the runner's own TLS traffic, including its credentials,
+      # must not end up in the (public) log.
       - name: Smoke-test the binary
         run: |
           go build -o snoopy .
           ./snoopy --version
-          sudo timeout -s INT 5 ./snoopy --no-scan || [ $? -eq 124 ]
+          sudo timeout -s INT 5 ./snoopy --no-scan --quiet || [ $? -eq 124 ]

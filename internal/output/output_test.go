@@ -84,12 +84,28 @@ func TestSummarizeHTTP2(t *testing.T) {
 		t.Errorf("got %q\nwant %q", got, want)
 	}
 
-	cut := summarizeHTTP2([]byte("\x00\x00\x10\x00\x01\x00\x00\x00\x03abc"))
-	if len(cut) != 1 || !strings.HasSuffix(cut[0], "(cut off)") {
+	ping := "\x00\x00\x08\x06\x00\x00\x00\x00\x00" + "12345678"
+	cut := summarizeHTTP2([]byte(ping + "\x00\x00\x10\x00\x01\x00\x00\x00\x03abc"))
+	if len(cut) != 2 || cut[1] != "DATA stream=3 length=16 [END_STREAM] (cut off)" {
 		t.Errorf("cut-off frame: %q", cut)
 	}
-	if got := summarizeHTTP2([]byte("\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6")); got != nil {
-		t.Errorf("random bytes: %q", got)
+	partial := summarizeHTTP2([]byte(ping + "\x00\x00"))
+	if len(partial) != 2 || partial[1] != "2 bytes of the next frame" {
+		t.Errorf("partial header: %q", partial)
+	}
+
+	for name, in := range map[string]string{
+		"random":              "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6",
+		"lone cut-off frame":  "\x00\x00\x10\x00\x01\x00\x00\x00\x03abc",
+		"undefined DATA flag": "\x00\x00\x01\x00\x02\x00\x00\x00\x01x",
+		"SETTINGS on stream":  "\x00\x00\x00\x04\x00\x00\x00\x00\x01",
+		"bad PING length":     "\x00\x00\x01\x06\x00\x00\x00\x00\x00x",
+		// Seen in the wild: binary data that once passed as a DATA frame.
+		"seen in the wild": "\x00\xfe\x04\x00\x8a\x02\xbb\x93\xba\x30\x8d\xbe",
+	} {
+		if got := summarizeHTTP2([]byte(in)); got != nil {
+			t.Errorf("%s: %q", name, got)
+		}
 	}
 }
 

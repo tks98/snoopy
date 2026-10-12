@@ -159,6 +159,9 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. |
 | Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64. Works on stripped binaries. |
 
+Programs that do their own socket I/O around the TLS library, such as .NET's
+`SslStream` over OpenSSL, are captured without a file descriptor or addresses.
+
 Not supported: rustls, Java, TLS libraries with stripped symbols (such as the
 BoringSSL inside Chrome), QUIC/HTTP/3, and programs that use OpenSSL only
 through its BIO layer (e.g. `openssl s_server -www`).
