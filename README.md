@@ -30,6 +30,17 @@ HTTP/2 HEADERS stream=1 length=162 [END_HEADERS]
 content-type: text/html; charset=utf-8
 server: cloudflare
 ...
+
+20:38:45.316878 chrome (pid 14779, tid 14792) EVP_AEAD_CTX_open ← 172.66.147.243:443  553 bytes  53µs  fd 30, conn 0x1f5400297058
+QUIC: STREAM id=0 off=0 len=548 FIN
+HTTP/3 HEADERS stream=0
+:status: 200
+content-type: text/html; charset=utf-8
+content-encoding: br
+...
+HTTP/3 DATA stream=0 (334 bytes)
+[br: 334 bytes decoded to 577]
+<!doctype html><html lang=en><head><meta charset=utf-8>...<title>Example Domain</title>...
 ```
 
 ## Features
@@ -37,7 +48,9 @@ server: cloudflare
 - **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS, wolfSSL,
   Mbed TLS, s2n-tls, rustls (synchronous use) and Go's `crypto/tls`,
   including stripped Go binaries, and the stripped BoringSSL inside Chrome,
-  other Chromium-based browsers and Electron apps.
+  other Chromium-based browsers and Electron apps, on x86_64 and arm64.
+- **HTTP/3:** the QUIC traffic of Chrome, other Chromium-based programs and
+  Firefox, captured where each packet is encrypted and decrypted.
 - **Finds what to trace:** system libraries, libraries loaded by running
   processes (including inside containers, and copies that an upgrade has
   since replaced), Go programs, and anything you point it at with `--lib`.
@@ -59,8 +72,10 @@ server: cloudflare
 
 ## Requirements
 
-- Linux 5.10 or later on x86_64 or arm64. CI tests 5.10, 5.15, 6.1, 6.6 and
-  current kernels; 5.8 and 5.9 should work but aren't tested.
+- Linux 5.10 or later on x86_64 or arm64. CI tests the current kernels of
+  GitHub's x86_64 and arm64 runners; 5.10, 5.15, 6.1, 6.6 and 6.12 have been
+  tested in VMs (see [Development](#development)), and 5.8 and 5.9 should
+  work but aren't tested.
 - Root. The minimal set of capabilities is `CAP_BPF`, `CAP_PERFMON`,
   `CAP_SYS_RESOURCE` and `CAP_SYS_PTRACE` (to inspect other processes), plus
   `CAP_SYS_ADMIN` to trace libraries that were replaced while in use.
@@ -100,7 +115,7 @@ sudo snoopy --lib /usr/bin/node     # also attach to a binary with OpenSSL linke
 | `--lib PATH` | Also attach to this library or executable. Can be repeated. |
 | `--no-scan` | Don't scan running or newly started processes; attach only to system libraries and `--lib`. |
 | `--json` | Print one JSON object per line. |
-| `--hex` | Always hex-dump payloads. |
+| `--hex` | Always hex-dump payloads as captured, without decoding HTTP. |
 | `--max-size N` | Maximum bytes captured per call, up to 1 MiB. Defaults to 16384. |
 | `--pcap FILE` | Also write the plaintext to a pcap file; `-` writes it to stdout. |
 | `--quiet` | Don't print events. Useful with `--pcap`. |
@@ -141,11 +156,11 @@ Each line is one call to a TLS read or write function:
 | Field | Description |
 | --- | --- |
 | `time` | When the call returned. |
-| `function`, `library` | The traced function, e.g. `SSL_read`, and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n`, `rustls` or `go`. |
+| `function`, `library` | The traced function, e.g. `SSL_read`, `EVP_AEAD_CTX_open` or `AES_AEAD (decrypt)` (QUIC packets), and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n`, `rustls` or `go`. |
 | `direction` | `read` (received from the peer) or `write` (sent to it). |
 | `process_name`, `pid`, `tid` | The calling process and thread. |
 | `container_id` | The container the process runs in, if any. |
-| `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*`, `WOLFSSL*`, `mbedtls_ssl_context*`, `struct s2n_connection*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. |
+| `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*`, `WOLFSSL*`, `mbedtls_ssl_context*`, `struct s2n_connection*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. For QUIC packets it is the encryption context, of which a connection uses several. |
 | `fd`, `local_addr`, `remote_addr` | The socket, if known. |
 | `latency_ns` | Time spent inside the call. |
 | `size` | Bytes the call transferred. |
@@ -177,7 +192,7 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
 | BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 and arm64. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer. Checked against published debug symbols on Chrome 155 and 156 (x86_64) and Electron 42 and 44 (arm64), and on Brave 1.97, Edge 155 and Ubuntu's Chromium 155 snap (arm64). Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Chrome's HTTP/3 traffic is captured too, see below. |
 | QUIC (HTTP/3) in Chrome, Brave, Edge, Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | x86_64 and arm64. QUIC encrypts each packet with these, and the plaintext is the packet's frames, which snoopy reassembles into HTTP/3 with QPACK-decoded headers. Packets are told apart from TLS records and other callers by their header. |
-| QUIC (HTTP/3) in Firefox | NSS's `AES_CreateContext` and `AES_AEAD` in freebl, found through its exported function table | Firefox's QUIC stack (neqo) calls freebl's AES-GCM directly, so packets are captured there, as for Chrome. AES-GCM only: a connection that negotiates ChaCha20-Poly1305 isn't captured. Neither are connections set up before snoopy started, since a context's direction is learned when it's created. |
+| QUIC (HTTP/3) in Firefox | NSS's `AES_CreateContext` and `AES_AEAD` in freebl, found through its exported function table | x86_64 and arm64. Firefox's QUIC stack (neqo) calls freebl's AES-GCM directly, so packets are captured there, as for Chrome. AES-GCM only: a connection that negotiates ChaCha20-Poly1305 isn't captured. Neither are connections set up before snoopy started, since a context's direction is learned when it's created. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. Includes the copy bundled with Firefox, also when Firefox starts after snoopy. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
@@ -190,9 +205,10 @@ Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
 Not supported: rustls under tokio (see above), Java, stripped TLS libraries
-other than BoringSSL, QUIC/HTTP/3 outside Chromium
-and Firefox, and programs that use OpenSSL only through its BIO layer (e.g.
-`openssl s_server -www`).
+other than BoringSSL, QUIC/HTTP/3 outside Chromium and Firefox, programs that
+use OpenSSL only through its BIO layer (e.g. `openssl s_server -www`), and
+bodies compressed with a shared dictionary (Chrome's `dcb` and `dcz`), which
+are shown as sent.
 
 ## How it works
 
@@ -265,6 +281,17 @@ them on x86_64 and arm64. To run them on an older kernel in a VM, use
 [vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
 Install vimto with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`; a build
 with cgo refuses to run.
+
+Two tests check the signature-based finding against real programs, and only
+run when pointed at them. `SNOOPY_BORINGSSL_TEST` takes a comma-separated list
+of Chromium-based executables, each optionally followed by `=` and a file
+with its symbols to compare with: an ELF debug file (Google publishes them for
+Chrome) or a Breakpad `.sym` file (Electron publishes them with each release).
+`SNOOPY_FREEBL_TEST` does the same for freebl libraries:
+
+```bash
+SNOOPY_BORINGSSL_TEST=/opt/google/chrome/chrome=chrome.debug go test ./internal/discover -run TestBoringSSLBinaries -v
+```
 
 To release, push a tag like `v2.0.0`. GoReleaser builds and publishes the
 binaries.

@@ -1,37 +1,39 @@
-# snoopy rewrite: handoff notes
+# snoopy: development notes
 
-The work is on branch `claude/snoopy-project-review-f9wf21`. These notes let you
-(or a new Claude Code session) pick it up. Delete this file before merging.
+Notes for picking up work on snoopy, for people and Claude Code sessions:
+where things stand, how the pieces work and why, and what's left. The
+README covers what snoopy does; this covers what to keep in mind when
+changing it.
 
 ## Status
 
-The branch replaces the BCC/gobpf implementation with a CO-RE eBPF program
-loaded by cilium/ebpf, fixes the old bugs, adds features, tests, CI and release
-automation, and fixes 8 issues found in an independent review.
+Version 2 (the rewrite on cilium/ebpf with a CO-RE eBPF program, PR #4) and
+exec watching with wolfSSL, Mbed TLS and s2n-tls (#9) are on main. Branch
+`feat/hpack` adds HPACK, rustls, Chrome by signature (x86_64 and arm64),
+HTTP/3 for Chromium and Firefox, and compressed bodies.
 
 | Check | Status |
 | --- | --- |
-| Unit tests, lint, amd64 and arm64 builds | Green in CI |
-| Committed BPF objects match `bpf/snoopy.c` | Green in CI |
-| Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI (run #3) |
-| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | Red in CI through `7f1ea93` because vimto itself was built with cgo, so it refused to run (`9015ae7` had made the *test* binary static, which wasn't the problem). Fixed by installing vimto with `CGO_ENABLED=0`. Locally (amd64 container, QEMU without KVM) all five pass after the morestack fix below. **Check that the CI run for the latest commit is green.** |
-| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04, OpenSSL 3.5.5, curl 8.18) | Pass natively in a Parallels VM. |
+| Lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date | Green in CI |
+| Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
+| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass on `feat/hpack` (23 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in "Things learned about the environment". |
+| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | 27 pass, rustls included (`SNOOPY_TEST_RUSTLS=1`) |
+| Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded |
 
-### To do first
+### To do
 
-1. Check that the latest CI run on the branch is green, especially the
-   "Integration tests (Linux x.y)" jobs:
-   https://github.com/tks98/snoopy/actions
-2. **Delete the logs of CI run 38189398199**
+1. **Delete the logs of CI run 38189398199**, if that hasn't happened
    (https://github.com/tks98/snoopy/actions/runs/38189398199, then ⋯, then
    "Delete all logs"). Its smoke test printed the runner's own TLS traffic,
    including short-lived Azure SAS signatures and the job's `GITHUB_TOKEN`
    basic-auth header. Both expire quickly, but they shouldn't stay public. The
    smoke test now runs with `--quiet`.
-3. Close PR #2 ("add actions workflow", from the `build` branch). This work
-   supersedes it.
-4. Open a PR from this branch, merge, then tag a release (`git tag v2.0.0 && git
-   push --tags`). GoReleaser publishes linux amd64 and arm64 binaries.
+2. Merge `feat/hpack`, then tag the first release (`git tag v2.0.0 && git
+   push --tags`). GoReleaser publishes linux amd64 and arm64 binaries. No
+   release has been made yet.
+3. Dependabot's #5, #6 and #7 are open. #6 bumps `golang.org/x/arch` and
+   `golang.org/x/sys` in go.mod, which `feat/hpack` changes too, so it may
+   need a rebase after the merge.
 
 ## Working on it from a Mac
 
@@ -74,7 +76,10 @@ sudo ./snoopy --verbose    # try it
 
 The integration tests skip clients that aren't installed: curl, python3,
 gnutls-cli, and cc with libnss3-dev for the NSS client in
-`internal/tracer/testdata`.
+`internal/tracer/testdata`. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
+client with cargo. `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
+signature finding against real binaries (see the README's Development
+section).
 
 ## Repository map
 
@@ -87,12 +92,14 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 | `internal/tracer/snoopy_{x86,arm64}_bpfel.{go,o}` | Generated and committed |
 | `internal/tracer/tracer.go` | Load (BTF detection and fallback), attach, ring buffer loop, lost-event counter |
 | `internal/tracer/assemble.go` | Decodes records and reassembles chunks into events |
+| `internal/tracer/sockets.go` | Holds writes back until the socket notice for their connection arrives |
 | `internal/tracer/event.go` | `Event`, `Function` (must match `enum fn_id` in C; a test checks) |
-| `internal/discover/` | Finds targets: system libs, `/proc/*/maps`, deleted files, Go binaries, RET offsets, prologue check |
+| `internal/discover/` | Finds targets: system libs, `/proc/*/maps`, deleted files, Go binaries, RET offsets, prologue check, rustls by mangled name, stripped BoringSSL (`boringssl.go`), freebl's function table (`freebl.go`) |
+| `internal/funcfind/` | Locates functions in stripped x86-64 and arm64 binaries by the strings and constants they use (`x86.go`, `arm64.go`) |
 | `internal/procinfo/` | Container ID from cgroups; `/proc` socket lookup (fallback when there's no BTF) |
-| `internal/output/` | Text (HTTP/1 pretty-print, HTTP/2 frames with HPACK-decoded headers, hexdump), NDJSON, pcap writer |
+| `internal/output/` | Text, NDJSON and pcap writers; HTTP/1 message framing (`http1.go`), HTTP/2 with HPACK (`http2.go`), QUIC and HTTP/3 with QPACK (`quic.go`, `qpack.go`), body decompression (`body.go`) |
 | `main.go` | CLI flags and wiring |
-| `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86, arm64, 5 kernels) |
+| `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64) |
 | `.github/workflows/release.yml`, `.goreleaser.yaml` | Releases on `v*` tags |
 | `.vimto.toml` | VM settings for kernel-matrix tests (root, 2 GB, loopback up) |
 
@@ -298,8 +305,14 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   inlined into tokio-rustls, writes use `write_vectored`), Java, QUIC/HTTP/3
   outside Chromium and Firefox, Firefox's QUIC with ChaCha20-Poly1305
   (freebl's `ChaCha20Poly1305_Seal`/`Open`, table entries 214/215, would be
-  the place),
-  apps using OpenSSL only via its BIO layer (`openssl s_server -www`).
+  the place), apps using OpenSSL only via its BIO layer (`openssl s_server
+  -www`), and bodies with shared-dictionary encodings (Chrome's `dcb`, `dcz`).
+- **HTTP/3 and bodies need the connection's start:** QPACK and HPACK tables
+  are built up over a connection, Firefox's packet keys get their direction
+  when created, and a body's decompressor needs its first bytes. Connections
+  that started before snoopy show less.
+- **HTTP/1 pipelining:** a response is matched to the last request sent, so
+  with pipelined requests a response to HEAD can be taken to have a body.
 - **No socket details** (fd or addresses) for apps that do their own socket
   I/O around OpenSSL with memory BIOs, e.g. .NET.
 - **Untested:**
@@ -310,6 +323,8 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 - **Go versions:** Go < 1.17 (amd64) and < 1.18 (arm64) are refused, since
   they predate the register ABI.
 - **Ideas:**
+  - rustls under tokio, the biggest gap that looks reachable.
+  - Java's TLS (JSSE), a big gap but hard: the code is JIT-compiled.
   - Publish a container image (the static binary makes it trivial).
   - An `--sslkeylog` mode.
   - A flag for the ring buffer size (`tracer.Options.RingBufferSize` exists,
