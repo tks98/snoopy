@@ -14,13 +14,16 @@ used.
 On main: version 2, the rewrite on cilium/ebpf with a CO-RE eBPF program
 (#4); exec watching with wolfSSL, Mbed TLS and s2n-tls (#9); and HPACK,
 rustls, Chrome by signature (x86_64 and arm64), HTTP/3 for Chromium and
-Firefox, and compressed bodies (#10).
+Firefox, and compressed bodies (#10); docs on the fragile parts (#12);
+tcpdump-style output and filters (#13); and fixes for a first run: output
+limits, `--pid` following children, connections from before snoopy, the
+`/v2` module path (#14).
 
 | Check | Status |
 | --- | --- |
 | Lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date | Green in CI |
 | Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
-| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #10 (23 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
+| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #14 (24 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
 | Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | 27 pass, rustls included (`SNOOPY_TEST_RUSTLS=1`) |
 | Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded |
 
