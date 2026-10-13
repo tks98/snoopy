@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // http1Conns follows the HTTP/1.x messages on connections, to undo their
@@ -51,6 +51,7 @@ type http1Dir struct {
 	chunk int
 	line  []byte // a chunk-size or trailer line so far
 	body  *bodyDecoder
+	info  bodyInfo // of the body being read
 }
 
 // http1Segment is a part of an event's data: a start line and headers, or
@@ -61,6 +62,10 @@ type http1Segment struct {
 	raw    []byte
 	inBody bool // raw is (part of) a message body
 	body   bodyPart
+	// For body bytes: the body's content type, if known, and how many of
+	// its bytes came before these (chunked framing included).
+	contentType string
+	offset      int64
 }
 
 const (
@@ -174,14 +179,14 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 		case h1Length:
 			n := min(int64(len(data)), d.left)
 			d.left -= n
-			segs = append(segs, http1Segment{raw: data[:n], inBody: true, body: decodeBody(d.body, data[:n], d.left == 0)})
+			segs = append(segs, d.bodySegment(data[:n], decodeBody(d.body, data[:n], d.left == 0)))
 			if d.left == 0 {
 				d.body, d.state = nil, h1Start
 			}
 			data = data[n:]
 		case h1Chunked:
 			n, body, done, ok := d.chunked(data)
-			seg := http1Segment{raw: data[:n], inBody: true, body: decodeBody(d.body, body, done && ok)}
+			seg := d.bodySegment(data[:n], decodeBody(d.body, body, done && ok))
 			if !ok {
 				// Lost track of the framing; wait for the next message.
 				d.endBody(errors.New("bad chunked framing"))
@@ -196,12 +201,19 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 			}
 			data = data[n:]
 		case h1ToClose:
-			return append(segs, http1Segment{raw: data, inBody: true, body: decodeBody(d.body, data, false)})
+			return append(segs, d.bodySegment(data, decodeBody(d.body, data, false)))
 		default: // h1Gone
 			return append(segs, http1Segment{raw: data})
 		}
 	}
 	return segs
+}
+
+// bodySegment returns the segment for bytes of the body being read.
+func (d *http1Dir) bodySegment(raw []byte, part bodyPart) http1Segment {
+	seg := http1Segment{raw: raw, inBody: true, body: part, contentType: d.info.contentType, offset: d.info.seen}
+	d.info.seen += int64(len(raw))
+	return seg
 }
 
 // headEnd returns where the header block at the start of b ends, after its
@@ -267,6 +279,7 @@ func (conn *http1Conn) startBody(d *http1Dir, m httpMessage, pool *bodyPool) {
 	d.chunk, d.line = chunkSize, nil
 	if d.state != h1Start {
 		d.body = pool.start(header("Content-Encoding"))
+		d.info = bodyInfo{contentType: header("Content-Type")}
 	}
 }
 
@@ -332,6 +345,7 @@ func join(parts [][]byte) []byte {
 // returns the body decoder it stopped, if any.
 func (d *http1Dir) lose(n int) *bodyDecoder {
 	dec := d.body
+	d.info.seen += int64(n)
 	switch d.state {
 	case h1Length:
 		d.endBody(errors.New("bytes of the body weren't captured (raise --max-size)"))

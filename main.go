@@ -22,10 +22,10 @@ import (
 
 	"github.com/fatih/color"
 
-	"github.com/tks98/snoopy/internal/discover"
-	"github.com/tks98/snoopy/internal/output"
-	"github.com/tks98/snoopy/internal/procinfo"
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/discover"
+	"github.com/tks98/snoopy/v2/internal/output"
+	"github.com/tks98/snoopy/v2/internal/procinfo"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -42,6 +42,7 @@ type config struct {
 	brief     bool
 	json      bool
 	hex       bool
+	full      bool
 	maxSize   int
 	count     int
 	pcap      string
@@ -68,58 +69,93 @@ func (p *portList) Set(v string) error {
 	return nil
 }
 
-const usageHeader = `snoopy traces TLS plaintext using eBPF.
+// usage is the help text. Each flag defined in flags must be in it.
+var usage = fmt.Sprintf(`snoopy shows what programs send and receive over TLS, as plaintext, using
+eBPF. It needs root.
 
 Usage: sudo snoopy [flags]
 
-Flags:
-`
+Which processes:
+  --pid PID          only this process and those it starts
+  --comm NAME        only processes whose name starts with NAME, as in
+                     /proc/<pid>/comm (curl, firefox, chrome)
+  --container ID     only processes in the container with this ID, or ID prefix
 
-const usageExamples = `
+Which connections (repeatable):
+  --host HOST        only connections with this IP address, network (CIDR)
+                     or host name at either end
+  --port PORT        only connections with this port at either end
+
+Output:
+  --brief            one line per call, like tcpdump
+  --json             one JSON object per call
+  --full             whole bodies, and binary data as hex dumps (by default,
+                     a body's first 2 KiB, and binary data described)
+  --hex              payloads as hex dumps
+  --verbose          also calls that only keep connections going (HTTP/2
+                     settings and flow control, QUIC acknowledgments), and
+                     every file attached to
+  --count N          stop after N calls
+  --pcap FILE        also write the plaintext as TCP streams to a pcap file
+                     ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
+  --quiet            don't print calls (with --pcap)
+  --no-color         no colors
+
+Capture:
+  --max-size BYTES   bytes to capture per call (default %d, at most %d)
+  --lib PATH         also attach to this library or program, e.g. one with
+                     OpenSSL linked in statically (repeatable)
+  --no-scan          only attach to system libraries and --lib, not to what
+                     running and new processes use
+
+  --version          print the version and exit
+
 Examples:
   sudo snoopy                                 everything, decoded
-  sudo snoopy --brief                         one line per call, like tcpdump
+  sudo snoopy --brief                         one line per call
   sudo snoopy --comm curl                     only processes named curl
-  sudo snoopy --host example.com --port 443   only connections to example.com on port 443
+  sudo snoopy --host example.com --port 443   only connections to example.com:443
   sudo snoopy --count 20                      stop after 20 calls
   sudo snoopy --json | jq 'select(.direction == "write") | .data'
   sudo snoopy --quiet --pcap - | tcpdump -r - -nn -A
-`
+`, tracer.DefaultMaxCapture, tracer.MaxCaptureLimit)
+
+// flags returns the command line flags, which set c.
+func flags(c *config, stderr io.Writer) *flag.FlagSet {
+	fs := flag.NewFlagSet("snoopy", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() { fmt.Fprint(stderr, usage) }
+
+	// The usages are in the help text instead.
+	fs.IntVar(&c.pid, "pid", 0, "")
+	fs.StringVar(&c.comm, "comm", "", "")
+	fs.StringVar(&c.container, "container", "", "")
+	fs.Var(&c.hosts, "host", "")
+	fs.Var(&c.ports, "port", "")
+	fs.Var(&c.libs, "lib", "")
+	fs.BoolVar(&c.noScan, "no-scan", false, "")
+	fs.BoolVar(&c.brief, "brief", false, "")
+	fs.BoolVar(&c.json, "json", false, "")
+	fs.BoolVar(&c.full, "full", false, "")
+	fs.BoolVar(&c.hex, "hex", false, "")
+	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, "")
+	fs.IntVar(&c.count, "count", 0, "")
+	fs.StringVar(&c.pcap, "pcap", "", "")
+	fs.BoolVar(&c.quiet, "quiet", false, "")
+	fs.BoolVar(&c.noColor, "no-color", false, "")
+	fs.BoolVar(&c.verbose, "verbose", false, "")
+	fs.BoolVar(&c.version, "version", false, "")
+	return fs
+}
 
 func parseFlags(args []string, stderr io.Writer) (config, error) {
 	var c config
-	fs := flag.NewFlagSet("snoopy", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() {
-		fmt.Fprint(stderr, usageHeader)
-		fs.PrintDefaults()
-		fmt.Fprint(stderr, usageExamples)
-	}
-
-	fs.IntVar(&c.pid, "pid", 0, "trace only this process ID")
-	fs.StringVar(&c.comm, "comm", "", "trace only processes with this exact name (as in /proc/<pid>/comm)")
-	fs.StringVar(&c.container, "container", "", "trace only processes in the container with this ID (or ID prefix)")
-	fs.Var(&c.hosts, "host", "show only connections with this IP address, network (CIDR) or host name at either end (repeatable)")
-	fs.Var(&c.ports, "port", "show only connections with this port at either end (repeatable)")
-	fs.Var(&c.libs, "lib", "also attach to this library or executable, e.g. a binary with OpenSSL linked in statically (repeatable)")
-	fs.BoolVar(&c.noScan, "no-scan", false, "don't scan running or newly started processes for TLS libraries and Go binaries; only use system libraries and --lib")
-	fs.BoolVar(&c.brief, "brief", false, "print one line per call, like tcpdump")
-	fs.BoolVar(&c.json, "json", false, "print events as JSON, one object per line")
-	fs.BoolVar(&c.hex, "hex", false, "always print payloads as a hex dump")
-	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, fmt.Sprintf("maximum bytes to capture per call (up to %d)", tracer.MaxCaptureLimit))
-	fs.IntVar(&c.count, "count", 0, "stop after this many calls (0: no limit)")
-	fs.StringVar(&c.pcap, "pcap", "", "also write plaintext as TCP streams to this pcap file (\"-\" for stdout, e.g. to pipe into wireshark -k -i - or tcpdump -r -)")
-	fs.BoolVar(&c.quiet, "quiet", false, "don't print events (useful with --pcap)")
-	fs.BoolVar(&c.noColor, "no-color", false, "disable colors")
-	fs.BoolVar(&c.verbose, "verbose", false, "show which functions were attached to")
-	fs.BoolVar(&c.version, "version", false, "print the version and exit")
-
+	fs := flags(&c, stderr)
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
 	if fs.NArg() > 0 {
-		fs.Usage()
-		return c, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+		return c, fmt.Errorf("unexpected argument %q; to trace processes by name, use --comm %[1]s", fs.Arg(0))
 	}
 	if c.pid < 0 {
 		return c, errors.New("--pid must be positive")
@@ -127,13 +163,15 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	if c.count < 0 {
 		return c, errors.New("--count must be positive")
 	}
-	switch {
-	case c.json && c.hex:
-		return c, errors.New("--json and --hex can't be combined")
-	case c.brief && c.json:
-		return c, errors.New("--brief and --json can't be combined")
-	case c.brief && c.hex:
-		return c, errors.New("--brief and --hex can't be combined")
+	var output []string
+	for name, set := range map[string]bool{"--brief": c.brief, "--json": c.json, "--hex": c.hex, "--full": c.full} {
+		if set {
+			output = append(output, name)
+		}
+	}
+	if len(output) > 1 {
+		slices.Sort(output)
+		return c, fmt.Errorf("%s can't be combined", strings.Join(output, " and "))
 	}
 	return c, nil
 }
@@ -235,13 +273,21 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	// Loading the BPF program comes first: without root, its error is the
+	// one to see.
+	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize})
+	if err != nil {
+		return err
+	}
+	defer t.Close()
 	printers, closePrinters, err := openPrinters(cfg)
 	if err != nil {
 		return err
 	}
 	defer closePrinters()
 
-	targets, warnings, err := discover.Find(discover.Options{PID: cfg.pid, Extra: cfg.libs, NoScan: cfg.noScan})
+	discover.Progress = func(msg string) { logf("%s", msg) }
+	targets, warnings, err := discover.Find(discover.Options{PID: cfg.pid, Comm: cfg.comm, Extra: cfg.libs, NoScan: cfg.noScan})
 	if err != nil {
 		return err
 	}
@@ -252,30 +298,33 @@ func run(cfg config) error {
 		return errors.New("no TLS libraries found to attach to; point snoopy at one with --lib")
 	}
 
-	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize})
-	if err != nil {
-		return err
-	}
-	defer t.Close()
-
-	attached := 0
+	var attached []discover.Target
 	for _, target := range targets {
 		funcs, err := t.Attach(target)
-		if reportAttach(cfg, target, funcs, err) {
-			attached++
+		if reportAttach(cfg, target, funcs, err, true) {
+			attached = append(attached, target)
 		}
 	}
-	if attached == 0 {
+	if len(attached) == 0 {
 		return errors.New("could not attach to any TLS library")
+	}
+	if !cfg.verbose {
+		logf("attached to %s (--verbose lists every file)", attachSummary(attached))
 	}
 	if err := t.AttachSyscalls(); err != nil {
 		logf("warning: socket addresses will be missing for C libraries: %v", err)
 	}
-	// With --pid, the one process is already running; otherwise also attach
-	// to what processes started from now on use.
-	if cfg.pid == 0 && !cfg.noScan {
-		stopWatching, err := t.WatchNewProcesses(discover.NewWatcher(targets), acceptProcess(cfg),
-			func(target discover.Target, funcs []string, err error) { reportAttach(cfg, target, funcs, err) })
+	if cfg.pid != 0 {
+		for _, pid := range discover.Descendants(cfg.pid)[1:] {
+			if err := t.TracePID(uint32(pid)); err != nil {
+				logf("warning: %v", err)
+			}
+		}
+	}
+	// Also attach to what processes started from now on use.
+	if !cfg.noScan {
+		stopWatching, err := t.WatchNewProcesses(discover.NewWatcher(targets), acceptProcess(cfg, t),
+			func(target discover.Target, funcs []string, err error) { reportAttach(cfg, target, funcs, err, false) })
 		if err != nil {
 			logf("warning: programs started from now on are only traced if they use a library already attached to: %v", err)
 		} else {
@@ -288,7 +337,12 @@ func run(cfg config) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go reportLostEvents(ctx, t)
+	go watchCounters(ctx, t)
+	if cfg.pid != 0 && !t.ResolvesAddresses() {
+		// Without BTF, the BPF program can't tell a process's parents, so
+		// processes that fork without executing a program are found here.
+		go followChildren(ctx, t, cfg.pid)
+	}
 
 	resolver := procinfo.NewResolver("/proc")
 	calls := 0
@@ -306,29 +360,98 @@ func run(cfg config) error {
 		if !filter.match(ev) || cfg.count > 0 && calls >= cfg.count {
 			return
 		}
-		calls++
+		shown := true
 		for _, p := range printers {
+			before := hidden(p)
 			if err := p.Print(ev); err != nil {
 				logf("error: write output: %v", err)
 				stop()
 				return
 			}
+			shown = shown && hidden(p) == before
 		}
+		if !shown {
+			return
+		}
+		calls++
 		if cfg.count > 0 && calls >= cfg.count {
 			stop()
 		}
 	})
 
-	logf("captured %d calls", calls)
+	summary := fmt.Sprintf("captured %d calls", calls)
+	if n := hiddenTotal(printers); n > 0 {
+		summary += fmt.Sprintf(", and hid %d that only kept connections going (--verbose shows them)", n)
+	}
+	logf("%s", summary)
 	if lost, _ := t.LostEvents(); lost > 0 {
 		logf("warning: %d chunks were dropped because the ring buffer was full", lost)
 	}
 	return err
 }
 
-// reportAttach logs the result of attaching to a target and reports whether
-// any function was attached to.
-func reportAttach(cfg config, target discover.Target, funcs []string, err error) bool {
+// hidden returns how many events a printer left out so far.
+func hidden(p output.Printer) int {
+	if h, ok := p.(output.Hider); ok {
+		return h.Hidden()
+	}
+	return 0
+}
+
+func hiddenTotal(printers []output.Printer) int {
+	n := 0
+	for _, p := range printers {
+		n += hidden(p)
+	}
+	return n
+}
+
+// attachSummary says in a few words what was attached to: the TLS libraries
+// by name, and the programs (TLS linked in) by file name.
+func attachSummary(targets []discover.Target) string {
+	var libs, progs []string
+	for _, t := range targets {
+		name := t.Name()
+		if strings.Contains(name, ".so") {
+			if l := t.Library.String(); !slices.Contains(libs, l) {
+				libs = append(libs, l)
+			}
+		} else if !slices.Contains(progs, name) {
+			progs = append(progs, name)
+		}
+	}
+	var parts []string
+	if len(libs) > 0 {
+		parts = append(parts, "the "+andList(libs)+" "+plural(len(libs), "library", "libraries"))
+	}
+	if len(progs) > 0 {
+		const maxNamed = 4
+		if len(progs) > maxNamed+1 {
+			progs = append(progs[:maxNamed:maxNamed], fmt.Sprintf("%d more", len(progs)-maxNamed))
+		}
+		parts = append(parts, plural(len(progs), "the program ", "the programs ")+andList(progs))
+	}
+	return strings.Join(parts, ", and to ")
+}
+
+func andList(items []string) string {
+	if len(items) < 2 {
+		return strings.Join(items, "")
+	}
+	return strings.Join(items[:len(items)-1], ", ") + " and " + items[len(items)-1]
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// reportAttach logs the result of attaching to a target, and reports
+// whether any function was attached to. A file attached to at startup, as
+// opposed to for a process started since, is only listed with --verbose.
+func reportAttach(cfg config, target discover.Target, funcs []string, err error, startup bool) bool {
 	// A file reached through /proc/<pid> is gone if the process exited in
 	// the meantime, which short-lived new processes often do.
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -336,6 +459,12 @@ func reportAttach(cfg config, target discover.Target, funcs []string, err error)
 	}
 	if len(funcs) == 0 {
 		return false
+	}
+	if target.Limits != "" {
+		logf("warning: %s: %s", target.Path, target.Limits)
+	}
+	if startup && !cfg.verbose {
+		return true
 	}
 	desc := fmt.Sprintf("%-7s %s", target.Library, target.Path)
 	var notes []string
@@ -356,20 +485,53 @@ func reportAttach(cfg config, target discover.Target, funcs []string, err error)
 }
 
 // acceptProcess returns which new processes are worth inspecting: those
-// that --comm and --container would trace.
-func acceptProcess(cfg config) func(pid int) bool {
-	if cfg.comm == "" && cfg.container == "" {
+// that --pid, --comm and --container would trace. With --pid, a process
+// accepted is also added to those traced.
+func acceptProcess(cfg config, t *tracer.Tracer) func(pid int) bool {
+	if cfg.pid == 0 && cfg.comm == "" && cfg.container == "" {
 		return nil
 	}
 	resolver := procinfo.NewResolver("/proc") // not shared: Resolver isn't safe for concurrent use
 	return func(pid int) bool {
 		if cfg.comm != "" {
 			comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-			if err != nil || strings.TrimSuffix(string(comm), "\n") != cfg.comm {
+			if err != nil || !strings.HasPrefix(strings.TrimSuffix(string(comm), "\n"), cfg.comm) {
 				return false
 			}
 		}
-		return cfg.container == "" || strings.HasPrefix(resolver.ContainerID(uint32(pid)), cfg.container)
+		if cfg.container != "" && !strings.HasPrefix(resolver.ContainerID(uint32(pid)), cfg.container) {
+			return false
+		}
+		if cfg.pid != 0 {
+			if !discover.IsDescendant(pid, cfg.pid) {
+				return false
+			}
+			if err := t.TracePID(uint32(pid)); err != nil {
+				logf("warning: %v", err)
+			}
+		}
+		return true
+	}
+}
+
+// followChildren adds the processes that pid starts to those traced, as it
+// finds them in /proc.
+func followChildren(ctx context.Context, t *tracer.Tracer, pid int) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	traced := map[int]bool{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, child := range discover.Descendants(pid) {
+				// One that failed, e.g. with the map full, is tried again.
+				if !traced[child] && t.TracePID(uint32(child)) == nil {
+					traced[child] = true
+				}
+			}
+		}
 	}
 }
 
@@ -405,9 +567,9 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		case cfg.json:
 			printers = append(printers, output.NewJSON(os.Stdout))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(os.Stdout))
+			printers = append(printers, output.NewBrief(os.Stdout, output.Options{Verbose: cfg.verbose}))
 		default:
-			printers = append(printers, output.NewText(os.Stdout, cfg.hex))
+			printers = append(printers, output.NewText(os.Stdout, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose}))
 		}
 	}
 
@@ -420,10 +582,14 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 	}, nil
 }
 
-func reportLostEvents(ctx context.Context, t *tracer.Tracer) {
+// watchCounters warns about what the BPF program counts going missing: data
+// dropped because the ring buffer was full, and QUIC packets of connections
+// that started before snoopy and can't be followed (Firefox's).
+func watchCounters(ctx context.Context, t *tracer.Tracer) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	var reported uint64
+	quicWarned := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -433,6 +599,10 @@ func reportLostEvents(ctx context.Context, t *tracer.Tracer) {
 			if err == nil && lost > reported {
 				logf("warning: %d chunks dropped so far because the ring buffer was full", lost)
 				reported = lost
+			}
+			if n, err := t.UntrackedQUIC(); err == nil && n > 0 && !quicWarned {
+				logf("warning: Firefox has HTTP/3 connections that were open before snoopy started, which can't be traced; restart Firefox to trace them")
+				quicWarned = true
 			}
 		}
 	}

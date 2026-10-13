@@ -5,6 +5,7 @@ package discover
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -59,7 +60,10 @@ type Target struct {
 	// replaced while in use through /proc/<pid>/map_files or /proc/<pid>/exe.
 	Path string
 	// Note says what Path is, if that isn't obvious from it.
-	Note    string
+	Note string
+	// Deleted is the name a file that was deleted or replaced while in use
+	// had.
+	Deleted string
 	Library Library
 	// Go holds the probe locations for GoTLS targets.
 	Go *GoInfo
@@ -72,6 +76,17 @@ type Target struct {
 	// traced, e.g. a stripped BoringSSL whose functions couldn't be told
 	// apart. Such a target is reported, not attached to.
 	Problem error
+	// Limits, if set, says what of a target that is attached to can't be
+	// traced, e.g. a BoringSSL build's HTTP/3.
+	Limits string
+}
+
+// Name returns the file's name, as the processes using it know it.
+func (t Target) Name() string {
+	if t.Deleted != "" {
+		return filepath.Base(t.Deleted)
+	}
+	return filepath.Base(t.Path)
 }
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
@@ -116,9 +131,13 @@ var libDirs = []string{
 
 // Options controls Find.
 type Options struct {
-	// PID restricts discovery to the files mapped by one process. Zero means
-	// system-wide libraries plus, unless NoScan is set, every running process.
+	// PID restricts discovery to system-wide libraries and the files mapped
+	// by one process and those it started. Zero means system-wide libraries,
+	// known programs and, unless NoScan is set, every running process.
 	PID int
+	// Comm, if set, leaves out the running processes, and the known
+	// programs, whose name doesn't start with it.
+	Comm string
 	// Extra are additional libraries or executables to attach to.
 	Extra []string
 	// NoScan skips scanning running processes.
@@ -150,12 +169,20 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 			return nil, nil, fmt.Errorf("pid %d: %w", opts.PID, err)
 		}
 		candidates = append(candidates, files...)
-	} else {
+		for _, child := range descendants(proc, opts.PID)[1:] {
+			files, _ := processFiles(proc, child) // it may have exited
+			candidates = append(candidates, files...)
+		}
+		// For the programs it will start.
 		for _, path := range systemLibraries() {
 			candidates = append(candidates, candidate{path: path})
 		}
+	} else {
+		for _, path := range append(knownFiles(opts.Comm), systemLibraries()...) {
+			candidates = append(candidates, candidate{path: path})
+		}
 		if !opts.NoScan {
-			files, denied := allProcessFiles(proc)
+			files, denied := allProcessFiles(proc, opts.Comm)
 			candidates = append(candidates, files...)
 			if denied > 0 {
 				msg := fmt.Sprintf("permission denied inspecting %d processes; TLS libraries and Go programs only they use are missed", denied)
@@ -191,6 +218,7 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 				continue
 			}
 			t.Note = joinNotes(t.Note, c.note)
+			t.Deleted = c.deleted
 			targets = append(targets, t)
 		}
 	}
@@ -252,14 +280,28 @@ func (w *Watcher) Process(pid int) []Target {
 	return targets
 }
 
-// systemLibraries returns the TLS libraries installed in the usual places.
-func systemLibraries() []string {
+// knownFiles returns the known programs that are installed, of those whose
+// name starts with comm.
+func knownFiles(comm string) []string {
 	var out []string
 	for _, p := range knownPrograms {
+		name := filepath.Base(p)
+		if strings.Contains(p, "/firefox/") {
+			name = "firefox" // its libraries
+		}
+		if !strings.HasPrefix(name, comm) {
+			continue
+		}
 		if real, err := filepath.EvalSymlinks(p); err == nil {
 			out = append(out, real)
 		}
 	}
+	return out
+}
+
+// systemLibraries returns the TLS libraries installed in the usual places.
+func systemLibraries() []string {
+	var out []string
 	for _, dir := range libDirs {
 		for _, pat := range libPatterns {
 			matches, _ := filepath.Glob(filepath.Join(dir, pat))
@@ -276,8 +318,9 @@ func systemLibraries() []string {
 }
 
 type candidate struct {
-	path string
-	note string
+	path    string
+	note    string
+	deleted string // the name the file had, if it was deleted
 }
 
 const deletedSuffix = " (deleted)"
@@ -301,8 +344,9 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 	for _, lib := range libs {
 		if lib.Deleted {
 			out = append(out, candidate{
-				path: filepath.Join(dir, "map_files", lib.Range),
-				note: "deleted " + lib.Path,
+				path:    filepath.Join(dir, "map_files", lib.Range),
+				note:    "deleted " + lib.Path,
+				deleted: lib.Path,
 			})
 		} else {
 			out = append(out, candidate{path: filepath.Join(dir, "root", lib.Path)})
@@ -314,8 +358,9 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 	case err != nil:
 	case strings.HasSuffix(exe, deletedSuffix):
 		out = append(out, candidate{
-			path: filepath.Join(dir, "exe"),
-			note: "deleted " + strings.TrimSuffix(exe, deletedSuffix),
+			path:    filepath.Join(dir, "exe"),
+			note:    "deleted " + strings.TrimSuffix(exe, deletedSuffix),
+			deleted: strings.TrimSuffix(exe, deletedSuffix),
 		})
 	default:
 		out = append(out, candidate{path: filepath.Join(dir, "root", exe)})
@@ -323,9 +368,76 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 	return out, nil
 }
 
-// allProcessFiles runs processFiles for every process, ignoring processes
-// that exit. It also returns how many processes it wasn't allowed to inspect.
-func allProcessFiles(proc string) (files []candidate, denied int) {
+// Descendants returns a process's ID and those of the processes it started,
+// and they started, and so on, that are still running.
+func Descendants(pid int) []int {
+	return descendants("/proc", pid)
+}
+
+func descendants(proc string, pid int) []int {
+	entries, err := os.ReadDir(proc)
+	if err != nil {
+		return []int{pid}
+	}
+	children := map[int][]int{}
+	for _, e := range entries {
+		child, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		if ppid, ok := parentPID(proc, child); ok {
+			children[ppid] = append(children[ppid], child)
+		}
+	}
+	out := []int{pid}
+	for i := 0; i < len(out); i++ {
+		out = append(out, children[out[i]]...)
+	}
+	return out
+}
+
+// parentPID reads a process's parent from /proc/<pid>/stat: "pid (comm)
+// state ppid ...", where comm may contain spaces and parentheses.
+func parentPID(proc string, pid int) (int, bool) {
+	data, err := os.ReadFile(filepath.Join(proc, strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0, false
+	}
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(string(data[i+1:]))
+	if len(fields) < 2 {
+		return 0, false
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	return ppid, err == nil
+}
+
+// IsDescendant reports whether pid was started by ancestor, directly or not.
+func IsDescendant(pid, ancestor int) bool {
+	return isDescendant("/proc", pid, ancestor)
+}
+
+func isDescendant(proc string, pid, ancestor int) bool {
+	for i := 0; i < 64 && pid > 1; i++ {
+		ppid, ok := parentPID(proc, pid)
+		if !ok {
+			return false
+		}
+		if ppid == ancestor {
+			return true
+		}
+		pid = ppid
+	}
+	return false
+}
+
+// allProcessFiles runs processFiles for every process whose name starts
+// with comm, ignoring processes that exit. It also returns how many
+// processes it wasn't allowed to inspect.
+func allProcessFiles(proc, comm string) (files []candidate, denied int) {
 	entries, err := os.ReadDir(proc)
 	if err != nil {
 		return nil, 0
@@ -335,6 +447,12 @@ func allProcessFiles(proc string) (files []candidate, denied int) {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid == self {
 			continue
+		}
+		if comm != "" {
+			name, err := os.ReadFile(filepath.Join(proc, e.Name(), "comm"))
+			if err != nil || !strings.HasPrefix(string(name), comm) {
+				continue
+			}
 		}
 		f, err := processFiles(proc, pid)
 		if errors.Is(err, os.ErrPermission) {

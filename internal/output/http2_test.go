@@ -9,7 +9,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // http2Writer builds one direction of an HTTP/2 connection.
@@ -123,7 +123,7 @@ func TestHTTP2MissingBytes(t *testing.T) {
 	b := server.buf.Bytes()
 
 	c := newHTTP2Conns(newBodyPool())
-	c.start(http2Key{7, 0x1000}) // as if the client's preface was seen
+	c.start(http2Key{7, 0x1000}, false) // as if the client's preface was seen
 	// One call returns everything, but only the first 100 bytes are captured.
 	ev := &tracer.Event{PID: 7, ConnID: 0x1000, Function: tracer.FuncSSLRead, Size: uint32(len(b)), Data: b[:100]}
 	if _, ok, note := c.process(ev); ok || !strings.Contains(note, "weren't captured") {
@@ -131,7 +131,7 @@ func TestHTTP2MissingBytes(t *testing.T) {
 	}
 
 	c = newHTTP2Conns(newBodyPool())
-	c.start(http2Key{7, 0x1000})
+	c.start(http2Key{7, 0x1000}, false)
 	dataEnd := len(b) - 9 - 1 // the last HEADERS frame: 9-byte header, 1-byte block
 	evs := []*tracer.Event{
 		{PID: 7, ConnID: 0x1000, Function: tracer.FuncSSLRead, Size: uint32(dataEnd), Data: b[:100]},
@@ -142,30 +142,107 @@ func TestHTTP2MissingBytes(t *testing.T) {
 	}
 }
 
-func TestHTTP2NeedsConnectionStart(t *testing.T) {
+// A connection that started before snoopy is followed from the first call
+// that starts with a frame, without its headers.
+func TestHTTP2StartedBeforeSnoopy(t *testing.T) {
 	server := newHTTP2Writer(false)
 	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: server.block(":status", "200"), EndHeaders: true})
+	server.fr.WriteData(1, false, []byte("<html>"))
+	server.fr.WriteData(1, true, []byte("</html>"))
+	stream := server.buf.Bytes()
+
 	c := newHTTP2Conns(newBodyPool())
-	for _, ev := range events(tracer.FuncSSLRead, server.buf.Bytes(), 1<<20) {
-		if _, ok, _ := c.process(ev); ok {
-			t.Error("decoded a connection whose start wasn't seen")
+	var got []string
+	var notes int
+	// The first call starts in the middle of the SETTINGS frame, and is
+	// skipped; the next starts with the HEADERS frame.
+	for _, ev := range append(events(tracer.FuncSSLRead, stream[3:15], 1<<20), events(tracer.FuncSSLRead, stream[15:], 25)...) {
+		frames, ok, note := c.process(ev)
+		if note != "" {
+			notes++
 		}
+		if !ok {
+			got = append(got, "skipped")
+			continue
+		}
+		for _, f := range frames {
+			desc := f.Type
+			if f.HeadersLost {
+				desc += " (lost)"
+			}
+			if len(f.Data) > 0 {
+				desc += " " + string(f.Data)
+			}
+			got = append(got, desc)
+		}
+	}
+	want := []string{"skipped", "HEADERS (lost)", "DATA <html>", "DATA </html>"}
+	if !reflect.DeepEqual(got, want) || notes != 1 {
+		t.Errorf("got %q and %d notes, want %q and 1", got, notes, want)
+	}
+
+	// Data that doesn't start with a frame isn't taken for HTTP/2.
+	c = newHTTP2Conns(newBodyPool())
+	if _, ok, _ := c.process(events(tracer.FuncSSLRead, []byte("hello, world"), 1<<20)[0]); ok {
+		t.Error("text taken for HTTP/2")
 	}
 }
 
 func TestTextHTTP2(t *testing.T) {
 	client := newHTTP2Writer(true)
 	client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: client.block(":method", "GET", ":path", "/index.html"), EndStream: true, EndHeaders: true})
+	client.fr.WriteWindowUpdate(0, 1<<20)
+	for _, verbose := range []bool{false, true} {
+		var out bytes.Buffer
+		p := NewText(&out, Options{Verbose: verbose})
+		for _, ev := range events(tracer.FuncSSLWrite, client.buf.Bytes(), 1<<20) {
+			if err := p.Print(ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, want := range []string{"HTTP/2 HEADERS stream=1", "[END_STREAM,END_HEADERS]", ":path: /index.html"} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("verbose %v: output lacks %q:\n%s", verbose, want, out.String())
+			}
+		}
+		// The frames that only keep the connection going are left out.
+		for _, s := range []string{"HTTP/2 connection preface", "HTTP/2 SETTINGS stream=0", "HTTP/2 WINDOW_UPDATE stream=0"} {
+			if strings.Contains(out.String(), s) != verbose {
+				t.Errorf("verbose %v: %q shown: %v\n%s", verbose, s, !verbose, out.String())
+			}
+		}
+	}
+
+	// A call with only those is left out, and counted.
 	var out bytes.Buffer
-	p := NewText(&out, false)
-	for _, ev := range events(tracer.FuncSSLWrite, client.buf.Bytes(), 1<<20) {
+	p := NewText(&out, Options{})
+	server := newHTTP2Writer(false)
+	server.fr.WriteWindowUpdate(0, 1<<20)
+	client = newHTTP2Writer(true)
+	for _, ev := range []*tracer.Event{events(tracer.FuncSSLWrite, client.buf.Bytes(), 1<<20)[0], events(tracer.FuncSSLRead, server.buf.Bytes(), 1<<20)[0]} {
 		if err := p.Print(ev); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, want := range []string{"HTTP/2 connection preface", "HTTP/2 SETTINGS stream=0", "HTTP/2 HEADERS stream=1", "[END_STREAM,END_HEADERS]", ":path: /index.html"} {
-		if !strings.Contains(out.String(), want) {
-			t.Errorf("output lacks %q:\n%s", want, out.String())
+	if out.Len() != 0 || p.Hidden() != 2 {
+		t.Errorf("%d hidden; printed:\n%s", p.Hidden(), out.String())
+	}
+
+	// A connection that started before snoopy gets one note.
+	out.Reset()
+	server = newHTTP2Writer(false)
+	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: server.block(":status", "200"), EndHeaders: true})
+	server.fr.WriteData(3, true, []byte("hello"))
+	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 5, BlockFragment: server.block(":status", "404"), EndHeaders: true, EndStream: true})
+	p = NewText(&out, Options{})
+	for _, ev := range events(tracer.FuncSSLRead, server.buf.Bytes(), 40) {
+		ev.ConnID = 0x2000
+		if err := p.Print(ev); err != nil {
+			t.Fatal(err)
 		}
+	}
+	text := out.String()
+	if strings.Count(text, "started before snoopy") != 1 || strings.Count(text, "(headers not decoded)") != 2 || !strings.Contains(text, "hello") {
+		t.Errorf("late connection:\n%s", text)
 	}
 }

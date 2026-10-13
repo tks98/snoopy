@@ -2,15 +2,17 @@
 package output
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/netip"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fatih/color"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // Printer writes events somewhere.
@@ -19,31 +21,31 @@ type Printer interface {
 }
 
 // Text prints events for humans: a header line per call followed by the
-// payload, pretty-printed if it is HTTP/1.x or HTTP/2 and hex-dumped if it
-// is binary.
+// payload, decoded if it is HTTP, and hex-dumped if it is binary.
 type Text struct {
-	w    io.Writer
-	hex  bool
-	h1   *http1Conns
-	h2   *http2Conns
-	quic *quicConns
+	w      io.Writer
+	opts   Options
+	dec    decoders
+	hidden int
 
 	dim, title, fn, write, read, header, warn func(a ...any) string
 }
 
-// NewText returns a Text printer. If hex is set, payloads are always
-// hex-dumped. Colors follow color.NoColor.
-func NewText(w io.Writer, hex bool) *Text {
+// How much of the data is shown, without Options.Full.
+const (
+	maxBodyShown = 2048 // bytes of a body, or of a call's data that isn't HTTP
+	maxHexShown  = 256  // bytes of binary data that isn't a body
+)
+
+// NewText returns a Text printer. Colors follow color.NoColor.
+func NewText(w io.Writer, opts Options) *Text {
 	s := func(attrs ...color.Attribute) func(a ...any) string {
 		return color.New(attrs...).SprintFunc()
 	}
-	pool := newBodyPool()
 	return &Text{
 		w:      w,
-		hex:    hex,
-		h1:     newHTTP1Conns(pool),
-		h2:     newHTTP2Conns(pool),
-		quic:   newQUICConns(pool),
+		opts:   opts,
+		dec:    newDecoders(),
 		dim:    s(color.Faint),
 		title:  s(color.Bold),
 		fn:     s(color.FgHiMagenta, color.Bold),
@@ -54,7 +56,16 @@ func NewText(w io.Writer, hex bool) *Text {
 	}
 }
 
+// Hidden returns how many events were left out because they only kept a
+// connection going.
+func (t *Text) Hidden() int { return t.hidden }
+
 func (t *Text) Print(ev *tracer.Event) error {
+	dc := t.dec.decode(ev)
+	if !t.opts.Verbose && dc.housekeeping() {
+		t.hidden++
+		return nil
+	}
 	var b strings.Builder
 
 	// 12:01:02.345678 curl (pid 2422) SSL_write 10.0.0.2:51234 > 93.184.216.34:443  77 bytes  311µs
@@ -80,29 +91,22 @@ func (t *Text) Print(ev *tracer.Event) error {
 	}
 	fmt.Fprintf(&b, "  %s\n", t.dim(strings.Join(extra, ", ")))
 
-	if ev.Function.IsQUIC() {
-		if items, ok := t.quic.process(ev); ok && !t.hex {
-			t.writeQUIC(&b, items)
-		} else {
+	if dc.note != "" {
+		fmt.Fprintln(&b, t.warn("["+dc.note+"]"))
+	}
+	switch {
+	case t.opts.Hex:
+		if len(ev.Data) > 0 {
 			b.WriteString(hexdump(ev.Data) + "\n")
 		}
-	} else {
-		frames, isHTTP2, note := t.h2.process(ev)
-		if note != "" {
-			fmt.Fprintln(&b, t.warn("["+note+"]"))
-		}
-		var segs []http1Segment
-		if !isHTTP2 {
-			segs = t.h1.process(ev)
-		}
-		switch {
-		case isHTTP2 && !t.hex:
-			t.writeHTTP2(&b, frames, len(ev.Data))
-		case decodesBody(segs) && !t.hex:
-			t.writeHTTP1(&b, segs)
-		default:
-			t.writePayload(&b, ev.Data)
-		}
+	case dc.isQUIC && !dc.notQUIC:
+		t.writeQUIC(&b, dc.quic)
+	case dc.isHTTP2:
+		t.writeHTTP2(&b, dc.http2, len(ev.Data))
+	case dc.http1 != nil:
+		t.writeHTTP1(&b, dc.http1)
+	default:
+		t.writeData(&b, ev.Data)
 	}
 
 	switch {
@@ -119,29 +123,8 @@ func (t *Text) Print(ev *tracer.Event) error {
 	return err
 }
 
-func (t *Text) writePayload(b *strings.Builder, data []byte) {
-	if len(data) == 0 {
-		return
-	}
-	if t.hex {
-		b.WriteString(hexdump(data) + "\n")
-		return
-	}
-	if m, ok := parseHTTP1(data); ok {
-		b.WriteString(t.title(escapeText([]byte(m.startLine))) + "\n")
-		for _, h := range m.headers {
-			fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h[0]))), escapeText([]byte(h[1])))
-		}
-		if len(m.body) > 0 {
-			b.WriteString("\n")
-			t.writeBody(b, m.body)
-		}
-		return
-	}
-	t.writeBody(b, data)
-}
-
-// writeHTTP1 prints HTTP/1.x messages whose bodies are being decoded.
+// writeHTTP1 prints HTTP/1.x messages, and data that isn't HTTP/1.x on a
+// connection that was.
 func (t *Text) writeHTTP1(b *strings.Builder, segs []http1Segment) {
 	for i, s := range segs {
 		switch {
@@ -154,29 +137,23 @@ func (t *Text) writeHTTP1(b *strings.Builder, segs []http1Segment) {
 				b.WriteString("\n")
 			}
 		case s.body.Encoding != "":
-			t.writeBodyPart(b, s.raw, s.body)
+			t.writeBodyPart(b, s.raw, s.offset, s.body, s.contentType)
+		case s.inBody:
+			t.writeBody(b, s.raw, s.contentType, s.offset, "")
 		case len(s.raw) > 0:
-			t.writeBody(b, s.raw)
+			t.writeData(b, s.raw)
 		}
 	}
-}
-
-func decodesBody(segs []http1Segment) bool {
-	for _, s := range segs {
-		if s.body.Encoding != "" {
-			return true
-		}
-	}
-	return false
 }
 
 // writeBodyPart prints a piece of an encoded body as what it decoded to, or
-// as sent if it couldn't be decoded.
-func (t *Text) writeBodyPart(b *strings.Builder, raw []byte, part bodyPart) {
+// as sent if it couldn't be decoded. offset is where the piece starts in the
+// body as sent.
+func (t *Text) writeBodyPart(b *strings.Builder, raw []byte, offset int64, part bodyPart, contentType string) {
 	if part.Err != "" {
 		b.WriteString(t.warn(fmt.Sprintf("[%s body not decoded: %s]", part.Encoding, part.Err)) + "\n")
 		if len(raw) > 0 {
-			t.writeBody(b, raw)
+			t.writeBody(b, raw, contentType, offset, "")
 		}
 		return
 	}
@@ -184,8 +161,97 @@ func (t *Text) writeBodyPart(b *strings.Builder, raw []byte, part bodyPart) {
 		b.WriteString(t.dim(fmt.Sprintf("[%s: %d bytes, no output]", part.Encoding, len(raw))) + "\n")
 		return
 	}
-	b.WriteString(t.dim(fmt.Sprintf("[%s: %d bytes decoded to %d]", part.Encoding, len(raw), len(part.Decoded))) + "\n")
-	t.writeBody(b, part.Decoded)
+	t.writeBody(b, part.Decoded, contentType, part.Offset, fmt.Sprintf("%s: %d bytes decoded to", part.Encoding, len(raw)))
+}
+
+// writeBody prints a piece of a message body that starts offset bytes into
+// it. Unless Options.Full is set, text is shown up to maxBodyShown bytes into
+// the body, and the rest of it, and binary data, are only described. decoded,
+// if not empty, says what the piece was decoded from, e.g. "gzip: 300 bytes
+// decoded to".
+func (t *Text) writeBody(b *strings.Builder, data []byte, contentType string, offset int64, decoded string) {
+	text := isText(data)
+	if t.opts.Full || text && offset < maxBodyShown {
+		if decoded != "" {
+			b.WriteString(t.dim(fmt.Sprintf("[%s %d]", decoded, len(data))) + "\n")
+		}
+		switch {
+		case !text:
+			b.WriteString(hexdump(data) + "\n")
+		case t.opts.Full:
+			t.writeLimited(b, data, len(data))
+		default:
+			t.writeLimited(b, data, int(maxBodyShown-offset))
+		}
+		return
+	}
+	what := mediaType(contentType)
+	if what == "" {
+		what = "binary data"
+		if text {
+			what = "text"
+		}
+	}
+	desc := fmt.Sprintf("%d bytes of %s", len(data), what)
+	if offset > 0 {
+		desc = fmt.Sprintf("%d more bytes of %s", len(data), what)
+	}
+	if decoded != "" {
+		desc = decoded + " " + desc
+	}
+	b.WriteString(t.dim("["+desc+"]") + "\n")
+}
+
+// writeData prints data that isn't known to be a message body: text, and
+// binary data as a hex dump, each up to a limit unless Options.Full is set.
+func (t *Text) writeData(b *strings.Builder, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	if isText(data) {
+		limit := len(data)
+		if !t.opts.Full {
+			limit = maxBodyShown
+		}
+		t.writeLimited(b, data, limit)
+		return
+	}
+	if t.opts.Full || len(data) <= maxHexShown {
+		b.WriteString(hexdump(data) + "\n")
+		return
+	}
+	b.WriteString(hexdump(data[:maxHexShown]) + "\n")
+	b.WriteString(t.dim(fmt.Sprintf("[… %d more bytes; --full shows all]", len(data)-maxHexShown)) + "\n")
+}
+
+// writeLimited prints text, or its first limit bytes, ending at a line
+// break if there's one in the second half, and says how much was left out.
+func (t *Text) writeLimited(b *strings.Builder, data []byte, limit int) {
+	shown := data
+	if len(data) > limit {
+		cut := limit
+		for cut > 0 && !utf8.RuneStart(data[cut]) { // don't split a character
+			cut--
+		}
+		if i := bytes.LastIndexByte(data[:cut], '\n'); i >= limit/2 {
+			cut = i + 1
+		}
+		shown = data[:cut]
+	}
+	text := escapeText(shown)
+	b.WriteString(text)
+	if !strings.HasSuffix(text, "\n") && text != "" {
+		b.WriteString("\n")
+	}
+	if len(shown) < len(data) {
+		b.WriteString(t.dim(fmt.Sprintf("[… %d more bytes; --full shows all]", len(data)-len(shown))) + "\n")
+	}
+}
+
+// mediaType returns a Content-Type's type, without its parameters.
+func mediaType(contentType string) string {
+	typ, _, _ := strings.Cut(contentType, ";")
+	return strings.TrimSpace(typ)
 }
 
 // writeHTTP2 prints the frames of an HTTP/2 connection, with their decoded
@@ -195,6 +261,9 @@ func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int)
 		b.WriteString(t.dim(fmt.Sprintf("HTTP/2: %d bytes of a frame that continues in a later call", captured)) + "\n")
 	}
 	for _, f := range frames {
+		if !t.opts.Verbose && f.housekeeping() {
+			continue
+		}
 		line := "HTTP/2 " + f.Type
 		switch {
 		case f.Type == "connection preface":
@@ -206,9 +275,12 @@ func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int)
 		if len(f.Flags) > 0 {
 			line += " [" + strings.Join(f.Flags, ",") + "]"
 		}
-		if f.Headers != nil {
+		switch {
+		case f.Headers != nil:
 			b.WriteString(t.title(line) + "\n")
-		} else {
+		case f.HeadersLost:
+			b.WriteString(t.title(line) + t.dim(" (headers not decoded)") + "\n")
+		default:
 			b.WriteString(t.dim(line) + "\n")
 		}
 		for _, h := range f.Headers {
@@ -216,25 +288,27 @@ func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int)
 		}
 		switch {
 		case f.Body.Encoding != "":
-			t.writeBodyPart(b, f.Data, f.Body)
+			t.writeBodyPart(b, f.Data, f.Offset, f.Body, f.ContentType)
 		case len(f.Data) > 0:
-			t.writeBody(b, f.Data)
+			t.writeBody(b, f.Data, f.ContentType, f.Offset, "")
 		}
 	}
 }
 
-// writeQUIC prints a QUIC packet's frames on one line, then the HTTP/3
-// frames its stream data completed.
+// writeQUIC prints the HTTP/3 frames a QUIC packet's stream data completed,
+// after the packet's QUIC frames on one line if Options.Verbose is set.
 func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
-	var frames []string
-	for _, it := range items {
-		if it.Frame != "" {
-			frames = append(frames, it.Frame)
+	if t.opts.Verbose {
+		var frames []string
+		for _, it := range items {
+			if it.Frame != "" {
+				frames = append(frames, it.Frame)
+			}
 		}
+		b.WriteString(t.dim("QUIC: "+strings.Join(frames, ", ")) + "\n")
 	}
-	b.WriteString(t.dim("QUIC: "+strings.Join(frames, ", ")) + "\n")
 	for _, it := range items {
-		if it.Frame != "" {
+		if it.Frame != "" || !t.opts.Verbose && it.housekeeping() {
 			continue
 		}
 		line := fmt.Sprintf("HTTP/3 %s stream=%d", it.HTTP3, it.Stream)
@@ -247,7 +321,7 @@ func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
 				fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), escapeText([]byte(h.Value)))
 			}
 			if it.Body.Encoding != "" {
-				t.writeBodyPart(b, nil, it.Body)
+				t.writeBodyPart(b, nil, 0, it.Body, "")
 			}
 		case it.HTTP3 == "SETTINGS":
 			b.WriteString(t.dim(line+" "+string(it.Data)) + "\n")
@@ -258,27 +332,12 @@ func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
 			b.WriteString(t.dim(line) + "\n")
 			switch {
 			case it.Body.Encoding != "":
-				t.writeBodyPart(b, it.Data, it.Body)
+				t.writeBodyPart(b, it.Data, it.Offset, it.Body, it.ContentType)
 			case len(it.Data) > 0:
-				t.writeBody(b, it.Data)
+				t.writeBody(b, it.Data, it.ContentType, it.Offset, "")
 			}
 		}
 	}
-}
-
-func (t *Text) writeBody(b *strings.Builder, data []byte) {
-	if isText(data) {
-		text := escapeText(data)
-		b.WriteString(text)
-		if !strings.HasSuffix(text, "\n") {
-			b.WriteString("\n")
-		}
-		return
-	}
-	if frames := summarizeHTTP2(data); frames != nil {
-		b.WriteString(t.dim("HTTP/2: "+strings.Join(frames, "; ")) + "\n")
-	}
-	b.WriteString(hexdump(data) + "\n")
 }
 
 // endpoints says where an event's data went, from sender to receiver, as

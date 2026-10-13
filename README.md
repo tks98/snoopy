@@ -7,9 +7,7 @@ library, so it sees the data before it is encrypted and after it is decrypted.
 
 ```console
 $ sudo snoopy
-snoopy: attached to openssl /opt/google/chrome/chrome (BoringSSL found by signature)
-snoopy: attached to openssl /usr/lib/x86_64-linux-gnu/libssl.so.3
-snoopy: attached to gnutls  /usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1
+snoopy: attached to the openssl and gnutls libraries, and to the program chrome (--verbose lists every file)
 snoopy: tracing; press Ctrl-C to stop
 06:42:46.026011 curl (pid 32570) SSL_write 192.168.5.15:58278 > 172.66.147.243:443  116 bytes  2.15ms  fd 5, conn 0x5f49f76814f0
 GET / HTTP/1.1
@@ -44,6 +42,21 @@ $ sudo snoopy --brief
 06:43:04.149725 chrome[32786] 172.66.147.243:443 > 192.168.5.15:54267 QUIC 551: HTTP/3 HEADERS s0 200, text/html; charset=utf-8, br; DATA s0 334 bytes (br, 577 decoded)
 ```
 
+## Quick start
+
+On Linux 5.10 or later, x86_64 or arm64, with Go 1.25 or later:
+
+```bash
+go install github.com/tks98/snoopy/v2@latest
+sudo "$(go env GOPATH)/bin/snoopy" --brief
+```
+
+Then run `curl https://example.com` in another terminal. snoopy needs root,
+and `sudo` doesn't search your Go bin directory, hence the full path. To
+trace one program, name it: `--comm curl`, `--comm firefox`, `--comm chrome`.
+Binaries are on the [releases page](https://github.com/tks98/snoopy/releases)
+once a version is tagged.
+
 ## Features
 
 - **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS, wolfSSL,
@@ -62,10 +75,12 @@ $ sudo snoopy --brief
 - **Connection details:** process, thread, socket and local and remote
   address for every call, plus the container ID when the process runs in one.
 - **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 and HTTP/3 are
-  shown frame by frame with their headers decoded (HPACK, QPACK), bodies
+  shown frame by frame with their headers decoded (HPACK, QPACK), and bodies
   compressed with gzip, deflate, Brotli or zstd are shown decompressed as
-  they arrive, and binary data is hex-dumped. With
-  `--json` you get one JSON object per line instead.
+  they arrive. A body's first 2 KiB are shown and binary bodies are described
+  in a line, and calls that only keep connections going are left out; `--full`
+  and `--verbose` show everything. With `--json` you get one JSON object per
+  line instead.
 - **Wireshark:** `--pcap` writes the plaintext as TCP streams so Wireshark
   can dissect the application protocol.
 - **Single static binary:** the eBPF program is compiled ahead of time and
@@ -87,53 +102,97 @@ $ sudo snoopy --brief
 
 ## Install
 
-Download a binary from the [releases page](https://github.com/tks98/snoopy/releases),
-or build from source with Go 1.25+:
+With Go 1.25 or later:
 
 ```bash
-go install github.com/tks98/snoopy@latest
-# or
-git clone https://github.com/tks98/snoopy && cd snoopy && make build
+go install github.com/tks98/snoopy/v2@latest
 ```
+
+This builds the committed eBPF objects into the binary, so it needs no
+compiler or kernel headers. `sudo snoopy` won't find it, since `sudo` uses its
+own `PATH`; run `sudo "$(go env GOPATH)/bin/snoopy"`, or copy the binary
+somewhere like `/usr/local/bin`. Or clone the repository and run
+`make build`. Tagged versions also come as binaries on the
+[releases page](https://github.com/tks98/snoopy/releases).
 
 ## Usage
 
 ```bash
 sudo snoopy                                 # everything, decoded
 sudo snoopy --brief                         # one line per call, like tcpdump
-sudo snoopy --pid 1234                      # one process
-sudo snoopy --comm curl                     # processes named curl
+sudo snoopy --comm curl                     # processes whose name starts with curl
+sudo snoopy --pid 1234                      # one process and those it starts
 sudo snoopy --container 4b825dc642          # one container (ID prefix)
 sudo snoopy --host example.com --port 443   # connections to example.com on port 443
 sudo snoopy --count 20                      # stop after 20 calls
+sudo snoopy --full                          # whole bodies, and binary data as hex dumps
 sudo snoopy --json | jq 'select(.direction == "write") | .data'
-sudo snoopy --max-size 1048576              # capture up to 1 MiB per call (default 16 KiB)
 sudo snoopy --lib /usr/bin/node             # also attach to a binary with OpenSSL linked in
 ```
 
-| Flag | Description |
-| --- | --- |
-| `--pid N` | Trace only this process. |
-| `--comm NAME` | Trace only processes with exactly this name, as in `/proc/<pid>/comm` (at most 15 characters). |
-| `--container ID` | Trace only processes in this container, given as an ID or ID prefix. |
-| `--host HOST` | Show only connections with this IP address, network (`10.0.0.0/8`) or host name at either end. Names are looked up when snoopy starts. Can be repeated. |
-| `--port N` | Show only connections with this port at either end. Can be repeated. |
-| `--lib PATH` | Also attach to this library or executable. Can be repeated. |
-| `--no-scan` | Don't scan running or newly started processes; attach only to system libraries and `--lib`. |
-| `--brief` | Print one line per call, like tcpdump: time, process, `source > destination`, protocol and size, and a summary of the data (an HTTP request or status line, HTTP/2 and HTTP/3 frames, what a body decoded to). |
-| `--json` | Print one JSON object per line. |
-| `--hex` | Always hex-dump payloads as captured, without decoding HTTP. |
-| `--max-size N` | Maximum bytes captured per call, up to 1 MiB. Defaults to 16384. |
-| `--count N` | Stop after this many calls (after filtering). |
-| `--pcap FILE` | Also write the plaintext to a pcap file; `-` writes it to stdout. |
-| `--quiet` | Don't print events. Useful with `--pcap`. |
-| `--no-color` | Disable colors. Colors are also off automatically when stdout isn't a terminal. |
-| `--verbose` | List the functions attached in each file. |
-| `--version` | Print the version. |
+`snoopy --help` lists every flag:
+
+```text
+Which processes:
+  --pid PID          only this process and those it starts
+  --comm NAME        only processes whose name starts with NAME, as in
+                     /proc/<pid>/comm (curl, firefox, chrome)
+  --container ID     only processes in the container with this ID, or ID prefix
+
+Which connections (repeatable):
+  --host HOST        only connections with this IP address, network (CIDR)
+                     or host name at either end
+  --port PORT        only connections with this port at either end
+
+Output:
+  --brief            one line per call, like tcpdump
+  --json             one JSON object per call
+  --full             whole bodies, and binary data as hex dumps (by default,
+                     a body's first 2 KiB, and binary data described)
+  --hex              payloads as hex dumps
+  --verbose          also calls that only keep connections going (HTTP/2
+                     settings and flow control, QUIC acknowledgments), and
+                     every file attached to
+  --count N          stop after N calls
+  --pcap FILE        also write the plaintext as TCP streams to a pcap file
+                     ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
+  --quiet            don't print calls (with --pcap)
+  --no-color         no colors
+
+Capture:
+  --max-size BYTES   bytes to capture per call (default 16384, at most 1048576)
+  --lib PATH         also attach to this library or program, e.g. one with
+                     OpenSSL linked in statically (repeatable)
+  --no-scan          only attach to system libraries and --lib, not to what
+                     running and new processes use
+
+  --version          print the version and exit
+```
+
+### What you see
 
 Each call shows where its data went, as tcpdump writes it: from the sender's
 address to the receiver's, so a read shows the server first. An end that
 isn't known shows as `local` or `peer`.
+
+A body is shown up to its first 2 KiB, over however many calls it takes, and
+the calls after that say how many more bytes of it arrived. Binary bodies,
+like images, get a line saying their size and content type. Data that isn't
+HTTP is shown as text, or hex-dumped up to 256 bytes. `--full` shows all of
+it, binary data as hex dumps.
+
+Calls that carry nothing of the requests and responses, only what keeps the
+connection going (HTTP/2 `SETTINGS`, `WINDOW_UPDATE` and `PING`, QUIC
+packets with only acknowledgments and the like), are left out, and so are
+those frames within other calls. When snoopy stops, it says how many calls it
+left out; `--verbose` shows them. `--count` counts the calls shown.
+
+Connections that were already open when snoopy started are shown as well as
+they can be. HTTP/2 compresses headers against a table built up over the
+connection, so for those connections the frames are listed but their headers
+can't be decoded, and the same goes for HTTP/3 header blocks that refer to
+earlier ones. Firefox's HTTP/3 connections from before snoopy can't be
+traced at all, and snoopy warns when it sees them.
 
 `--host` and `--port` need a connection's addresses. Connections whose
 addresses aren't known don't match: on kernels without BTF, those of
@@ -145,8 +204,13 @@ the TLS libraries and Go programs they use. It looks at a new process right
 after its `exec` and again after 50 ms, 500 ms and 3 s, since shared libraries
 are loaded after the `exec`. TLS calls a new program makes before then are
 missed, unless it uses a library snoopy was already attached to, such as the
-system `libssl`. With `--pid`, only that process is traced and nothing new is
-picked up.
+system `libssl`.
+
+`--pid` follows the processes the given one starts, which matters for
+browsers: Chrome does its networking in a separate process, so `--pid` of
+its main process captures that one. Without kernel BTF, a child that doesn't
+execute a new program (a fork) is only found by a scan of `/proc` every
+second.
 
 ### Wireshark and tcpdump
 
@@ -193,7 +257,7 @@ Each line is one call to a TLS read or write function:
 | `incomplete` | Set when part of the payload was dropped because the ring buffer was full. |
 | `read_error` | Set when the payload couldn't be read from the process's memory. |
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. |
-| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`) and `body` (see below). Only for connections whose start snoopy saw: HPACK compresses headers against a table built up over the connection. |
+| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`) and `body` (see below). HPACK compresses headers against a table built up over the connection, so on a connection that started before snoopy, frames are followed from the first call that starts with one, and a header block has `headers_not_decoded` instead of `headers`. |
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 | `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
 | `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
@@ -210,30 +274,89 @@ through `/proc`:
 docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /snoopy
 ```
 
+On Kubernetes, that's a pod with `hostPID: true` and a privileged container,
+on the node to trace.
+
 ## Supported libraries
 
-| Library | Functions | Notes |
+| Library | Functions probed | Notes |
 | --- | --- | --- |
-| OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
-| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 and arm64. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer, and otherwise warns that the build can't be traced. Checked against published debug symbols on Chrome 155 and 156 (x86_64) and Electron 42 and 44 (arm64), and on Brave 1.97, Edge 155 and Ubuntu's Chromium 155 snap (arm64). Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Chrome's HTTP/3 traffic is captured too, see below. |
-| QUIC (HTTP/3) in Chrome, Brave, Edge, Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | x86_64 and arm64. QUIC encrypts each packet with these, and the plaintext is the packet's frames, which snoopy reassembles into HTTP/3 with QPACK-decoded headers. Packets are told apart from TLS records and other callers by their header. |
-| QUIC (HTTP/3) in Firefox | NSS's `AES_CreateContext` and `AES_AEAD` in freebl, found through its exported function table | x86_64 and arm64. Firefox's QUIC stack (neqo) calls freebl's AES-GCM directly, so packets are captured there, as for Chrome. AES-GCM only: a connection that negotiates ChaCha20-Poly1305 isn't captured. Neither are connections set up before snoopy started, since a context's direction is learned when it's created. |
+| OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Also copies linked into a program that exports them, like Node.js. |
+| BoringSSL in Chrome, Brave, Edge and Electron apps | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. |
+| HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | Each QUIC packet, decrypted. |
+| HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
-| NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. Includes the copy bundled with Firefox, also when Firefox starts after snoopy. |
-| wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
+| NSS (Firefox, Thunderbird) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` | Also the copy bundled with Firefox. |
+| wolfSSL | `wolfSSL_read`, `wolfSSL_write` | |
 | Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
-| s2n-tls | `s2n_recv`, `s2n_send` | Data sent with `s2n_sendv` isn't captured. |
-| rustls | `Reader::read`, `Writer::write`, found by their mangled names | Programs that use rustls's reader and writer directly, such as `ureq` or `rustls::Stream`. Needs the program's symbol table, which Cargo keeps by default. Not async stacks built on tokio-rustls (`hyper`, `reqwest`, `axum`): there the read path is inlined and writes are vectored. |
-| Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64. Works on stripped binaries. |
+| s2n-tls | `s2n_recv`, `s2n_send` | Not `s2n_sendv`. |
+| rustls | `Reader::read`, `Writer::write` | Synchronous use only; needs the program's symbols. |
+| Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64, stripped binaries too. |
+
+All of them on x86_64 and arm64. Some details:
+
+- **Chromium-based browsers and Electron apps** link BoringSSL without
+  symbols, so snoopy recognizes its functions by the error codes they report
+  (see [How it works](#how-it-works)). It attaches only if that gives one
+  clear answer, and otherwise warns that the build can't be traced. This was
+  checked against published debug symbols on Chrome 155 and 156 (x86_64) and
+  Electron 42 and 44 (arm64), and on Brave 1.97, Edge 155 and Ubuntu's
+  Chromium 155 snap (arm64). Browsers in their usual install locations are
+  analyzed at startup, which takes a few seconds the first time, so they are
+  traced from the moment they start; results are cached by build ID.
+- **HTTP/3** is captured where each QUIC packet is encrypted and decrypted;
+  the plaintext is the packet's frames, which snoopy reassembles into HTTP/3
+  with QPACK-decoded headers. Firefox's QUIC stack (neqo) calls freebl's
+  AES-GCM directly, through its exported function table. A Firefox connection
+  that negotiates ChaCha20-Poly1305 isn't captured, and neither are those set
+  up before snoopy started, since a context's direction is learned when it's
+  created.
+- **NSS** functions are used for all kinds of files, so only layered
+  descriptors (the SSL layer) are captured.
+- **rustls** is found by its mangled names, in programs that use its reader
+  and writer directly, such as `ureq` or `rustls::Stream`; Cargo keeps the
+  symbols by default. Not async stacks built on tokio-rustls (`hyper`,
+  `reqwest`, `axum`): there the read path is inlined and writes are vectored.
 
 Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
-Not supported: rustls under tokio (see above), Java, stripped TLS libraries
-other than BoringSSL, QUIC/HTTP/3 outside Chromium and Firefox, programs that
-use OpenSSL only through its BIO layer (e.g. `openssl s_server -www`), and
-bodies compressed with a shared dictionary (Chrome's `dcb` and `dcz`), which
-are shown as sent.
+Not supported: rustls under tokio, Java, stripped TLS libraries other than
+BoringSSL, QUIC/HTTP/3 outside Chromium and Firefox (curl's own HTTP/3, for
+example), programs that use OpenSSL only through its BIO layer (e.g.
+`openssl s_server -www`), and bodies compressed with a shared dictionary
+(Chrome's `dcb` and `dcz`), which are shown as sent.
+
+## Troubleshooting
+
+**`sudo: snoopy: command not found`** after `go install`: `sudo` doesn't
+search your Go bin directory. Run `sudo "$(go env GOPATH)/bin/snoopy"`.
+
+**Nothing from a browser, or HTTP/2 frames without headers.** Browsers keep
+connections open for minutes, and snoopy can't decode the headers of a
+connection that started before it did, nor see Firefox's HTTP/3 from before
+then. Restart the browser, or open a site it hasn't connected to yet. Also
+check the startup lines: a browser outside the usual install locations is
+only attached to once it's running, and a warning says if a build can't be
+traced.
+
+**`--pid` shows nothing.** The process may not be the one doing the TLS:
+browsers and many servers hand it to another process. snoopy follows the
+processes the given one starts, so use the parent's PID, or `--comm`.
+
+**Too much output.** Use `--brief`, narrow it down with `--comm`, `--host`
+and `--port`, or stop after a number of calls with `--count`.
+
+**Hex dumps instead of HTTP.** The data isn't HTTP that snoopy can follow: a
+different protocol, or a connection it joined partway through.
+
+**The first start takes a few seconds.** snoopy analyzes Chromium-based
+browsers it finds to locate their TLS functions, and says so while it does.
+The result is cached by build ID, in `/root/.cache/snoopy` when run with
+`sudo`.
+
+**`snoopy needs root`.** It loads an eBPF program. The minimal capabilities
+are listed under [Requirements](#requirements).
 
 ## How it works
 
@@ -340,7 +463,10 @@ headers at runtime and no longer builds against current BCC releases.
 - `--json` now prints one compact object per line. Fields were renamed:
   `elapsed_time` → `latency_ns`, `message_size` → `size`,
   `tls_content` → `data` or `data_base64`. `result` was removed.
-- `--pid` now restricts tracing to that process. In 1.x it printed every process's events.
+- `--pid` now restricts tracing to that process and the processes it starts.
+  In 1.x it printed every process's events.
+- `--comm` matches the processes whose name starts with the given name.
+- The Go module path is `github.com/tks98/snoopy/v2`.
 - The binary no longer needs to run from the repository directory.
 
 ## License

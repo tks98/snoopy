@@ -102,7 +102,7 @@ DEFINE_EVENT(2048);
 DEFINE_EVENT(16384); // CHUNK_SIZE
 
 // Configuration, set from user space before the program is loaded.
-const volatile __u32 targ_tgid = 0;
+const volatile bool filter_tgids = false; // trace only the processes in traced_tgids
 const volatile __u32 max_capture = CHUNK_SIZE;
 const volatile bool filter_comm = false;
 const volatile char targ_comm[TASK_COMM_LEN] = {};
@@ -188,13 +188,29 @@ struct {
 	__uint(max_entries, 64 << 10);
 } execs SEC(".maps");
 
-// Chunks that could not be written because the ring buffer was full.
+// Counters for user space, by index.
+enum counter {
+	COUNTER_LOST,	       // chunks dropped because the ring buffer was full
+	COUNTER_UNTRACKED_QUIC, // QUIC packets of contexts created before snoopy started
+	COUNTER_COUNT,
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
+	__uint(max_entries, COUNTER_COUNT);
 	__type(key, __u32);
 	__type(value, __u64);
-} lost_events SEC(".maps");
+} counters SEC(".maps");
+
+// With --pid, the processes to trace: the one given and those it starts.
+// User space adds them as it finds them, and so does is_traced_tgid, with
+// BTF, at a process's first call.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32); // tgid
+	__type(value, __u8);
+} traced_tgids SEC(".maps");
 
 // Force bpf2go to emit a Go type for struct event_header.
 const struct event_header *unused_event_header __attribute__((unused));
@@ -212,30 +228,67 @@ static __always_inline void get_process_name(char *buf)
 	bpf_get_current_comm(buf, TASK_COMM_LEN);
 }
 
+// MAX_ANCESTORS is how far up its parents a process is looked for in
+// traced_tgids.
+#define MAX_ANCESTORS 8
+
+// is_traced_tgid reports whether the current process is in traced_tgids, or
+// descends from one that is and so is added to it: a process that forked
+// without executing a program (as Chrome's network service does) comes to
+// user space's notice only when it rescans /proc.
+static __always_inline bool is_traced_tgid(__u32 tgid)
+{
+	if (bpf_map_lookup_elem(&traced_tgids, &tgid))
+		return true;
+	if (!have_btf)
+		return false;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	for (int i = 0; i < MAX_ANCESTORS; i++) {
+		task = BPF_CORE_READ(task, real_parent);
+		if (!task)
+			return false;
+		__u32 parent = BPF_CORE_READ(task, tgid);
+		if (parent <= 1)
+			return false;
+		if (bpf_map_lookup_elem(&traced_tgids, &parent)) {
+			__u8 one = 1;
+			bpf_map_update_elem(&traced_tgids, &tgid, &one, BPF_NOEXIST);
+			return true;
+		}
+	}
+	return false;
+}
+
 static __always_inline bool should_trace(__u64 pid_tgid)
 {
-	if (targ_tgid && (__u32)(pid_tgid >> 32) != targ_tgid)
+	if (filter_tgids && !is_traced_tgid(pid_tgid >> 32))
 		return false;
 
+	// --comm matches names that start with it.
 	if (filter_comm) {
 		char comm[TASK_COMM_LEN];
 		get_process_name(comm);
 		for (int i = 0; i < TASK_COMM_LEN; i++) {
+			if (targ_comm[i] == 0)
+				break;
 			if (comm[i] != targ_comm[i])
 				return false;
-			if (comm[i] == 0)
-				break;
 		}
 	}
 	return true;
 }
 
+static __always_inline void count(enum counter c)
+{
+	__u32 key = c;
+	__u64 *n = bpf_map_lookup_elem(&counters, &key);
+	if (n)
+		*n += 1;
+}
+
 static __always_inline void count_lost(void)
 {
-	__u32 zero = 0;
-	__u64 *lost = bpf_map_lookup_elem(&lost_events, &zero);
-	if (lost)
-		*lost += 1;
+	count(COUNTER_LOST);
 }
 
 #define AF_INET 2
@@ -903,8 +956,20 @@ static __always_inline bool nspr_is_layered(const void *fd)
 
 NSPR_PROBE(PR_Read, FN_PR_READ)
 NSPR_PROBE(PR_Write, FN_PR_WRITE)
-NSPR_PROBE(PR_Recv, FN_PR_RECV)
 NSPR_PROBE(PR_Send, FN_PR_SEND)
+
+#define PR_MSG_PEEK 0x2
+
+// PRInt32 PR_Recv(PRFileDesc *fd, void *buf, PRInt32 amount, PRIntn flags,
+// PRIntervalTime timeout). Firefox peeks at a byte to check that an idle
+// connection is alive; the byte is read again later.
+SEC("uprobe/PR_Recv")
+int BPF_UPROBE(PR_Recv_enter, void *fd, void *buf, int amount, int flags)
+{
+	if ((flags & PR_MSG_PEEK) || !nspr_is_layered(fd))
+		return 0;
+	return enter_call(ctx, FN_PR_RECV, RET_INT, (__u64)fd, buf, 0);
+}
 
 // wolfSSL. wolfSSL_recv and wolfSSL_send call these, so they aren't probed.
 // int wolfSSL_read(WOLFSSL *ssl, void *data, int sz) and wolfSSL_write alike.
@@ -1196,8 +1261,10 @@ int aes_aead_enter(struct pt_regs *ctx)
 	key.tgid = pid_tgid >> 32;
 	key.ctx = func_arg(ctx, 0);
 	__u8 *encrypt = bpf_map_lookup_elem(&aes_gcm_ctxs, &key);
-	if (!encrypt)
-		return 0; // created before snoopy started: direction unknown
+	if (!encrypt) { // created before snoopy started: direction unknown
+		count(COUNTER_UNTRACKED_QUIC);
+		return 0;
+	}
 	struct io_thread *rt = io_thread(pid_tgid);
 	if (!*encrypt) {
 		__s32 fd = packet_fd(pid_tgid, rt, func_arg(ctx, 4), func_arg(ctx, 8), (__u32)func_arg(ctx, 9));

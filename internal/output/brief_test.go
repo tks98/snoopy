@@ -9,13 +9,13 @@ import (
 
 	"golang.org/x/net/http2"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 func briefLines(t *testing.T, evs ...*tracer.Event) []string {
 	t.Helper()
 	var buf bytes.Buffer
-	b := NewBrief(&buf)
+	b := NewBrief(&buf, Options{})
 	for _, ev := range evs {
 		if err := b.Print(ev); err != nil {
 			t.Fatal(err)
@@ -63,8 +63,15 @@ func TestBriefHTTP2AndHTTP3(t *testing.T) {
 	client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndStream: true, EndHeaders: true,
 		BlockFragment: client.block(":method", "GET", ":authority", "example.com", ":path", "/index.html")})
 	ev := event(tracer.FuncSSLWrite, client.buf.String())
-	if got := briefLines(t, ev)[0]; !strings.HasSuffix(got, ": HTTP/2 preface; SETTINGS; HEADERS s1 GET example.com/index.html [END_STREAM]") {
+	if got := briefLines(t, ev)[0]; !strings.HasSuffix(got, ": HTTP/2 HEADERS s1 GET example.com/index.html [END_STREAM]") {
 		t.Errorf("HTTP/2: %q", got)
+	}
+	var buf bytes.Buffer
+	if err := NewBrief(&buf, Options{Verbose: true}).Print(ev); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.HasSuffix(got, ": HTTP/2 preface; SETTINGS; HEADERS s1 GET example.com/index.html [END_STREAM]\n") {
+		t.Errorf("HTTP/2, verbose: %q", got)
 	}
 
 	block := append([]byte{0x00, 0x00, 0xd9}, literalField("content-encoding", "br")...) // :status 200

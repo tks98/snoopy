@@ -9,7 +9,7 @@ import (
 
 	"golang.org/x/net/http2"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // HTTP/2: a response body in DATA frames (one padded) spread over calls, its
@@ -32,7 +32,7 @@ func TestHTTP2EncodedBody(t *testing.T) {
 
 	for _, sizes := range [][]int{{1 << 20}, {1000}, {17, 4000}} {
 		c := newHTTP2Conns(newBodyPool())
-		c.start(http2Key{7, 0x1000})
+		c.start(http2Key{7, 0x1000}, false)
 		var decoded []byte
 		for _, ev := range events(tracer.FuncSSLRead, server.buf.Bytes(), sizes...) {
 			frames, ok, note := c.process(ev)
@@ -59,7 +59,7 @@ func TestHTTP2EncodedBody(t *testing.T) {
 
 	// Bytes of the body not captured: said once, then the rest is shown as is.
 	c := newHTTP2Conns(newBodyPool())
-	c.start(http2Key{7, 0x1000})
+	c.start(http2Key{7, 0x1000}, false)
 	evs := events(tracer.FuncSSLRead, server.buf.Bytes(), 2000)
 	evs[1].Data = evs[1].Data[:500]
 	var errs []string
@@ -219,7 +219,7 @@ func TestTextAndJSONEncodedBody(t *testing.T) {
 	half := len(msg) - len(gz)/2
 
 	var text, js bytes.Buffer
-	tp, jp := NewText(&text, false), NewJSON(&js)
+	tp, jp := NewText(&text, Options{}), NewJSON(&js)
 	for _, data := range [][]byte{msg[:half], msg[half:]} {
 		ev := event(tracer.FuncSSLRead, string(data))
 		if err := tp.Print(ev); err != nil {

@@ -107,46 +107,31 @@ var http2FrameTypes = []string{
 	"PUSH_PROMISE", "PING", "GOAWAY", "WINDOW_UPDATE", "CONTINUATION",
 }
 
-// summarizeHTTP2 describes the HTTP/2 frames in b, or returns nil if b
-// doesn't look like a sequence of frames. Frame headers are only nine bytes,
-// so to avoid describing random binary data, every frame must be valid for
-// its type and at least one must be complete; the last may be cut off.
-func summarizeHTTP2(b []byte) []string {
-	var out []string
+// http2Aligned reports whether b starts with HTTP/2 frames, as a call on a
+// connection that started before snoopy might. Frame headers are only nine
+// bytes, so to avoid taking random binary data for frames, every frame must
+// be valid for its type and at least one must be complete; the last may be
+// cut off. A call of just a frame header also counts, since Firefox reads
+// each frame's header on its own.
+func http2Aligned(b []byte) bool {
 	complete := 0
-	if rest, ok := bytes.CutPrefix(b, []byte(http2Preface)); ok {
-		out = append(out, "connection preface")
-		complete++
-		b = rest
+	if len(b) == 9 {
+		complete++ // if valid, below
 	}
 	for len(b) >= 9 {
 		length := int(b[0])<<16 | int(b[1])<<8 | int(b[2])
 		typ, flags := b[3], b[4]
 		stream := binary.BigEndian.Uint32(b[5:9])
 		if !validHTTP2Frame(typ, flags, length, stream) {
-			return nil
-		}
-		desc := fmt.Sprintf("%s stream=%d length=%d", http2FrameTypes[typ], stream, length)
-		if f := http2Flags(typ, flags); f != "" {
-			desc += " " + f
+			return false
 		}
 		if 9+length > len(b) {
-			if complete == 0 {
-				return nil
-			}
-			return append(out, desc+" (cut off)")
+			break
 		}
-		out = append(out, desc)
 		complete++
 		b = b[9+length:]
 	}
-	if complete == 0 {
-		return nil
-	}
-	if len(b) > 0 {
-		out = append(out, fmt.Sprintf("%d bytes of the next frame", len(b)))
-	}
-	return out
+	return complete > 0
 }
 
 // http2FlagMasks are the flags defined for each frame type; senders must
@@ -180,14 +165,6 @@ func validHTTP2Frame(typ, flags byte, length int, stream uint32) bool {
 		return length >= 8
 	}
 	return true
-}
-
-func http2Flags(typ, flags byte) string {
-	names := http2FlagNames(typ, flags)
-	if len(names) == 0 {
-		return ""
-	}
-	return "[" + strings.Join(names, ",") + "]"
 }
 
 func http2FlagNames(typ, flags byte) []string {

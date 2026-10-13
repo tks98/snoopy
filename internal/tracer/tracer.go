@@ -20,7 +20,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
 
-	"github.com/tks98/snoopy/internal/discover"
+	"github.com/tks98/snoopy/v2/internal/discover"
 )
 
 const (
@@ -36,10 +36,12 @@ const (
 
 // Options configures a Tracer.
 type Options struct {
-	// PID traces only this process; zero traces every process.
+	// PID traces only this process and those it starts; zero traces every
+	// process. With BTF, a process is found to descend from it at its first
+	// call; without, only those added with TracePID are traced.
 	PID int
-	// Comm traces only processes with exactly this name, as shown in
-	// /proc/<pid>/comm.
+	// Comm traces only processes whose name, as shown in /proc/<pid>/comm,
+	// starts with this.
 	Comm string
 	// MaxCapture is the maximum number of bytes captured per call.
 	// Zero means DefaultMaxCapture.
@@ -112,8 +114,8 @@ func New(opts Options) (*Tracer, error) {
 	var comm [16]byte
 	copy(comm[:], opts.Comm)
 	for name, value := range map[string]any{
-		"targ_tgid":   uint32(opts.PID),
-		"max_capture": uint32(opts.MaxCapture),
+		"filter_tgids": opts.PID != 0,
+		"max_capture":  uint32(opts.MaxCapture),
 		// Without BTF the kernel only knows thread names, so the process
 		// name is filtered on in user space instead.
 		"filter_comm": opts.Comm != "" && btfErr == nil,
@@ -135,12 +137,27 @@ func New(opts Options) (*Tracer, error) {
 		return nil, permissionHint(fmt.Errorf("load BPF program: %w", err))
 	}
 
+	if opts.PID != 0 {
+		if err := t.TracePID(uint32(opts.PID)); err != nil {
+			t.objs.Close()
+			return nil, err
+		}
+	}
 	t.reader, err = ringbuf.NewReader(t.objs.Events)
 	if err != nil {
 		t.objs.Close()
 		return nil, fmt.Errorf("open ring buffer: %w", err)
 	}
 	return t, nil
+}
+
+// TracePID adds a process to those traced, with Options.PID set: a process
+// that it started, for example.
+func (t *Tracer) TracePID(pid uint32) error {
+	if err := t.objs.TracedTgids.Update(pid, uint8(1), ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("trace pid %d: %w", pid, err)
+	}
+	return nil
 }
 
 func emptyBTFSpec() (*btf.Spec, error) {
@@ -269,7 +286,9 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 
 	var attached []string
 	for _, p := range probes {
-		opts := &link.UprobeOptions{PID: t.opts.PID}
+		// Not limited to Options.PID, whose descendants are traced too: the
+		// BPF program filters on traced_tgids.
+		opts := &link.UprobeOptions{}
 		if target.Offsets != nil { // a stripped copy: functions found by signature
 			off, ok := target.Offsets[p.symbol]
 			if !ok {
@@ -325,7 +344,7 @@ func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]str
 		{"rustls::Writer::write", ri.Writes, t.objs.RustlsWriteEnter},
 	} {
 		for _, off := range p.offsets {
-			opts := &link.UprobeOptions{Address: off, PID: t.opts.PID}
+			opts := &link.UprobeOptions{Address: off}
 			ret, err := ex.Uretprobe("", t.objs.TlsReturn, opts)
 			if err != nil {
 				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
@@ -361,7 +380,7 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, e
 		// uretprobe, which would corrupt the goroutine's stack.
 		for _, ret := range fn.f.Returns {
 			l, err := ex.Uprobe("", t.objs.GoTlsReturn, &link.UprobeOptions{
-				Address: fn.f.Offset, Offset: ret, PID: t.opts.PID,
+				Address: fn.f.Offset, Offset: ret,
 			})
 			if err != nil {
 				return attached, fmt.Errorf("%s+%#x: %w", fn.name, ret, err)
@@ -372,7 +391,7 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, e
 		// grow, runtime.morestack restarts the function from the top, and a
 		// probe on the first instruction would see the call twice.
 		l, err := ex.Uprobe("", fn.prog, &link.UprobeOptions{
-			Address: fn.f.Offset, Offset: fn.f.Body, PID: t.opts.PID,
+			Address: fn.f.Offset, Offset: fn.f.Body,
 		})
 		if err != nil {
 			return attached, fmt.Errorf("%s+%#x: %w", fn.name, fn.f.Body, err)
@@ -491,7 +510,7 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 	release := func(ev *Event) {
 		if !t.haveBTF {
 			ev.Comm = t.processName(ev.PID, ev.Comm)
-			if t.opts.Comm != "" && ev.Comm != t.opts.Comm {
+			if t.opts.Comm != "" && !strings.HasPrefix(ev.Comm, t.opts.Comm) {
 				return
 			}
 		}
@@ -555,8 +574,19 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 // LostEvents returns how many chunks the kernel dropped because the ring
 // buffer was full.
 func (t *Tracer) LostEvents() (uint64, error) {
+	return t.counter(0) // COUNTER_LOST
+}
+
+// UntrackedQUIC returns how many QUIC packets were left out because their
+// encryption context was created before snoopy started (Firefox's, whose
+// direction is only known from its creation).
+func (t *Tracer) UntrackedQUIC() (uint64, error) {
+	return t.counter(1) // COUNTER_UNTRACKED_QUIC
+}
+
+func (t *Tracer) counter(index uint32) (uint64, error) {
 	var perCPU []uint64
-	if err := t.objs.LostEvents.Lookup(uint32(0), &perCPU); err != nil {
+	if err := t.objs.Counters.Lookup(index, &perCPU); err != nil {
 		return 0, err
 	}
 	var total uint64

@@ -29,10 +29,10 @@ file, then match what you see:
 | What you see | Likely cause | Go to |
 | --- | --- | --- |
 | `warning: ...: BoringSSL is linked in, but its functions couldn't be told apart` | Signature finding failed | [Chrome, Electron and other Chromium builds](#chrome-electron-and-other-chromium-builds) |
-| `attached to openssl ... (BoringSSL found by signature; not its QUIC packet encryption, so no HTTP/3)` | The AEAD functions weren't found | [Chrome, Electron and other Chromium builds](#chrome-electron-and-other-chromium-builds) |
-| QUIC events appear, but HTTP/3 shows `waiting for QPACK encoder stream data`, gaps in bodies, or one connection's packets on several fds | Packets matched to the wrong socket | [HTTP/3 in Chromium](#http3-in-chromium) |
+| `warning: ...: BoringSSL's QUIC packet encryption wasn't found in this build, so its HTTP/3 isn't traced` | The AEAD functions weren't found | [Chrome, Electron and other Chromium builds](#chrome-electron-and-other-chromium-builds) |
+| QUIC events appear, but HTTP/3 shows `waiting for QPACK encoder stream data` that never resolves, gaps in bodies, or one connection's packets on several fds | Packets matched to the wrong socket | [HTTP/3 in Chromium](#http3-in-chromium) |
 | QUIC events are hex dumps instead of `QUIC: ...` lines | A frame type snoopy doesn't know | [HTTP/3 in Chromium](#http3-in-chromium) |
-| Firefox uses HTTP/3 (UDP port 443 in `tcpdump`) but there are no `AES_AEAD` events | Firefox's QUIC path changed, or freebl's table wasn't found | [HTTP/3 in Firefox](#http3-in-firefox) |
+| Firefox uses HTTP/3 (UDP port 443 in `tcpdump`) but there are no `AES_AEAD` events, and no warning about connections from before snoopy | Firefox's QUIC path changed, or freebl's table wasn't found | [HTTP/3 in Firefox](#http3-in-firefox) |
 | A Rust program shows nothing, or wrong sizes | rustls symbol names or Rust's return layout | [rustls](#rustls) |
 | A Go program shows events without fd or addresses, or isn't attached | Go's struct offsets, prologue or pclntab | [Go crypto/tls](#go-cryptotls) |
 | arm64 Chromium has TLS but no HTTP/3, after a dependency update | `golang.org/x/arch` output changed | [funcfind and golang.org/x/arch](#funcfind-and-golangorgxarch) |
@@ -311,7 +311,7 @@ open_gather's `0x73`.
 
 snoopy warns that BoringSSL is linked in but its functions couldn't be told
 apart, with the reason (e.g. `BoringSSL: 2 candidates for SSL_write`), or
-attaches with a note that HTTP/3 won't be captured. The test gives the same
+attaches with a warning that HTTP/3 won't be captured. The test gives the same
 reason, and with symbols, which function it got wrong:
 
 ```bash
@@ -425,7 +425,8 @@ address it returns, checks the table's header (its length, and version 3.x),
 and reads the two pointers, through their `R_*_RELATIVE` relocations or, with
 packed (RELR) relocations, from the file. The BPF program learns each GCM
 context's direction when it's created, so contexts created before snoopy
-started are skipped.
+started are skipped; it counts their packets, and snoopy warns once it sees
+any.
 
 Three things went wrong along the way:
 
@@ -440,8 +441,11 @@ Three things went wrong along the way:
 ### How to tell it broke
 
 Firefox uses HTTP/3 (UDP port 443 in `tcpdump`), but there are no `AES_AEAD`
-events. `--verbose` shows `(freebl, for QUIC)` when the table was found;
-`TestFreeblBinaries` shows what was found and checks it against symbols.
+events. Restart Firefox first: snoopy warns about HTTP/3 connections that
+were open before it started, which it can't trace, but only while their
+packets go by. `--verbose` shows `(freebl, for QUIC)` when the table was
+found; `TestFreeblBinaries` shows what was found and checks it against
+symbols.
 
 ### How to fix it
 
@@ -542,7 +546,14 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   helper, and keep the chunk loop's shape.
 - **New probes:** a function's 32-bit arguments have undefined upper halves,
   in registers and in stack slots. Truncate them (`(__u32)func_arg(ctx, n)`),
-  as the arm64 `AES_AEAD` bug showed.
+  as the arm64 `AES_AEAD` bug showed. And check every argument that changes
+  what a call means: Firefox peeks at a byte of an idle connection with
+  `PR_Recv(..., PR_MSG_PEEK)`, which snoopy took for data until it checked the
+  flag, and which broke HTTP/2 decoding when the byte was read again.
+- **`--pid`:** uprobes aren't attached per process. The BPF program filters
+  on `traced_tgids`, and with BTF adds a process whose parent, or one of its
+  parents up to 8 levels, is in it (`is_traced_tgid`). Without BTF, user
+  space scans `/proc` for new children every second.
 
 ## HTTP decoding and compressed bodies
 
@@ -555,4 +566,11 @@ These follow published standards and rarely need fixing.
   in `internal/output/body.go`, with a test that encodes with the real
   encoder (see `body_test.go`).
 - **To see what was actually sent:** `--hex` prints payloads as captured,
-  without decoding.
+  without decoding, and `--full` shows whole bodies.
+- **Connections that started before snoopy:** HTTP/2 is followed from the
+  first call that starts with a frame (`http2Aligned` in
+  `internal/output/payload.go`), without headers, and found again if the
+  framing is lost. Firefox reads each frame's 9-byte header on its own, so a
+  call of just a valid frame header counts. It's a heuristic over 9-byte
+  headers, so if data that isn't HTTP/2 gets taken for it, make
+  `http2Aligned` stricter rather than the decoder more forgiving.

@@ -89,14 +89,14 @@ func Inspect(path string) ([]Target, error) {
 		targets = append(targets, Target{Path: path, Library: NSS, Offsets: offsets, Note: "freebl, for QUIC"})
 	}
 	if !defined["SSL_read"] {
-		offsets, err := cachedFindBoringSSL(f)
+		offsets, err := cachedFindBoringSSL(path, f)
 		switch {
 		case err == nil:
-			note := "BoringSSL found by signature"
+			t := Target{Path: path, Library: OpenSSL, Offsets: offsets, Note: "BoringSSL found by signature"}
 			if offsets["EVP_AEAD_CTX_seal"] == 0 {
-				note += "; not its QUIC packet encryption, so no HTTP/3"
+				t.Limits = "BoringSSL's QUIC packet encryption wasn't found in this build, so its HTTP/3 isn't traced"
 			}
-			targets = append(targets, Target{Path: path, Library: OpenSSL, Offsets: offsets, Note: note})
+			targets = append(targets, t)
 		case !errors.Is(err, errNotBoringSSL):
 			targets = append(targets, Target{Path: path, Library: OpenSSL, Problem: fmt.Errorf(
 				"BoringSSL is linked in, but its functions couldn't be told apart (%w), so this build can't be traced; see docs/maintenance.md", err)})

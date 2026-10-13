@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/tks98/snoopy/internal/funcfind"
+	"github.com/tks98/snoopy/v2/internal/funcfind"
 )
 
 // BoringSSL reason codes (include/openssl/err.h and ssl.h). They are part of
@@ -31,6 +31,10 @@ const (
 
 var errNotBoringSSL = errors.New("no statically linked BoringSSL")
 
+// Progress, if set, is told about slow work as it starts, such as analyzing
+// a large program for BoringSSL the first time it's seen.
+var Progress func(msg string)
+
 // boringSSLCacheVersion is part of cached results' names: bump it when
 // findBoringSSL would answer differently, so that older answers aren't used.
 const boringSSLCacheVersion = 3
@@ -39,7 +43,7 @@ const boringSSLCacheVersion = 3
 // the user's cache directory, so a large program (Chrome is 300 MB) is
 // analyzed once. Later runs attach to it right away, which matters for
 // programs found as they start.
-func cachedFindBoringSSL(f *elf.File) (map[string]uint64, error) {
+func cachedFindBoringSSL(path string, f *elf.File) (map[string]uint64, error) {
 	var file string
 	if id := funcfind.BuildID(f); id != nil {
 		if dir, err := os.UserCacheDir(); err == nil {
@@ -53,7 +57,11 @@ func cachedFindBoringSSL(f *elf.File) (map[string]uint64, error) {
 			return offsets, nil
 		}
 	}
-	offsets, err := findBoringSSL(f)
+	offsets, err := findBoringSSL(f, func() {
+		if Progress != nil {
+			Progress(fmt.Sprintf("analyzing %s to find BoringSSL's functions; the first time takes a few seconds", path))
+		}
+	})
 	if err == nil && file != "" {
 		if data, err := json.Marshal(offsets); err == nil && os.MkdirAll(filepath.Dir(file), 0o755) == nil {
 			_ = os.WriteFile(file, data, 0o644) // a cache: failing only costs time
@@ -83,7 +91,10 @@ func cachedFindBoringSSL(f *elf.File) (map[string]uint64, error) {
 //
 // Anything less than one clear answer for each is an error: probing the
 // wrong function would capture the wrong data.
-func findBoringSSL(f *elf.File) (map[string]uint64, error) {
+//
+// onBoringSSL, if not nil, is called once the program turns out to contain
+// BoringSSL, before the slow part.
+func findBoringSSL(f *elf.File, onBoringSSL func()) (map[string]uint64, error) {
 	b, err := funcfind.Open(f)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errNotBoringSSL, err)
@@ -91,6 +102,9 @@ func findBoringSSL(f *elf.File) (map[string]uint64, error) {
 	file, ok := b.FindString("/ssl/ssl_lib.cc")
 	if !ok {
 		return nil, errNotBoringSSL
+	}
+	if onBoringSSL != nil {
+		onBoringSSL()
 	}
 
 	// The functions referencing the file name, and the reason codes each
