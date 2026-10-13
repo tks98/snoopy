@@ -7,40 +7,41 @@ library, so it sees the data before it is encrypted and after it is decrypted.
 
 ```console
 $ sudo snoopy
+snoopy: attached to openssl /opt/google/chrome/chrome (BoringSSL found by signature)
 snoopy: attached to openssl /usr/lib/x86_64-linux-gnu/libssl.so.3
 snoopy: attached to gnutls  /usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1
-snoopy: attached to nss     /usr/lib/x86_64-linux-gnu/libnspr4.so
-snoopy: attached to go      /proc/5078/root/usr/local/bin/api-server (go1.24.7)
 snoopy: tracing; press Ctrl-C to stop
-00:27:03.731924 curl (pid 5565) SSL_write → 127.0.0.1:8444  84 bytes  134µs  fd 5, conn 0x55afcecfdf80
-GET /curl-h1 HTTP/1.1
-Host: 127.0.0.1:8444
+06:42:46.026011 curl (pid 32570) SSL_write 192.168.5.15:58278 > 172.66.147.243:443  116 bytes  2.15ms  fd 5, conn 0x5f49f76814f0
+GET / HTTP/1.1
+Host: example.com
 User-Agent: curl/8.5.0
 Accept: */*
+Accept-Encoding: deflate, gzip, br, zstd
 
-00:27:03.776086 curl (pid 5565) SSL_read ← 127.0.0.1:8444  145 bytes  103µs  fd 5, conn 0x55afcecfdf80
+06:42:46.073841 curl (pid 32570) SSL_read 172.66.147.243:443 > 192.168.5.15:58278  689 bytes  1.58ms  fd 5, conn 0x5f49f76814f0
 HTTP/1.1 200 OK
-Server: BaseHTTP/0.6 Python/3.13.16
-Content-Type: application/json
-Content-Length: 35
-
-16:21:30.061843 curl (pid 754998) SSL_read ← 104.20.23.154:443  171 bytes  127µs  fd 5, conn 0xbe9168ce6300
-HTTP/2 HEADERS stream=1 length=162 [END_HEADERS]
-:status: 200
-content-type: text/html; charset=utf-8
-server: cloudflare
+Content-Type: text/html; charset=utf-8
+Transfer-Encoding: chunked
+Server: cloudflare
+Content-Encoding: br
 ...
 
-20:38:45.316878 chrome (pid 14779, tid 14792) EVP_AEAD_CTX_open ← 172.66.147.243:443  553 bytes  53µs  fd 30, conn 0x1f5400297058
-QUIC: STREAM id=0 off=0 len=548 FIN
-HTTP/3 HEADERS stream=0
-:status: 200
-content-type: text/html; charset=utf-8
-content-encoding: br
-...
-HTTP/3 DATA stream=0 (334 bytes)
-[br: 334 bytes decoded to 577]
+[br: 341 bytes decoded to 577]
 <!doctype html><html lang=en><head><meta charset=utf-8>...<title>Example Domain</title>...
+```
+
+Or one line per call, like tcpdump, here with curl over HTTP/1.1 and HTTP/2
+and Chrome over HTTP/3:
+
+```console
+$ sudo snoopy --brief
+06:42:53.389996 curl[32719] 192.168.5.15:33736 > 172.66.147.243:443 TLS 116: GET / HTTP/1.1, host example.com
+06:42:53.430619 curl[32719] 172.66.147.243:443 > 192.168.5.15:33736 TLS 689: HTTP/1.1 200 OK, text/html; charset=utf-8, br; body 341 bytes (br, 577 decoded)
+06:42:54.835128 curl[32722] 192.168.5.15:33748 > 172.66.147.243:443 TLS 57: HTTP/2 HEADERS s1 GET example.com/ [END_STREAM]
+06:42:54.874490 curl[32722] 172.66.147.243:443 > 192.168.5.15:33748 TLS 170: HTTP/2 HEADERS s1 200, text/html; charset=utf-8, br
+06:42:54.877224 curl[32722] 172.66.147.243:443 > 192.168.5.15:33748 TLS 343: HTTP/2 DATA s1 334 bytes (br, 577 decoded)
+06:43:04.105915 chrome[32786] 192.168.5.15:54267 > 172.66.147.243:443 QUIC 457: HTTP/3 HEADERS s0 GET example.com/
+06:43:04.149725 chrome[32786] 172.66.147.243:443 > 192.168.5.15:54267 QUIC 551: HTTP/3 HEADERS s0 200, text/html; charset=utf-8, br; DATA s0 334 bytes (br, 577 decoded)
 ```
 
 ## Features
@@ -98,13 +99,16 @@ git clone https://github.com/tks98/snoopy && cd snoopy && make build
 ## Usage
 
 ```bash
-sudo snoopy                         # everything, as text
-sudo snoopy --pid 1234              # one process
-sudo snoopy --comm curl             # processes named curl
-sudo snoopy --container 4b825dc642  # one container (ID prefix)
+sudo snoopy                                 # everything, decoded
+sudo snoopy --brief                         # one line per call, like tcpdump
+sudo snoopy --pid 1234                      # one process
+sudo snoopy --comm curl                     # processes named curl
+sudo snoopy --container 4b825dc642          # one container (ID prefix)
+sudo snoopy --host example.com --port 443   # connections to example.com on port 443
+sudo snoopy --count 20                      # stop after 20 calls
 sudo snoopy --json | jq 'select(.direction == "write") | .data'
-sudo snoopy --max-size 1048576      # capture up to 1 MiB per call (default 16 KiB)
-sudo snoopy --lib /usr/bin/node     # also attach to a binary with OpenSSL linked in
+sudo snoopy --max-size 1048576              # capture up to 1 MiB per call (default 16 KiB)
+sudo snoopy --lib /usr/bin/node             # also attach to a binary with OpenSSL linked in
 ```
 
 | Flag | Description |
@@ -112,16 +116,29 @@ sudo snoopy --lib /usr/bin/node     # also attach to a binary with OpenSSL linke
 | `--pid N` | Trace only this process. |
 | `--comm NAME` | Trace only processes with exactly this name, as in `/proc/<pid>/comm` (at most 15 characters). |
 | `--container ID` | Trace only processes in this container, given as an ID or ID prefix. |
+| `--host HOST` | Show only connections with this IP address, network (`10.0.0.0/8`) or host name at either end. Names are looked up when snoopy starts. Can be repeated. |
+| `--port N` | Show only connections with this port at either end. Can be repeated. |
 | `--lib PATH` | Also attach to this library or executable. Can be repeated. |
 | `--no-scan` | Don't scan running or newly started processes; attach only to system libraries and `--lib`. |
+| `--brief` | Print one line per call, like tcpdump: time, process, `source > destination`, protocol and size, and a summary of the data (an HTTP request or status line, HTTP/2 and HTTP/3 frames, what a body decoded to). |
 | `--json` | Print one JSON object per line. |
 | `--hex` | Always hex-dump payloads as captured, without decoding HTTP. |
 | `--max-size N` | Maximum bytes captured per call, up to 1 MiB. Defaults to 16384. |
+| `--count N` | Stop after this many calls (after filtering). |
 | `--pcap FILE` | Also write the plaintext to a pcap file; `-` writes it to stdout. |
 | `--quiet` | Don't print events. Useful with `--pcap`. |
 | `--no-color` | Disable colors. Colors are also off automatically when stdout isn't a terminal. |
 | `--verbose` | List the functions attached in each file. |
 | `--version` | Print the version. |
+
+Each call shows where its data went, as tcpdump writes it: from the sender's
+address to the receiver's, so a read shows the server first. An end that
+isn't known shows as `local` or `peer`.
+
+`--host` and `--port` need a connection's addresses. Connections whose
+addresses aren't known don't match: on kernels without BTF, those of
+processes that ended before snoopy looked them up, and Firefox's HTTP/3,
+whose UDP socket isn't connected to one server.
 
 snoopy also watches for programs that start while it runs and attaches to
 the TLS libraries and Go programs they use. It looks at a new process right
@@ -131,7 +148,7 @@ missed, unless it uses a library snoopy was already attached to, such as the
 system `libssl`. With `--pid`, only that process is traced and nothing new is
 picked up.
 
-### Wireshark
+### Wireshark and tcpdump
 
 `--pcap` turns each TLS connection into a synthetic TCP stream that carries the
 plaintext, using the real addresses where they are known. Wireshark expects
@@ -144,6 +161,14 @@ wireshark -d tcp.port==443,http capture.pcap      # or http2
 # or watch live
 sudo snoopy --pcap - | wireshark -k -i - -d tcp.port==443,http
 ```
+
+tcpdump reads the same stream, for its exact output format and its filters:
+
+```bash
+sudo snoopy --quiet --pcap - | tcpdump -r - -nn -A 'port 443'
+```
+
+QUIC (HTTP/3) packets aren't written to the pcap.
 
 ### JSON output
 
@@ -190,7 +215,7 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | Library | Functions | Notes |
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
-| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 and arm64. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer. Checked against published debug symbols on Chrome 155 and 156 (x86_64) and Electron 42 and 44 (arm64), and on Brave 1.97, Edge 155 and Ubuntu's Chromium 155 snap (arm64). Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Chrome's HTTP/3 traffic is captured too, see below. |
+| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 and arm64. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer, and otherwise warns that the build can't be traced. Checked against published debug symbols on Chrome 155 and 156 (x86_64) and Electron 42 and 44 (arm64), and on Brave 1.97, Edge 155 and Ubuntu's Chromium 155 snap (arm64). Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Chrome's HTTP/3 traffic is captured too, see below. |
 | QUIC (HTTP/3) in Chrome, Brave, Edge, Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | x86_64 and arm64. QUIC encrypts each packet with these, and the plaintext is the packet's frames, which snoopy reassembles into HTTP/3 with QPACK-decoded headers. Packets are told apart from TLS records and other callers by their header. |
 | QUIC (HTTP/3) in Firefox | NSS's `AES_CreateContext` and `AES_AEAD` in freebl, found through its exported function table | x86_64 and arm64. Firefox's QUIC stack (neqo) calls freebl's AES-GCM directly, so packets are captured there, as for Chrome. AES-GCM only: a connection that negotiates ChaCha20-Poly1305 isn't captured. Neither are connections set up before snoopy started, since a context's direction is learned when it's created. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |

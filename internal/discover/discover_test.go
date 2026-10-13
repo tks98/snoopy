@@ -463,3 +463,37 @@ func TestFreeblBinaries(t *testing.T) {
 		})
 	}
 }
+
+// A program that has BoringSSL's file name in it, but not BoringSSL's
+// functions, is reported as a problem instead of being attached to.
+func TestBoringSSLProblem(t *testing.T) {
+	var cc string
+	for _, name := range []string{"cc", "gcc", "clang"} {
+		if p, err := exec.LookPath(name); err == nil {
+			cc = p
+			break
+		}
+	}
+	if cc == "" || runtime.GOOS != "linux" {
+		t.Skip("needs a C compiler on Linux")
+	}
+	dir := t.TempDir()
+	src, bin := filepath.Join(dir, "x.c"), filepath.Join(dir, "x")
+	code := `#include <stdio.h>
+int main(void) { printf("%s %d\n", "third_party/boringssl/src/ssl/ssl_lib.cc", 0xd7); return 0; }
+`
+	if err := os.WriteFile(src, []byte(code), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(cc, "-O0", "-o", bin, src).CombinedOutput(); err != nil {
+		t.Skipf("compile: %v: %s", err, out)
+	}
+	targets, err := Inspect(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Problem == nil || !strings.Contains(targets[0].Problem.Error(), "can't be traced") {
+		t.Fatalf("got %+v", targets)
+	}
+	t.Log(targets[0].Problem)
+}

@@ -4,6 +4,7 @@ package output
 import (
 	"fmt"
 	"io"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -56,22 +57,18 @@ func NewText(w io.Writer, hex bool) *Text {
 func (t *Text) Print(ev *tracer.Event) error {
 	var b strings.Builder
 
-	// 12:01:02.345678 curl (pid 2422) SSL_write → 93.184.216.34:443  77 bytes  311µs
+	// 12:01:02.345678 curl (pid 2422) SSL_write 10.0.0.2:51234 > 93.184.216.34:443  77 bytes  311µs
 	fmt.Fprintf(&b, "%s %s %s %s",
 		t.dim(ev.Time.Format("15:04:05.000000")),
 		t.title(ev.Comm),
 		t.dim(processLabel(ev)),
 		t.fn(ev.Function.String()),
 	)
-	arrow, paint := "←", t.read
+	paint := t.read
 	if ev.Function.Direction() == tracer.Write {
-		arrow, paint = "→", t.write
+		paint = t.write
 	}
-	peer := "peer"
-	if ev.Remote.IsValid() {
-		peer = ev.Remote.String()
-	}
-	fmt.Fprintf(&b, " %s  %d bytes  %s", paint(arrow+" "+peer), ev.Size, t.dim(formatLatency(ev.Latency)))
+	fmt.Fprintf(&b, " %s  %d bytes  %s", paint(endpoints(ev)), ev.Size, t.dim(formatLatency(ev.Latency)))
 
 	var extra []string
 	if ev.FD >= 0 {
@@ -183,10 +180,12 @@ func (t *Text) writeBodyPart(b *strings.Builder, raw []byte, part bodyPart) {
 		}
 		return
 	}
-	b.WriteString(t.dim(fmt.Sprintf("[%s: %d bytes decoded to %d]", part.Encoding, len(raw), len(part.Decoded))) + "\n")
-	if len(part.Decoded) > 0 {
-		t.writeBody(b, part.Decoded)
+	if len(part.Decoded) == 0 { // e.g. only the end of the encoding
+		b.WriteString(t.dim(fmt.Sprintf("[%s: %d bytes, no output]", part.Encoding, len(raw))) + "\n")
+		return
 	}
+	b.WriteString(t.dim(fmt.Sprintf("[%s: %d bytes decoded to %d]", part.Encoding, len(raw), len(part.Decoded))) + "\n")
+	t.writeBody(b, part.Decoded)
 }
 
 // writeHTTP2 prints the frames of an HTTP/2 connection, with their decoded
@@ -280,6 +279,29 @@ func (t *Text) writeBody(b *strings.Builder, data []byte) {
 		b.WriteString(t.dim("HTTP/2: "+strings.Join(frames, "; ")) + "\n")
 	}
 	b.WriteString(hexdump(data) + "\n")
+}
+
+// endpoints says where an event's data went, from sender to receiver, as
+// tcpdump writes it. An end that isn't known is "local" (the traced
+// process's socket) or "peer".
+func endpoints(ev *tracer.Event) string {
+	local, remote := "local", "peer"
+	if knownAddr(ev.Local) {
+		local = ev.Local.String()
+	}
+	if knownAddr(ev.Remote) {
+		remote = ev.Remote.String()
+	}
+	if ev.Function.Direction() == tracer.Write {
+		return local + " > " + remote
+	}
+	return remote + " > " + local
+}
+
+// knownAddr reports whether an address is known. An unconnected UDP socket
+// (Firefox's QUIC) has 0.0.0.0:0 as its remote address.
+func knownAddr(a netip.AddrPort) bool {
+	return a.IsValid() && (!a.Addr().IsUnspecified() || a.Port() != 0)
 }
 
 func processLabel(ev *tracer.Event) string {

@@ -457,6 +457,10 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) boo
 					continue
 				}
 				for _, target := range w.Process(pid) {
+					if target.Problem != nil {
+						attached(target, nil, target.Problem)
+						continue
+					}
 					funcs, err := t.Attach(target)
 					attached(target, funcs, err)
 				}

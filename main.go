@@ -9,9 +9,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,11 +35,15 @@ type config struct {
 	pid       int
 	comm      string
 	container string
+	hosts     stringList
+	ports     portList
 	libs      stringList
 	noScan    bool
+	brief     bool
 	json      bool
 	hex       bool
 	maxSize   int
+	count     int
 	pcap      string
 	quiet     bool
 	noColor   bool
@@ -48,11 +56,34 @@ type stringList []string
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
+type portList []uint16
+
+func (p *portList) String() string { return fmt.Sprint([]uint16(*p)) }
+func (p *portList) Set(v string) error {
+	n, err := strconv.ParseUint(v, 10, 16)
+	if err != nil || n == 0 {
+		return fmt.Errorf("not a port: %q", v)
+	}
+	*p = append(*p, uint16(n))
+	return nil
+}
+
 const usageHeader = `snoopy traces TLS plaintext using eBPF.
 
 Usage: sudo snoopy [flags]
 
 Flags:
+`
+
+const usageExamples = `
+Examples:
+  sudo snoopy                                 everything, decoded
+  sudo snoopy --brief                         one line per call, like tcpdump
+  sudo snoopy --comm curl                     only processes named curl
+  sudo snoopy --host example.com --port 443   only connections to example.com on port 443
+  sudo snoopy --count 20                      stop after 20 calls
+  sudo snoopy --json | jq 'select(.direction == "write") | .data'
+  sudo snoopy --quiet --pcap - | tcpdump -r - -nn -A
 `
 
 func parseFlags(args []string, stderr io.Writer) (config, error) {
@@ -62,17 +93,22 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	fs.Usage = func() {
 		fmt.Fprint(stderr, usageHeader)
 		fs.PrintDefaults()
+		fmt.Fprint(stderr, usageExamples)
 	}
 
 	fs.IntVar(&c.pid, "pid", 0, "trace only this process ID")
 	fs.StringVar(&c.comm, "comm", "", "trace only processes with this exact name (as in /proc/<pid>/comm)")
 	fs.StringVar(&c.container, "container", "", "trace only processes in the container with this ID (or ID prefix)")
+	fs.Var(&c.hosts, "host", "show only connections with this IP address, network (CIDR) or host name at either end (repeatable)")
+	fs.Var(&c.ports, "port", "show only connections with this port at either end (repeatable)")
 	fs.Var(&c.libs, "lib", "also attach to this library or executable, e.g. a binary with OpenSSL linked in statically (repeatable)")
 	fs.BoolVar(&c.noScan, "no-scan", false, "don't scan running or newly started processes for TLS libraries and Go binaries; only use system libraries and --lib")
+	fs.BoolVar(&c.brief, "brief", false, "print one line per call, like tcpdump")
 	fs.BoolVar(&c.json, "json", false, "print events as JSON, one object per line")
 	fs.BoolVar(&c.hex, "hex", false, "always print payloads as a hex dump")
 	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, fmt.Sprintf("maximum bytes to capture per call (up to %d)", tracer.MaxCaptureLimit))
-	fs.StringVar(&c.pcap, "pcap", "", "also write plaintext as TCP streams to this pcap file (\"-\" for stdout, e.g. to pipe into wireshark -k -i -)")
+	fs.IntVar(&c.count, "count", 0, "stop after this many calls (0: no limit)")
+	fs.StringVar(&c.pcap, "pcap", "", "also write plaintext as TCP streams to this pcap file (\"-\" for stdout, e.g. to pipe into wireshark -k -i - or tcpdump -r -)")
 	fs.BoolVar(&c.quiet, "quiet", false, "don't print events (useful with --pcap)")
 	fs.BoolVar(&c.noColor, "no-color", false, "disable colors")
 	fs.BoolVar(&c.verbose, "verbose", false, "show which functions were attached to")
@@ -88,10 +124,74 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	if c.pid < 0 {
 		return c, errors.New("--pid must be positive")
 	}
-	if c.json && c.hex {
+	if c.count < 0 {
+		return c, errors.New("--count must be positive")
+	}
+	switch {
+	case c.json && c.hex:
 		return c, errors.New("--json and --hex can't be combined")
+	case c.brief && c.json:
+		return c, errors.New("--brief and --json can't be combined")
+	case c.brief && c.hex:
+		return c, errors.New("--brief and --hex can't be combined")
 	}
 	return c, nil
+}
+
+// addrFilter keeps the events of connections with an end among hosts, if
+// any are given, and an end on one of ports, if any are given.
+type addrFilter struct {
+	hosts []netip.Prefix
+	ports []uint16
+}
+
+func newAddrFilter(cfg config) (addrFilter, error) {
+	f := addrFilter{ports: cfg.ports}
+	for _, h := range cfg.hosts {
+		prefixes, err := hostPrefixes(h)
+		if err != nil {
+			return f, fmt.Errorf("--host %s: %w", h, err)
+		}
+		f.hosts = append(f.hosts, prefixes...)
+	}
+	return f, nil
+}
+
+// hostPrefixes parses an IP address or network, or looks up a host name.
+func hostPrefixes(h string) ([]netip.Prefix, error) {
+	if p, err := netip.ParsePrefix(h); err == nil {
+		return []netip.Prefix{p.Masked()}, nil
+	}
+	if a, err := netip.ParseAddr(h); err == nil {
+		a = a.Unmap()
+		return []netip.Prefix{netip.PrefixFrom(a, a.BitLen())}, nil
+	}
+	ips, err := net.LookupIP(h)
+	if err != nil {
+		return nil, err
+	}
+	var out []netip.Prefix
+	for _, ip := range ips {
+		if a, ok := netip.AddrFromSlice(ip); ok {
+			a = a.Unmap()
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return out, nil
+}
+
+func (f addrFilter) match(ev *tracer.Event) bool {
+	ends := []netip.AddrPort{ev.Local, ev.Remote}
+	if len(f.hosts) > 0 && !slices.ContainsFunc(ends, func(a netip.AddrPort) bool {
+		return a.IsValid() && !a.Addr().IsUnspecified() && slices.ContainsFunc(f.hosts, func(p netip.Prefix) bool {
+			return p.Contains(a.Addr().Unmap())
+		})
+	}) {
+		return false
+	}
+	return len(f.ports) == 0 || slices.ContainsFunc(ends, func(a netip.AddrPort) bool {
+		return a.IsValid() && slices.Contains(f.ports, a.Port())
+	})
 }
 
 func main() {
@@ -131,6 +231,10 @@ func run(cfg config) error {
 		color.NoColor = true
 	}
 
+	filter, err := newAddrFilter(cfg)
+	if err != nil {
+		return err
+	}
 	printers, closePrinters, err := openPrinters(cfg)
 	if err != nil {
 		return err
@@ -199,6 +303,9 @@ func run(cfg config) error {
 				ev.Local, ev.Remote = local, remote
 			}
 		}
+		if !filter.match(ev) || cfg.count > 0 && calls >= cfg.count {
+			return
+		}
 		calls++
 		for _, p := range printers {
 			if err := p.Print(ev); err != nil {
@@ -206,6 +313,9 @@ func run(cfg config) error {
 				stop()
 				return
 			}
+		}
+		if cfg.count > 0 && calls >= cfg.count {
+			stop()
 		}
 	})
 
@@ -291,9 +401,12 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 	}
 
 	if !cfg.quiet && !stdoutUsed {
-		if cfg.json {
+		switch {
+		case cfg.json:
 			printers = append(printers, output.NewJSON(os.Stdout))
-		} else {
+		case cfg.brief:
+			printers = append(printers, output.NewBrief(os.Stdout))
+		default:
 			printers = append(printers, output.NewText(os.Stdout, cfg.hex))
 		}
 	}

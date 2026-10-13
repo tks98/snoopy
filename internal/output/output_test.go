@@ -115,7 +115,7 @@ func TestTextHTTP(t *testing.T) {
 	if err := NewText(&buf, false).Print(ev); err != nil {
 		t.Fatal(err)
 	}
-	want := "03:04:05.000006 curl (pid 42) SSL_write → 93.184.216.34:443  37 bytes  1.5ms  fd 5, conn 0xbeef\n" +
+	want := "03:04:05.000006 curl (pid 42) SSL_write 10.0.0.2:51234 > 93.184.216.34:443  37 bytes  1.5ms  fd 5, conn 0xbeef\n" +
 		"GET / HTTP/1.1\nHost: example.com\n\n"
 	if buf.String() != want {
 		t.Errorf("got:\n%s\nwant:\n%s", buf.String(), want)
@@ -135,7 +135,7 @@ func TestTextBinaryAndNotes(t *testing.T) {
 	}
 	out := buf.String()
 	for _, want := range []string{
-		"curl (pid 42, tid 43) crypto/tls.(*Conn).Read ← peer  100 bytes",
+		"curl (pid 42, tid 43) crypto/tls.(*Conn).Read peer > 10.0.0.2:51234  100 bytes",
 		"conn 0xbeef, container 4b825dc642cb",
 		"00000000  00 01 02 03",
 		"[truncated: captured 4 of 100 bytes; raise with --max-size]",

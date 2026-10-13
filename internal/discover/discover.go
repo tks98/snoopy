@@ -68,6 +68,10 @@ type Target struct {
 	// Offsets, if set, are the file offsets of a C library's functions,
 	// for a stripped copy whose functions were found by signature.
 	Offsets map[string]uint64
+	// Problem, if set, says why a TLS library found in the file can't be
+	// traced, e.g. a stripped BoringSSL whose functions couldn't be told
+	// apart. Such a target is reported, not attached to.
+	Problem error
 }
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
@@ -181,10 +185,14 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 		if len(found) == 0 && explicit {
 			warnings = append(warnings, fmt.Errorf("%s: no supported TLS functions found", c.path))
 		}
-		for i := range found {
-			found[i].Note = joinNotes(found[i].Note, c.note)
+		for _, t := range found {
+			if t.Problem != nil {
+				warnings = append(warnings, fmt.Errorf("%s: %w", c.path, t.Problem))
+				continue
+			}
+			t.Note = joinNotes(t.Note, c.note)
+			targets = append(targets, t)
 		}
-		targets = append(targets, found...)
 	}
 
 	for _, p := range opts.Extra {

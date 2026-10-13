@@ -28,8 +28,8 @@ file, then match what you see:
 
 | What you see | Likely cause | Go to |
 | --- | --- | --- |
-| A Chromium-based browser or Electron app shows nothing, and there's no `(BoringSSL found by signature)` line for it | Signature finding failed | [Chrome, Electron and other Chromium builds](#chrome-electron-and-other-chromium-builds) |
-| Its HTTP/1 and HTTP/2 show, but the line lists only `SSL_read, SSL_write`, without `EVP_AEAD_CTX_seal, EVP_AEAD_CTX_open` | The AEAD functions weren't found | [Chrome, Electron and other Chromium builds](#chrome-electron-and-other-chromium-builds) |
+| `warning: ...: BoringSSL is linked in, but its functions couldn't be told apart` | Signature finding failed | [Chrome, Electron and other Chromium builds](#chrome-electron-and-other-chromium-builds) |
+| `attached to openssl ... (BoringSSL found by signature; not its QUIC packet encryption, so no HTTP/3)` | The AEAD functions weren't found | [Chrome, Electron and other Chromium builds](#chrome-electron-and-other-chromium-builds) |
 | QUIC events appear, but HTTP/3 shows `waiting for QPACK encoder stream data`, gaps in bodies, or one connection's packets on several fds | Packets matched to the wrong socket | [HTTP/3 in Chromium](#http3-in-chromium) |
 | QUIC events are hex dumps instead of `QUIC: ...` lines | A frame type snoopy doesn't know | [HTTP/3 in Chromium](#http3-in-chromium) |
 | Firefox uses HTTP/3 (UDP port 443 in `tcpdump`) but there are no `AES_AEAD` events | Firefox's QUIC path changed, or freebl's table wasn't found | [HTTP/3 in Firefox](#http3-in-firefox) |
@@ -309,13 +309,13 @@ open_gather's `0x73`.
 
 ### How to tell it broke
 
-There's no `(BoringSSL found by signature)` line for the program in
-`--verbose` output, or the line lacks the AEAD functions. snoopy doesn't say
-why; the test does:
+snoopy warns that BoringSSL is linked in but its functions couldn't be told
+apart, with the reason (e.g. `BoringSSL: 2 candidates for SSL_write`), or
+attaches with a note that HTTP/3 won't be captured. The test gives the same
+reason, and with symbols, which function it got wrong:
 
 ```bash
 SNOOPY_BORINGSSL_TEST=/opt/google/chrome/chrome go test ./internal/discover -run TestBoringSSLBinaries -v
-# e.g. "BoringSSL: 2 candidates for SSL_write"
 ```
 
 ### How to fix it

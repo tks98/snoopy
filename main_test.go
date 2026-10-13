@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"net/netip"
 	"reflect"
 	"testing"
 
@@ -27,14 +28,63 @@ func TestParseFlags(t *testing.T) {
 	if _, err := parseFlags([]string{"-h"}, io.Discard); !errors.Is(err, flag.ErrHelp) {
 		t.Errorf("-h: %v", err)
 	}
+	c, err = parseFlags([]string{"--brief", "--host", "example.com", "--host", "10.0.0.0/8", "--port", "443", "--port", "8443", "--count", "5"}, io.Discard)
+	if err != nil || !c.brief || len(c.hosts) != 2 || !reflect.DeepEqual([]uint16(c.ports), []uint16{443, 8443}) || c.count != 5 {
+		t.Errorf("got %+v, %v", c, err)
+	}
+
 	for _, args := range [][]string{
 		{"--pid", "-1"},
 		{"--json", "--hex"},
+		{"--brief", "--json"},
+		{"--brief", "--hex"},
+		{"--port", "0"},
+		{"--port", "https"},
+		{"--count", "-1"},
 		{"extra"},
 		{"--nope"},
 	} {
 		if _, err := parseFlags(args, io.Discard); err == nil {
 			t.Errorf("%q: no error", args)
 		}
+	}
+}
+
+func TestAddrFilter(t *testing.T) {
+	ev := func(local, remote string) *tracer.Event {
+		e := &tracer.Event{Function: tracer.FuncSSLWrite}
+		if local != "" {
+			e.Local = netip.MustParseAddrPort(local)
+		}
+		if remote != "" {
+			e.Remote = netip.MustParseAddrPort(remote)
+		}
+		return e
+	}
+	f, err := newAddrFilter(config{hosts: stringList{"93.184.216.34", "10.1.0.0/16"}, ports: portList{443}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		local, remote string
+		want          bool
+	}{
+		{"10.0.0.2:51234", "93.184.216.34:443", true},
+		{"10.0.0.2:51234", "93.184.216.34:80", false},                  // wrong port
+		{"10.0.0.2:51234", "192.0.2.1:443", false},                     // wrong host
+		{"10.1.2.3:443", "192.0.2.1:51234", true},                      // a server in the network
+		{"[::ffff:10.0.0.2]:5000", "[::ffff:93.184.216.34]:443", true}, // IPv4 in IPv6
+		{"0.0.0.0:443", "0.0.0.0:0", false},                            // an unconnected UDP socket
+		{"", "", false},                                                // addresses unknown
+	} {
+		if got := f.match(ev(tc.local, tc.remote)); got != tc.want {
+			t.Errorf("%s > %s: %v", tc.local, tc.remote, got)
+		}
+	}
+	if none, _ := newAddrFilter(config{}); !none.match(ev("", "")) {
+		t.Error("no filter dropped an event")
+	}
+	if _, err := newAddrFilter(config{hosts: stringList{"no such host.invalid"}}); err == nil {
+		t.Error("unresolvable host accepted")
 	}
 }
