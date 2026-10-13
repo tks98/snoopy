@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"bytes"
 	"debug/elf"
 	"encoding/binary"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -357,26 +359,17 @@ func TestBoringSSLBinaries(t *testing.T) {
 			if debug == "" {
 				return
 			}
-			d, err := elf.Open(debug)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer d.Close()
-			syms, err := d.Symbols()
-			if err != nil {
-				t.Fatal(err)
-			}
 			checked := 0
-			for _, s := range syms {
-				if s.Name != "SSL_read" && s.Name != "SSL_write" && s.Name != "EVP_AEAD_CTX_seal" && s.Name != "EVP_AEAD_CTX_open" {
+			for name, addr := range debugSymbols(t, debug) {
+				if name != "SSL_read" && name != "SSL_write" && name != "EVP_AEAD_CTX_seal" && name != "EVP_AEAD_CTX_open" {
 					continue
 				}
-				want, err := fileOffset(f, s.Value)
+				want, err := fileOffset(f, addr)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if got[s.Name] != want {
-					t.Errorf("%s at %#x, debug symbols say %#x", s.Name, got[s.Name], want)
+				if got[name] != want {
+					t.Errorf("%s at %#x, debug symbols say %#x", name, got[name], want)
 				}
 				checked++
 			}
@@ -385,6 +378,46 @@ func TestBoringSSLBinaries(t *testing.T) {
 			}
 		})
 	}
+}
+
+// debugSymbols returns the function addresses in an ELF debug file or a
+// Breakpad symbol file (what Electron publishes; Chrome's are on
+// chrome-symbols too).
+func debugSymbols(t *testing.T, path string) map[string]uint64 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]uint64{}
+	if bytes.HasPrefix(data, []byte("MODULE ")) {
+		// FUNC [m] address size parameter_size name
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 5 || fields[0] != "FUNC" {
+				continue
+			}
+			if fields[1] == "m" {
+				fields = fields[1:]
+			}
+			if addr, err := strconv.ParseUint(fields[1], 16, 64); err == nil {
+				out[strings.Join(fields[4:], " ")] = addr
+			}
+		}
+		return out
+	}
+	d, err := elf.NewFile(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	syms, err := d.Symbols()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range syms {
+		out[s.Name] = s.Value
+	}
+	return out
 }
 
 // TestFreeblBinaries runs findFreebl on real freebl libraries:

@@ -207,7 +207,7 @@ func TestFind(t *testing.T) {
 }
 
 func TestOpenUnsupported(t *testing.T) {
-	if _, err := Open(&elf.File{FileHeader: elf.FileHeader{Machine: elf.EM_AARCH64}}); err != ErrUnsupported {
+	if _, err := Open(&elf.File{FileHeader: elf.FileHeader{Machine: elf.EM_RISCV}}); err != ErrUnsupported {
 		t.Errorf("got %v", err)
 	}
 }

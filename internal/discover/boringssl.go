@@ -2,7 +2,6 @@ package discover
 
 import (
 	"debug/elf"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,14 +22,18 @@ const (
 )
 
 // Reason codes (CIPHER_R_*) that crypto/fipsmodule/cipher/aead.cc.inc
-// reports from EVP_AEAD_CTX_seal and EVP_AEAD_CTX_open; like all of
-// BoringSSL's, they keep their values.
+// reports; like all of BoringSSL's, they keep their values.
 const (
-	aeadReasonSealOpen = 0x67 // reported by both
-	aeadReasonOpen     = 0x73 // reported by open only
+	aeadReasonBadDecrypt = 0x65 // open: input shorter than the tag
+	aeadReasonTooSmall   = 0x67 // seal and open: output buffer too small
+	aeadReasonGather     = 0x73 // open_gather (which open calls, or has inlined)
 )
 
 var errNotBoringSSL = errors.New("no statically linked BoringSSL")
+
+// boringSSLCacheVersion is part of cached results' names: bump it when
+// findBoringSSL would answer differently, so that older answers aren't used.
+const boringSSLCacheVersion = 3
 
 // cachedFindBoringSSL is findBoringSSL with its results kept by build ID in
 // the user's cache directory, so a large program (Chrome is 300 MB) is
@@ -40,7 +43,7 @@ func cachedFindBoringSSL(f *elf.File) (map[string]uint64, error) {
 	var file string
 	if id := funcfind.BuildID(f); id != nil {
 		if dir, err := os.UserCacheDir(); err == nil {
-			file = filepath.Join(dir, "snoopy", "boringssl", hex.EncodeToString(id)+"-v2.json")
+			file = filepath.Join(dir, "snoopy", "boringssl", fmt.Sprintf("%x-v%d.json", id, boringSSLCacheVersion))
 		}
 	}
 	if file != "" {
@@ -183,7 +186,9 @@ func pickSSLRead(b *funcfind.Binary, reads []*funcfind.Func) (*funcfind.Func, er
 // packet protection uses: Chrome encrypts and decrypts HTTP/3 packets with
 // them, while its TLS records go through EVP_AEAD_CTX_seal_scatter and, for
 // reading, also EVP_AEAD_CTX_open. Both take ten arguments (seal_scatter
-// takes thirteen); open is the one that reports aeadReasonOpen.
+// takes thirteen), and so does EVP_AEAD_CTX_open_gather, which open calls.
+// By their own reason codes: open is the one that reports a bad decrypt;
+// seal reports a buffer too small, but not open_gather's codes.
 func findAEAD(b *funcfind.Binary) (seal, open *funcfind.Func, err error) {
 	file, ok := b.FindString("/cipher/aead.cc.inc")
 	if !ok {
@@ -209,12 +214,12 @@ func findAEAD(b *funcfind.Binary) (seal, open *funcfind.Func, err error) {
 			continue
 		}
 		// Their own codes, without their callees': seal calls a helper that
-		// reports aeadReasonOpen too.
+		// reports open_gather's codes too.
 		reasons := own[fn.Start]
 		switch {
-		case slices.Contains(reasons, aeadReasonOpen):
+		case slices.Contains(reasons, aeadReasonBadDecrypt):
 			opens = append(opens, fn)
-		case slices.Contains(reasons, aeadReasonSealOpen):
+		case slices.Contains(reasons, aeadReasonTooSmall) && !slices.Contains(reasons, aeadReasonGather):
 			seals = append(seals, fn)
 		}
 	}

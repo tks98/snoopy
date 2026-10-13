@@ -88,6 +88,7 @@ var knownPrograms = []string{
 	"/usr/lib/chromium/chromium",
 	"/usr/lib/chromium-browser/chromium-browser",
 	"/usr/lib64/chromium-browser/chromium-browser",
+	"/snap/chromium/current/usr/lib/chromium-browser/chrome",
 	"/usr/share/code/code",
 	"/usr/lib/slack/slack",
 	"/usr/share/discord/Discord",

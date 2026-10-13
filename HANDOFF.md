@@ -183,21 +183,36 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 - **Stripped BoringSSL** (Chrome, Brave, Edge, Electron) is found by
   signature: `internal/discover/boringssl.go` on top of
   `internal/funcfind`, a small library for locating functions in stripped
-  x86-64 binaries (strings, the instructions that load them, function starts
-  from frame pointer prologues at direct call targets, constant call
-  arguments, which arguments a function reads). The README's "How it works"
-  has the rules. Results are cached by build ID in the user's cache dir.
-  Check new browser releases with `SNOOPY_BORINGSSL_TEST` (see
-  `TestBoringSSLBinaries`): Google publishes debug symbols for official
-  Chrome builds at
+  x86-64 and arm64 binaries (strings, the instructions that load them,
+  function starts at direct call targets, constant call arguments, which
+  arguments a function reads, how many stack arguments it reads). The
+  README's "How it works" has the rules. Results are cached by build ID in
+  the user's cache dir, under a version (`boringSSLCacheVersion`) to bump
+  whenever the answers could change. Check new browser releases with
+  `SNOOPY_BORINGSSL_TEST` (see `TestBoringSSLBinaries`), which takes an ELF
+  debug file or a Breakpad .sym file to compare with: Google publishes debug
+  symbols for official Chrome builds at
   `https://edgedl.me.gvt1.com/chrome/linux/symbols/google-chrome-debug-info-linux64-<version>.zip`
-  (stable, beta, dev), so the answers can be checked exactly. Chrome 156
-  changed what was inlined, which is why reason codes count callees and
-  candidates must read three arguments.
+  (stable, beta, dev), and Electron publishes Breakpad symbols with each
+  release (`electron-v<version>-linux-arm64-symbols.zip`, the only arm64
+  Chromium with symbols that's easy to get), so the answers can be checked
+  exactly. Chrome 156 changed what was inlined, which is why reason codes
+  count callees and candidates must read three arguments.
+- **funcfind on arm64** (`funcfind/arm64.go`): references are adrp+add
+  pairs and calls are bl, both matched as raw bits over the whole text;
+  per-function analysis decodes with arm64asm. Functions are 4-byte aligned
+  and start at bl targets; one also ends where a function that's only called
+  indirectly starts, recognized by paciasp or bti after an unconditional
+  branch or return (Chromium builds with branch protection). Stack
+  arguments are at the entry sp, found by following the prologue's sub sp,
+  pre-indexed stp and add x29.
 - **QUIC (HTTP/3)** in Chromium is captured at BoringSSL's
   `EVP_AEAD_CTX_seal`/`open` (found by signature next to SSL_read: both take
-  10 arguments, which `funcfind.StackArgs` checks, and open reports reason
-  0x73). The associated data is the packet header. `is_quic_aad` leaves out
+  10 arguments, which `funcfind.StackArgs` checks, but so does
+  `EVP_AEAD_CTX_open_gather`, which Chrome's and Electron's builds inline into
+  open and Ubuntu's Chromium snap doesn't. So by their own reason codes: open
+  reports bad decrypt (0x65); seal reports buffer too small (0x67) but not
+  open_gather's 0x73). The associated data is the packet header. `is_quic_aad` leaves out
   TLS records, which also use these functions, by the shape of theirs (a
   5-byte record header, or TLS 1.2's 13 bytes); QUIC's fixed bit can't be
   used, since peers may grease it (RFC 9287). Seal encrypts in place, so it

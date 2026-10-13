@@ -37,7 +37,7 @@ server: cloudflare
 - **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS, wolfSSL,
   Mbed TLS, s2n-tls, rustls (synchronous use) and Go's `crypto/tls`,
   including stripped Go binaries, and the stripped BoringSSL inside Chrome,
-  other Chromium-based browsers and Electron apps (x86_64).
+  other Chromium-based browsers and Electron apps.
 - **Finds what to trace:** system libraries, libraries loaded by running
   processes (including inside containers, and copies that an upgrade has
   since replaced), Go programs, and anything you point it at with `--lib`.
@@ -175,8 +175,8 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | Library | Functions | Notes |
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
-| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 only. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer. Checked on Chrome 155 and 156 (against Google's debug symbols), Brave 1.97 and Edge 155. Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Chrome's HTTP/3 traffic is captured too, see below. |
-| QUIC (HTTP/3) in Chrome, Brave, Edge, Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | x86_64. QUIC encrypts each packet with these, and the plaintext is the packet's frames, which snoopy reassembles into HTTP/3 with QPACK-decoded headers. Packets are told apart from TLS records and other callers by their header. |
+| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 and arm64. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer. Checked against published debug symbols on Chrome 155 and 156 (x86_64) and Electron 42 and 44 (arm64), and on Brave 1.97, Edge 155 and Ubuntu's Chromium 155 snap (arm64). Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Chrome's HTTP/3 traffic is captured too, see below. |
+| QUIC (HTTP/3) in Chrome, Brave, Edge, Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | x86_64 and arm64. QUIC encrypts each packet with these, and the plaintext is the packet's frames, which snoopy reassembles into HTTP/3 with QPACK-decoded headers. Packets are told apart from TLS records and other callers by their header. |
 | QUIC (HTTP/3) in Firefox | NSS's `AES_CreateContext` and `AES_AEAD` in freebl, found through its exported function table | Firefox's QUIC stack (neqo) calls freebl's AES-GCM directly, so packets are captured there, as for Chrome. AES-GCM only: a connection that negotiates ChaCha20-Poly1305 isn't captured. Neither are connections set up before snoopy started, since a context's direction is learned when it's created. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. Includes the copy bundled with Firefox, also when Firefox starts after snoopy. |
@@ -190,7 +190,7 @@ Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
 Not supported: rustls under tokio (see above), Java, stripped TLS libraries
-other than BoringSSL (and BoringSSL on arm64), QUIC/HTTP/3 outside Chromium
+other than BoringSSL, QUIC/HTTP/3 outside Chromium
 and Firefox, and programs that use OpenSSL only through its BIO layer (e.g.
 `openssl s_server -www`).
 
@@ -222,8 +222,9 @@ and `SSL_read` reports "uninitialized", "protocol is shutdown" and "should not
 have been called", counting the BoringSSL functions they call (the compiler
 inlines differently from build to build). Both must take three arguments,
 which rules out callers that BoringSSL code was inlined into. Function starts
-are frame pointer prologues that are called directly. If any of this doesn't
-give exactly one answer for each function, snoopy doesn't attach.
+are direct call targets (with a frame pointer prologue, on x86_64). If any of
+this doesn't give exactly one answer for each function, snoopy doesn't
+attach.
 
 QUIC (HTTP/3) encrypts each packet separately, with the packet's header as
 associated data, so snoopy captures packets where they're encrypted and
