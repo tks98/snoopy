@@ -328,15 +328,16 @@ SNOOPY_BORINGSSL_TEST=/opt/google/chrome/chrome go test ./internal/discover -run
 3. Disassemble the right function (its address from the symbols) and the
    candidates that got in the way, and compare what they report, what they
    call and what they read. Usually one build inlines differently.
-4. Change the rule in `boringssl.go` so that every build in the README's list
+4. Change the rule in `boringssl.go` so that every build in the list in
+   [how-it-works.md](how-it-works.md#supported-libraries)
    still gives the same answers. Keep the requirement of exactly one answer:
    attaching to the wrong function captures the wrong data.
 5. If the instructions themselves changed (a new prologue, a new way of
    loading addresses, like `endbr64` before the prologue), fix funcfind and
    add a hand-assembled case to `funcfind_test.go` or `arm64_test.go`.
 6. Bump `boringSSLCacheVersion`, or machines keep their cached answers.
-7. Run the test on all the builds again, add the new one to the README's
-   list, and do a live capture.
+7. Run the test on all the builds again, add the new one to that list, and
+   do a live capture.
 
 ## HTTP/3 in Chromium
 

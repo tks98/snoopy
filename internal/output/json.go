@@ -23,7 +23,7 @@ func NewJSON(w io.Writer) *JSON {
 	return &JSON{enc: enc, dec: newDecoders()}
 }
 
-// jsonEvent is the documented JSON schema; see README.md.
+// jsonEvent is the documented JSON schema; see docs/usage.md.
 type jsonEvent struct {
 	Time        time.Time `json:"time"`
 	Function    string    `json:"function"`
