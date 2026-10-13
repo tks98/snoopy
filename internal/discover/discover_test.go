@@ -447,21 +447,12 @@ func TestFreeblBinaries(t *testing.T) {
 			if debug == "" {
 				return
 			}
-			d, err := elf.Open(debug)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer d.Close()
-			syms, err := d.Symbols()
-			if err != nil {
-				t.Fatal(err)
-			}
 			checked := 0
-			for _, s := range syms {
-				if want, ok := got[s.Name]; ok {
-					off, err := fileOffset(f, s.Value)
+			for name, addr := range debugSymbols(t, debug) {
+				if want, ok := got[name]; ok {
+					off, err := fileOffset(f, addr)
 					if err != nil || off != want {
-						t.Errorf("%s at %#x, symbols say %#x", s.Name, want, off)
+						t.Errorf("%s at %#x, symbols say %#x", name, want, off)
 					}
 					checked++
 				}
