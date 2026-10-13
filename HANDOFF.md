@@ -170,11 +170,16 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   anywhere else, decoding stops for that direction with a note.
 - **rustls** is found by mangled symbol names (v0 and legacy;
   `inspectRustls`). Its Reader and Writer do no socket I/O, so
-  `io_threads` remembers, per thread that called them, the last socket
-  syscall (a read's socket is the one just read from) and which Writer is
-  waiting for the next one (which teaches `conn_infos` its socket, so only
-  a connection's first write lacks it). Returns are `io::Result<usize>` in
-  two registers (`RET_RUST_RESULT`).
+  `io_threads` remembers, per thread that called them, the last receive's
+  socket (a read's socket is the one just read from) and which Writer is
+  waiting for the next send (which teaches `conn_infos` its socket). With
+  BTF, only AF_INET/AF_INET6 sockets count, not pipes, eventfds or Unix
+  sockets (an event loop's wakeups, Chrome's Mojo IPC). A
+  connection's first write is emitted before that, so when `note_thread_fd`
+  learns a new socket for a connection it emits a header-only record
+  (`FN_SOCKET_NOTICE`, 0xff), and `tracer/sockets.go` holds such writes
+  (rustls, QUIC sends) until it arrives, or 300 ms. Returns are
+  `io::Result<usize>` in two registers (`RET_RUST_RESULT`).
 - **Stripped BoringSSL** (Chrome, Brave, Edge, Electron) is found by
   signature: `internal/discover/boringssl.go` on top of
   `internal/funcfind`, a small library for locating functions in stripped
@@ -192,16 +197,50 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 - **QUIC (HTTP/3)** in Chromium is captured at BoringSSL's
   `EVP_AEAD_CTX_seal`/`open` (found by signature next to SSL_read: both take
   10 arguments, which `funcfind.StackArgs` checks, and open reports reason
-  0x73). The associated data is the packet header; bit 0x40 of its first byte
-  separates QUIC from TLS records, which also use `open`. Seal encrypts in
-  place, so it captures at entry. The socket comes from `io_threads` (as for
-  rustls), with `recvmmsg`/`sendmmsg` added. User space (`output/quic.go`,
-  `qpack.go`) parses frames, reassembles streams per AEAD context (one per
-  connection direction; a key update starts over), and decodes HTTP/3 with a
-  QPACK dynamic table. The Required Insert Count is decoded assuming it
-  hasn't wrapped (the receiver's maximum table capacity isn't visible in the
-  same direction). `qpack_static.go` is generated from RFC 9204's text, and
-  `TestQPACKExamples` runs its Appendix B examples.
+  0x73). The associated data is the packet header. `is_quic_aad` leaves out
+  TLS records, which also use these functions, by the shape of theirs (a
+  5-byte record header, or TLS 1.2's 13 bytes); QUIC's fixed bit can't be
+  used, since peers may grease it (RFC 9287). Seal encrypts in place, so it
+  captures at entry. A send's socket comes from `io_threads` (as for
+  rustls). A received packet's comes from `recv_bufs`: `sys_enter` records,
+  for these threads, which socket each receive buffer was filled from (and
+  the socket's `struct file`, since a buffer can be freed with its socket and
+  reused), and `packet_fd` looks up the packet's start: `in - ad_len`, since
+  Chrome copies the header to remove header protection but decrypts the
+  rest in place. Later packets of a coalesced datagram are inside the same
+  buffer (`dgram_start`/`dgram_end`). Only then does it fall back to the
+  thread's last receive, which goes wrong when a program reads a packet and
+  decrypts it later (Chrome yields between batches, and buffers packets that
+  arrive before their keys).
+- **QUIC in Firefox:** neqo (via the `nss_rs` crate) calls freebl's
+  `AES_CreateContext` and `AES_AEAD` directly, through function pointers, not
+  through PK11 or any exported function. `FREEBL_GetVector` is exported and
+  returns freebl's function table, whose layout is NSS ABI
+  (`discover/freebl.go` reads entries 31 and 238 through RELA or RELR
+  relocations). The direction is only known at creation (`encrypt` flag,
+  mode 4 = GCM), so contexts created before snoopy started are skipped. QUIC
+  runs on the parent process's "Socket Thread", not the socket process.
+  `AES_AEAD` takes `unsigned int` lengths: on arm64 the upper half of a
+  32-bit stack argument's slot is garbage, which made `is_quic_aad` drop
+  most packets until the length was truncated. To test, start Firefox with
+  a `user.js` setting `network.http.http3.enable`,
+  `network.http.http3.alt-svc-mapping-for-testing` to `"example.com;h3=:443"`
+  and `network.http.http3.force-use-alt-svc-mapping-for-testing`.
+- **HTTP/3 decoding** (`output/quic.go`, `qpack.go`) parses frames,
+  reassembles streams per (pid, socket fd, direction), falling back to the
+  AEAD context when the fd is unknown: a direction goes through several
+  contexts (Initial, Handshake, 1-RTT, key updates). A new local address on
+  the same fd means a new connection. A new socket whose first packet uses
+  a context an open connection used in the last 10 s is that connection
+  migrating (Chrome does when a path seems to degrade, often under QEMU);
+  a connection that sent or received CONNECTION_CLOSE is left out, since
+  freed contexts' memory is reused. Within a packet, unidirectional
+  streams go first, so a header block can use encoder instructions sent
+  after it in the same packet. QPACK's Required Insert Count is decoded as
+  in RFC 9204 4.5.1.1, with the table size from the other direction's
+  SETTINGS; without them it assumes no wrap. `qpack_static.go` is generated
+  from RFC 9204's text, and `TestQPACKExamples` runs its Appendix B
+  examples.
 - **x86 testing on an Apple Silicon Mac:** `limactl start --arch=x86_64
   --vm-type=qemu template://ubuntu-24.04` gives an emulated x86 VM where
   uprobes work (Docker's amd64 emulation is user-space only). Slow, but fine
@@ -228,7 +267,10 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   missed, and libraries a long-running process `dlopen`s more than 3 s after
   its exec aren't picked up.
 - **Not supported:** rustls under tokio (hyper, reqwest: `Reader::read` is
-  inlined into tokio-rustls, writes use `write_vectored`), Java, QUIC/HTTP/3 outside Chromium (Firefox's is in Rust, neqo),
+  inlined into tokio-rustls, writes use `write_vectored`), Java, QUIC/HTTP/3
+  outside Chromium and Firefox, Firefox's QUIC with ChaCha20-Poly1305
+  (freebl's `ChaCha20Poly1305_Seal`/`Open`, table entries 214/215, would be
+  the place),
   apps using OpenSSL only via its BIO layer (`openssl s_server -www`).
 - **No socket details** (fd or addresses) for apps that do their own socket
   I/O around OpenSSL with memory BIOs, e.g. .NET.

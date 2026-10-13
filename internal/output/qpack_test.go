@@ -100,3 +100,32 @@ func TestQPACKHuffman(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+// The Required Insert Count wraps at twice the table's maximum number of
+// entries (RFC 9204, section 4.5.1.1).
+func TestQPACKRequiredInsertCountWraps(t *testing.T) {
+	d := qpackDecoder{maxEntries: 2} // a 64-byte table
+	if err := d.encoderStream(unhex(t, "3f21")); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		if err := d.encoderStream([]byte{0x41, 'a', 0x02, 'v', byte('0' + i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Required Insert Count 5, sent as 5 mod 4 + 1; base 5; entry 4.
+	if got := decodeSection(t, &d, "02 00 80"); got != "a=v4" {
+		t.Errorf("got %s", got)
+	}
+	for _, tc := range []struct {
+		encoded uint64
+		want    int
+	}{{0, 0}, {1, 4}, {2, 5}, {3, 6}, {4, 7}} {
+		if got, err := d.requiredInsertCount(tc.encoded); err != nil || got != tc.want {
+			t.Errorf("encoded %d: %d %v, want %d", tc.encoded, got, err, tc.want)
+		}
+	}
+	if _, err := d.requiredInsertCount(5); err == nil {
+		t.Error("accepted an encoded count beyond the range")
+	}
+}

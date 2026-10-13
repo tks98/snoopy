@@ -85,6 +85,9 @@ func Inspect(path string) ([]Target, error) {
 			targets = append(targets, Target{Path: path, Library: rs.lib})
 		}
 	}
+	if offsets, err := findFreebl(f); err == nil {
+		targets = append(targets, Target{Path: path, Library: NSS, Offsets: offsets, Note: "freebl, for QUIC"})
+	}
 	if !defined["SSL_read"] {
 		if offsets, err := cachedFindBoringSSL(f); err == nil {
 			targets = append(targets, Target{Path: path, Library: OpenSSL, Offsets: offsets, Note: "BoringSSL found by signature"})

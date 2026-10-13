@@ -686,16 +686,23 @@ t.join()
 func TestNewProcess(t *testing.T) {
 	requireRoot(t)
 	curl := requireTool(t, "curl")
-	system := systemTargets(t, discover.OpenSSL)
-	if len(system) == 0 {
-		t.Skip("no system OpenSSL")
+	// A copy of the system's libssl (not, say, a browser with BoringSSL).
+	var libssl string
+	for _, target := range systemTargets(t, discover.OpenSSL) {
+		if strings.HasPrefix(filepath.Base(target.Path), "libssl.so") {
+			libssl = target.Path
+			break
+		}
+	}
+	if libssl == "" {
+		t.Skip("no system libssl")
 	}
 	libDir := t.TempDir()
-	lib, err := os.ReadFile(system[0].Path)
+	lib, err := os.ReadFile(libssl)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(libDir, filepath.Base(system[0].Path)), lib, 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(libDir, filepath.Base(libssl)), lib, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -772,9 +779,12 @@ func TestRustls(t *testing.T) {
 	if out, err := exec.Command(client, port, "/rustls").CombinedOutput(); err != nil {
 		t.Fatalf("rustlsclient: %v: %s", err, out)
 	}
-	waitFor(t, events, "Writer::write", func(ev *Event) bool {
+	write := waitFor(t, events, "Writer::write", func(ev *Event) bool {
 		return ev.Function == FuncRustlsWrite && contains("GET /rustls HTTP/1.0")(ev)
 	})
+	// The connection's first write is encrypted before its socket is known;
+	// it is held back until the socket notice fills it in.
+	checkConnection(t, write, srv.Listener.Addr().String())
 	// The client reads into a growing buffer, so the response is spread
 	// over several reads; one thread makes them, so they arrive in order.
 	var reads []*Event

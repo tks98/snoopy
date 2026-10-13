@@ -25,6 +25,9 @@ type qpackDecoder struct {
 	entries  [][2]string // dynamic table, oldest first
 	inserted int         // insertions so far; the absolute index of the next
 	pending  []byte      // encoder stream bytes ending in a cut-off instruction
+	// The most entries the table can hold, from the capacity the receiver
+	// advertised; 0 if that isn't known.
+	maxEntries int
 }
 
 // encoderStream processes the next bytes of the encoder stream.
@@ -147,16 +150,12 @@ func (d *qpackDecoder) fieldSection(b []byte) ([]hpack.HeaderField, error) {
 		return nil, err
 	}
 	b = b[n:]
-	// The Required Insert Count is sent modulo twice the table's maximum
-	// number of entries, which the receiver advertises and we don't see.
-	// Assume it hasn't wrapped, which holds for a connection's first
-	// 2 * (maximum capacity / 32) insertions.
-	ric := 0
-	if encodedRIC > 0 {
-		ric = int(encodedRIC) - 1
-		if ric > d.inserted {
-			return nil, errBlocked
-		}
+	ric, err := d.requiredInsertCount(encodedRIC)
+	if err != nil {
+		return nil, err
+	}
+	if ric > d.inserted {
+		return nil, errBlocked
 	}
 	base := ric + int(delta)
 	if negative {
@@ -255,6 +254,36 @@ func (d *qpackDecoder) fieldSection(b []byte) ([]hpack.HeaderField, error) {
 		b = b[m:]
 	}
 	return fields, nil
+}
+
+// requiredInsertCount decodes a field section's Required Insert Count, which
+// is sent modulo twice the table's maximum number of entries (RFC 9204,
+// section 4.5.1.1). If that maximum isn't known, it assumes the count
+// hasn't wrapped, which holds for a connection's first 2 * (maximum
+// capacity / 32) insertions.
+func (d *qpackDecoder) requiredInsertCount(encoded uint64) (int, error) {
+	if encoded == 0 {
+		return 0, nil
+	}
+	if d.maxEntries <= 0 {
+		return int(min(encoded, 1<<40)) - 1, nil
+	}
+	fullRange := 2 * d.maxEntries
+	if encoded > uint64(fullRange) {
+		return 0, fmt.Errorf("qpack: encoded required insert count %d exceeds %d", encoded, fullRange)
+	}
+	maxValue := d.inserted + d.maxEntries
+	ric := maxValue/fullRange*fullRange + int(encoded) - 1
+	if ric > maxValue {
+		if ric <= fullRange {
+			return 0, fmt.Errorf("qpack: invalid required insert count %d", encoded)
+		}
+		ric -= fullRange
+	}
+	if ric == 0 {
+		return 0, fmt.Errorf("qpack: invalid required insert count %d", encoded)
+	}
+	return ric, nil
 }
 
 // qpackInt decodes a prefixed integer (RFC 7541, section 5.1) whose prefix

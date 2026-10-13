@@ -34,6 +34,8 @@ const (
 	FuncRustlsWrite
 	FuncQUICSend
 	FuncQUICRecv
+	FuncNSSQUICSend
+	FuncNSSQUICRecv
 )
 
 var functionNames = map[Function]string{
@@ -59,6 +61,8 @@ var functionNames = map[Function]string{
 	FuncRustlsWrite:  "rustls::Writer::write",
 	FuncQUICSend:     "EVP_AEAD_CTX_seal",
 	FuncQUICRecv:     "EVP_AEAD_CTX_open",
+	FuncNSSQUICSend:  "AES_AEAD (encrypt)",
+	FuncNSSQUICRecv:  "AES_AEAD (decrypt)",
 }
 
 func (f Function) String() string {
@@ -75,7 +79,7 @@ func (f Function) Library() discover.Library {
 		return discover.OpenSSL
 	case FuncGnuTLSRecv, FuncGnuTLSSend:
 		return discover.GnuTLS
-	case FuncPRRead, FuncPRWrite, FuncPRRecv, FuncPRSend:
+	case FuncPRRead, FuncPRWrite, FuncPRRecv, FuncPRSend, FuncNSSQUICSend, FuncNSSQUICRecv:
 		return discover.NSS
 	case FuncGoRead, FuncGoWrite:
 		return discover.GoTLS
@@ -94,7 +98,7 @@ func (f Function) Library() discover.Library {
 // IsQUIC reports whether the function's data is the frames of a QUIC packet
 // (HTTP/3), captured where the packet is encrypted or decrypted.
 func (f Function) IsQUIC() bool {
-	return f == FuncQUICSend || f == FuncQUICRecv
+	return f == FuncQUICSend || f == FuncQUICRecv || f == FuncNSSQUICSend || f == FuncNSSQUICRecv
 }
 
 // Direction is whether data was received or sent.
@@ -116,7 +120,7 @@ func (d Direction) String() string {
 func (f Function) Direction() Direction {
 	switch f {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
-		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend:
+		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend:
 		return Write
 	}
 	return Read

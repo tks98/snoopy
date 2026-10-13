@@ -386,3 +386,56 @@ func TestBoringSSLBinaries(t *testing.T) {
 		})
 	}
 }
+
+// TestFreeblBinaries runs findFreebl on real freebl libraries:
+//
+//	SNOOPY_FREEBL_TEST=/usr/lib/x86_64-linux-gnu/libfreeblpriv3.so=libfreeblpriv3.debug go test -run FreeblBinaries ./internal/discover
+//
+// A file with symbols after "=" (for distribution builds, debuginfod has them)
+// is checked against.
+func TestFreeblBinaries(t *testing.T) {
+	spec := os.Getenv("SNOOPY_FREEBL_TEST")
+	if spec == "" {
+		t.Skip("set SNOOPY_FREEBL_TEST to freebl libraries to check")
+	}
+	for _, item := range strings.Split(spec, ",") {
+		path, debug, _ := strings.Cut(item, "=")
+		t.Run(path, func(t *testing.T) {
+			f, err := elf.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			got, err := findFreebl(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("AES_CreateContext %#x, AES_AEAD %#x", got["AES_CreateContext"], got["AES_AEAD"])
+			if debug == "" {
+				return
+			}
+			d, err := elf.Open(debug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Close()
+			syms, err := d.Symbols()
+			if err != nil {
+				t.Fatal(err)
+			}
+			checked := 0
+			for _, s := range syms {
+				if want, ok := got[s.Name]; ok {
+					off, err := fileOffset(f, s.Value)
+					if err != nil || off != want {
+						t.Errorf("%s at %#x, symbols say %#x", s.Name, want, off)
+					}
+					checked++
+				}
+			}
+			if checked != 2 {
+				t.Errorf("symbols have %d of the 2 functions", checked)
+			}
+		})
+	}
+}

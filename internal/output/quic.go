@@ -3,8 +3,10 @@ package output
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/net/http2/hpack"
 
@@ -25,17 +27,24 @@ type quicItem struct {
 }
 
 // quicConns follows the HTTP/3 traffic in QUIC packets. Packets are
-// captured decrypted, one per event, keyed by their encryption context,
-// which belongs to one direction of one connection; each direction carries
-// its own streams' data and its own QPACK encoder stream.
+// captured decrypted, one per event, and followed per direction of a
+// connection, since each direction carries its own streams' data and its own
+// QPACK encoder stream. A connection is its UDP socket: a direction uses
+// several encryption contexts over its life (one per encryption level, and a
+// new one at each key update), so the context identifies it only if the
+// socket isn't known. A connection can also move to a new socket (QUIC
+// connection migration), keeping its keys.
 type quicConns struct {
-	dirs  map[quicKey]*quicDir
-	clock uint64
+	dirs   map[quicKey]*quicDir // several keys share one after a migration
+	locals map[quicKey]netip.AddrPort
+	clock  uint64
 }
 
 type quicKey struct {
 	pid  uint32
-	conn uint64
+	fd   int32
+	conn uint64 // the encryption context, if fd is -1
+	send bool
 }
 
 type quicDir struct {
@@ -43,6 +52,25 @@ type quicDir struct {
 	qpack    qpackDecoder
 	blocked  []blockedSection // HEADERS waiting for encoder stream data
 	lastUsed uint64
+	lastCtx  uint64    // the encryption context of the last packet
+	lastTime time.Time // and when it was
+	closed   bool      // a CONNECTION_CLOSE was seen
+	// The QPACK_MAX_TABLE_CAPACITY this direction's sender advertised in its
+	// SETTINGS, which bounds the other direction's dynamic table; -1 if not
+	// seen.
+	maxTableCapacity int64
+}
+
+func newQUICDir() *quicDir {
+	return &quicDir{streams: map[uint64]*quicStream{}, maxTableCapacity: -1}
+}
+
+func quicKeyOf(ev *tracer.Event) quicKey {
+	send := ev.Function.Direction() == tracer.Write
+	if ev.FD >= 0 {
+		return quicKey{pid: ev.PID, fd: ev.FD, send: send}
+	}
+	return quicKey{pid: ev.PID, fd: -1, conn: ev.ConnID, send: send}
 }
 
 type blockedSection struct {
@@ -68,24 +96,62 @@ const (
 	maxHTTP3Frame      = 1 << 20 // larger non-DATA frames are given up on
 )
 
+// migrationWindow is how recently a connection must have used a context for
+// a new socket using it to be the connection moving there; a freed
+// context's memory may be reused by a later connection.
+const migrationWindow = 10 * time.Second
+
 func newQUICConns() *quicConns {
-	return &quicConns{dirs: map[quicKey]*quicDir{}}
+	return &quicConns{dirs: map[quicKey]*quicDir{}, locals: map[quicKey]netip.AddrPort{}}
+}
+
+// dir returns the state for an event's direction of its connection.
+func (c *quicConns) dir(key quicKey, ev *tracer.Event) *quicDir {
+	d := c.dirs[key]
+	if l := c.locals[key]; d != nil && ev.Local.IsValid() && l.IsValid() && l != ev.Local {
+		d = nil // a new socket with a closed one's fd: a new connection
+	}
+	if d == nil && key.fd >= 0 {
+		// The first packet on this socket: an open connection moving here
+		// still uses its keys.
+		for k, o := range c.dirs {
+			if k.pid == key.pid && k.send == key.send && k.fd >= 0 && k.fd != key.fd && !o.closed &&
+				o.lastCtx == ev.ConnID && ev.Time.Sub(o.lastTime) < migrationWindow {
+				d = o
+				break
+			}
+		}
+	}
+	if d == nil {
+		if len(c.dirs) >= maxQUICDirs {
+			c.evict()
+		}
+		d = newQUICDir()
+	}
+	c.dirs[key] = d
+	if ev.Local.IsValid() {
+		c.locals[key] = ev.Local
+	}
+	return d
 }
 
 // process returns what a QUIC packet event contains, or ok false if its data
 // doesn't parse as QUIC frames.
 func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
-	key := quicKey{ev.PID, ev.ConnID}
-	d := c.dirs[key]
-	if d == nil {
-		if len(c.dirs) >= maxQUICDirs {
-			c.evict()
-		}
-		d = &quicDir{streams: map[uint64]*quicStream{}}
-		c.dirs[key] = d
-	}
+	key := quicKeyOf(ev)
+	d := c.dir(key, ev)
 	c.clock++
-	d.lastUsed = c.clock
+	d.lastUsed, d.lastCtx, d.lastTime = c.clock, ev.ConnID, ev.Time
+	// The other direction's SETTINGS bound this one's QPACK dynamic table.
+	other := key
+	other.send = !key.send
+	o := c.dirs[other]
+	if o != nil && (c.locals[other] != c.locals[key]) {
+		o = nil // the other direction's state is from an earlier socket
+	}
+	if o != nil && o.maxTableCapacity >= 0 {
+		d.qpack.maxEntries = int(o.maxTableCapacity / 32)
+	}
 
 	// A decrypted packet's frames end exactly where it does, unless the
 	// capture was cut short; anything else isn't QUIC.
@@ -95,10 +161,22 @@ func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 	}
 	for _, f := range frames {
 		items = append(items, quicItem{Frame: f})
+		if strings.HasPrefix(f, "CONNECTION_CLOSE") {
+			d.closed = true
+			if o != nil {
+				o.closed = true
+			}
+		}
 	}
 	if err != nil {
 		items = append(items, quicItem{Frame: "(" + err.Error() + ")"})
 	}
+	// A packet's frames arrive together, so a header block can use the
+	// encoder stream instructions that come after it in the same packet:
+	// deliver the unidirectional streams' data (control, QPACK) first.
+	sort.SliceStable(streamData, func(i, j int) bool {
+		return streamData[i].id&0x02 != 0 && streamData[j].id&0x02 == 0
+	})
 	for _, sd := range streamData {
 		items = append(items, d.streamData(sd)...)
 	}
@@ -114,6 +192,7 @@ func (c *quicConns) evict() {
 		}
 	}
 	delete(c.dirs, oldest)
+	delete(c.locals, oldest)
 }
 
 type streamFrame struct {
@@ -459,7 +538,11 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 		case 0x01: // HEADERS
 			items = append(items, d.headers(id, payload))
 		case 0x04: // SETTINGS
-			items = append(items, quicItem{HTTP3: "SETTINGS", Stream: id, Data: []byte(http3Settings(payload))})
+			settings := http3Settings(payload)
+			if v, ok := settings[0x01]; ok && s.uniType == 0 {
+				d.maxTableCapacity = int64(min(v, 1<<40))
+			}
+			items = append(items, quicItem{HTTP3: "SETTINGS", Stream: id, Data: []byte(describeSettings(settings))})
 		case 0x03, 0x05, 0x07, 0x0d:
 			items = append(items, quicItem{HTTP3: map[uint64]string{3: "CANCEL_PUSH", 5: "PUSH_PROMISE", 7: "GOAWAY", 0x0d: "MAX_PUSH_ID"}[typ], Stream: id})
 		default: // reserved (greasing) and unknown frames are ignored
@@ -503,11 +586,9 @@ func (d *quicDir) retryBlocked() []quicItem {
 	return items
 }
 
-// http3Settings describes a SETTINGS frame's payload.
-func http3Settings(p []byte) string {
-	names := map[uint64]string{0x01: "QPACK_MAX_TABLE_CAPACITY", 0x06: "MAX_FIELD_SECTION_SIZE",
-		0x07: "QPACK_BLOCKED_STREAMS", 0x08: "ENABLE_CONNECT_PROTOCOL", 0x33: "H3_DATAGRAM"}
-	var out []string
+// http3Settings parses a SETTINGS frame's payload.
+func http3Settings(p []byte) map[uint64]uint64 {
+	settings := map[uint64]uint64{}
 	for len(p) > 0 {
 		id, n, ok := quicVarint(p)
 		if !ok {
@@ -518,11 +599,21 @@ func http3Settings(p []byte) string {
 			break
 		}
 		p = p[n+m:]
-		name, known := names[id]
-		if !known {
-			continue // reserved (greasing) or unknown
+		settings[id] = v
+	}
+	return settings
+}
+
+// describeSettings lists the settings it knows, leaving out reserved
+// (greasing) and unknown ones.
+func describeSettings(settings map[uint64]uint64) string {
+	names := map[uint64]string{0x01: "QPACK_MAX_TABLE_CAPACITY", 0x06: "MAX_FIELD_SECTION_SIZE",
+		0x07: "QPACK_BLOCKED_STREAMS", 0x08: "ENABLE_CONNECT_PROTOCOL", 0x33: "H3_DATAGRAM"}
+	var out []string
+	for id, v := range settings {
+		if name, known := names[id]; known {
+			out = append(out, fmt.Sprintf("%s=%d", name, v))
 		}
-		out = append(out, fmt.Sprintf("%s=%d", name, v))
 	}
 	sort.Strings(out)
 	return strings.Join(out, " ")

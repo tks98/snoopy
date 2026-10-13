@@ -71,12 +71,13 @@ type Target struct {
 }
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
-var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*"}
+var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libfreeblpriv3.so", "libfreebl3.so", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*"}
 
-// knownPrograms are where Chromium-based browsers and Electron apps are
-// installed. They link BoringSSL statically, so they are found by signature
-// (see findBoringSSL), which takes a moment for these large binaries: doing
-// it at startup means they are traced from the moment they start.
+// knownPrograms are where Chromium-based browsers, Electron apps and
+// Firefox's own NSS libraries are installed. Inspecting them at startup means
+// they are traced from the moment they start: the browsers link BoringSSL
+// statically and are found by signature (see findBoringSSL), which takes a
+// moment for such large binaries, and Firefox's libraries aren't system ones.
 var knownPrograms = []string{
 	"/opt/google/chrome/chrome",
 	"/opt/google/chrome-beta/chrome",
@@ -91,6 +92,15 @@ var knownPrograms = []string{
 	"/usr/lib/slack/slack",
 	"/usr/share/discord/Discord",
 	"/opt/Signal/signal-desktop",
+	// Firefox's own NSS, whose freebl its QUIC stack uses (see findFreebl).
+	"/snap/firefox/current/usr/lib/firefox/libnspr4.so",
+	"/snap/firefox/current/usr/lib/firefox/libfreeblpriv3.so",
+	"/usr/lib/firefox/libnspr4.so",
+	"/usr/lib/firefox/libfreeblpriv3.so",
+	"/usr/lib64/firefox/libnspr4.so",
+	"/usr/lib64/firefox/libfreeblpriv3.so",
+	"/opt/firefox/libnspr4.so",
+	"/opt/firefox/libfreeblpriv3.so",
 }
 
 // libDirs are searched for system-wide libraries.

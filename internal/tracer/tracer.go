@@ -231,6 +231,13 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 			{"gnutls_record_send", t.objs.GnutlsRecordSendEnter, false},
 		}
 	case discover.NSS:
+		if target.Offsets["AES_AEAD"] != 0 { // freebl, for Firefox's QUIC
+			probes = []cProbe{
+				{"AES_CreateContext", t.objs.AesCreateEnter, false},
+				{"AES_AEAD", t.objs.AesAeadEnter, false},
+			}
+			break
+		}
 		probes = []cProbe{
 			{"PR_Read", t.objs.PR_ReadEnter, false},
 			{"PR_Write", t.objs.PR_WriteEnter, false},
@@ -272,7 +279,11 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 		}
 		// Attach the return probe first so no entry goes unmatched.
 		if !p.entryOnly {
-			ret, err := ex.Uretprobe(p.symbol, t.objs.TlsReturn, opts)
+			retProg := t.objs.TlsReturn
+			if p.symbol == "AES_CreateContext" { // records the new context's direction
+				retProg = t.objs.AesCreateReturn
+			}
+			ret, err := ex.Uretprobe(p.symbol, retProg, opts)
 			if errors.Is(err, link.ErrNoSymbol) {
 				continue // e.g. SSL_read_ex before OpenSSL 1.1.1
 			}
@@ -460,17 +471,20 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) boo
 }
 
 // Run delivers events to handle until ctx is cancelled. handle is called
-// from Run's goroutine.
+// from Run's goroutine. A connection's writes that went out before its
+// socket was known are held back until it is, briefly.
 func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 	const (
-		pollInterval = 200 * time.Millisecond
-		maxChunkWait = time.Second
+		pollInterval  = 200 * time.Millisecond
+		maxChunkWait  = time.Second
+		maxSocketWait = 300 * time.Millisecond
 	)
 	asm := newAssembler(t.clock)
+	sockets := newSocketWaiter()
 	lastExpire := time.Now()
 	var rec ringbuf.Record
 
-	deliver := func(ev *Event) {
+	release := func(ev *Event) {
 		if !t.haveBTF {
 			ev.Comm = t.processName(ev.PID, ev.Comm)
 			if t.opts.Comm != "" && ev.Comm != t.opts.Comm {
@@ -479,11 +493,20 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 		}
 		handle(ev)
 	}
+	deliver := func(ev *Event, now time.Time) {
+		for _, ev := range sockets.add(ev, now) {
+			release(ev)
+		}
+	}
 
 	for {
 		if ctx.Err() != nil {
-			for _, ev := range asm.expire(time.Now(), 0) {
-				deliver(ev)
+			now := time.Now()
+			for _, ev := range asm.expire(now, 0) {
+				deliver(ev, now)
+			}
+			for _, ev := range sockets.expire(now, 0) {
+				release(ev)
 			}
 			return nil
 		}
@@ -502,14 +525,23 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 			if err != nil {
 				return err
 			}
+			if c.Fn == fnSocketNotice {
+				for _, ev := range sockets.notice(c) {
+					release(ev)
+				}
+				break
+			}
 			for _, ev := range asm.add(c, now) {
-				deliver(ev)
+				deliver(ev, now)
 			}
 		}
 
 		if now.Sub(lastExpire) >= pollInterval {
 			for _, ev := range asm.expire(now, maxChunkWait) {
-				deliver(ev)
+				deliver(ev, now)
+			}
+			for _, ev := range sockets.expire(now, maxSocketWait) {
+				release(ev)
 			}
 			lastExpire = now
 		}
