@@ -85,8 +85,8 @@ The integration tests skip clients that aren't installed: curl, python3,
 gnutls-cli, and cc with libnss3-dev for the NSS client in
 `internal/tracer/testdata`. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
 client with cargo. `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
-signature finding against real binaries (see the README's Development
-section).
+signature finding against real binaries (see
+[CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Repository map
 
@@ -214,8 +214,8 @@ section).
   `internal/funcfind`, a small library for locating functions in stripped
   x86-64 and arm64 binaries (strings, the instructions that load them,
   function starts at direct call targets, constant call arguments, which
-  arguments a function reads, how many stack arguments it reads). The
-  README's "How it works" has the rules. Results are cached by build ID in
+  arguments a function reads, how many stack arguments it reads).
+  [docs/how-it-works.md](docs/how-it-works.md) has the rules. Results are cached by build ID in
   the user's cache dir, under a version (`boringSSLCacheVersion`) to bump
   whenever the answers could change. Check new browser releases with
   `SNOOPY_BORINGSSL_TEST` (see `TestBoringSSLBinaries`), which takes an ELF

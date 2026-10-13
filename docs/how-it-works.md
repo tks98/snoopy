@@ -1,0 +1,128 @@
+# How snoopy works
+
+What snoopy can trace, and how it does it.
+
+## Supported libraries
+
+
+| Library | Functions probed | Notes |
+| --- | --- | --- |
+| OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Also copies linked into a program that exports them, like Node.js. |
+| BoringSSL in Chrome, Brave, Edge and Electron apps | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. |
+| HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | Each QUIC packet, decrypted. |
+| HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
+| GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
+| NSS (Firefox, Thunderbird) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` | Also the copy bundled with Firefox. |
+| wolfSSL | `wolfSSL_read`, `wolfSSL_write` | |
+| Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
+| s2n-tls | `s2n_recv`, `s2n_send` | Not `s2n_sendv`. |
+| rustls | `Reader::read`, `Writer::write` | Synchronous use only; needs the program's symbols. |
+| Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64, stripped binaries too. |
+
+All of them on x86_64 and arm64. Some details:
+
+- **Chromium-based browsers and Electron apps** link BoringSSL without
+  symbols, so snoopy recognizes its functions by the error codes they report
+  (see [below](#chrome-and-other-stripped-boringssl-builds)). It attaches only if that gives one
+  clear answer, and otherwise warns that the build can't be traced. This was
+  checked against published debug symbols on Chrome 155 and 156 (x86_64) and
+  Electron 42 and 44 (arm64), and on Brave 1.97, Edge 155 and Ubuntu's
+  Chromium 155 snap (arm64). Browsers in their usual install locations are
+  analyzed at startup, which takes a few seconds the first time, so they are
+  traced from the moment they start; results are cached by build ID.
+- **HTTP/3** is captured where each QUIC packet is encrypted and decrypted;
+  the plaintext is the packet's frames, which snoopy reassembles into HTTP/3
+  with QPACK-decoded headers. Firefox's QUIC stack (neqo) calls freebl's
+  AES-GCM directly, through its exported function table. A Firefox connection
+  that negotiates ChaCha20-Poly1305 isn't captured, and neither are those set
+  up before snoopy started, since a context's direction is learned when it's
+  created.
+- **NSS** functions are used for all kinds of files, so only layered
+  descriptors (the SSL layer) are captured.
+- **rustls** is found by its mangled names, in programs that use its reader
+  and writer directly, such as `ureq` or `rustls::Stream`; Cargo keeps the
+  symbols by default. Not async stacks built on tokio-rustls (`hyper`,
+  `reqwest`, `axum`): there the read path is inlined and writes are vectored.
+
+Programs that do their own socket I/O around the TLS library, such as .NET's
+`SslStream` over OpenSSL, are captured without a file descriptor or addresses.
+
+Not supported: rustls under tokio, Java, stripped TLS libraries other than
+BoringSSL, QUIC/HTTP/3 outside Chromium and Firefox (curl's own HTTP/3, for
+example), programs that use OpenSSL only through its BIO layer (e.g.
+`openssl s_server -www`), and bodies compressed with a shared dictionary
+(Chrome's `dcb` and `dcz`), which are shown as sent.
+
+
+## Tracing calls
+
+1. snoopy finds the files to probe: shared libraries in the usual system
+   directories, the libraries and executables mapped by running processes
+   (reached through `/proc/<pid>/root`, which also covers containers), and any
+   `--lib` paths. While it runs, a `sched_process_exec` tracepoint reports
+   new programs, whose files are inspected the same way.
+2. A uprobe on each read/write function records the buffer pointer and the
+   connection handle. A return probe copies the bytes actually transferred
+   into a ring buffer, in chunks of up to 16 KiB. Go programs can't use return
+   probes, because Go moves goroutine stacks, so snoopy disassembles the
+   function and puts a probe on each `RET` instruction instead.
+3. A `sys_enter` tracepoint records which socket each TLS call uses. Socket
+   addresses are read from the kernel's `struct sock`, located with CO-RE
+   (BTF-based relocation) so one compiled program works on every kernel
+   version.
+4. User space reassembles the chunks and adds the container ID.
+
+## Chrome and other stripped BoringSSL builds
+
+Stripped programs that link BoringSSL statically, like Chrome, have no
+`SSL_read` or `SSL_write` symbols, so snoopy recognizes the functions by what
+they do (`internal/funcfind`). BoringSSL reports errors with the source file's
+name and a reason code, and those codes are fixed constants. Among the
+functions that load the address of `ssl/ssl_lib.cc`, `SSL_write` is the one
+that reports "bad length" besides "uninitialized" and "protocol is shutdown",
+and `SSL_read` reports "uninitialized", "protocol is shutdown" and "should not
+have been called", counting the BoringSSL functions they call (the compiler
+inlines differently from build to build). Both must take three arguments,
+which rules out callers that BoringSSL code was inlined into. Function starts
+are direct call targets (with a frame pointer prologue, on x86_64). If any of
+this doesn't give exactly one answer for each function, snoopy doesn't
+attach.
+
+## HTTP/3
+
+QUIC (HTTP/3) encrypts each packet separately, with the packet's header as
+associated data, so snoopy captures packets where they're encrypted and
+decrypted: BoringSSL's `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open` in Chrome,
+freebl's `AES_AEAD` in Firefox. The same functions protect TLS records, whose
+associated data looks different. None of them touch the socket. A received
+packet is usually decrypted from the buffer it was received into, so for
+threads that decrypt packets the BPF program remembers which socket each
+receive buffer was last filled from, and otherwise uses the thread's last
+receive. A packet is sent just after it's encrypted, so the thread's next
+send tells its connection's socket; when the BPF program learns a socket that
+way, it sends user space a notice, and packets that went out before it are
+held back until then (rustls's writes work the same way). User space
+reassembles each direction's streams per socket, across the encryption keys a
+connection goes through and the sockets it migrates to, and decodes the
+HTTP/3 frames and QPACK headers.
+
+## The code
+
+The eBPF program is `bpf/snoopy.c`. It is compiled with `bpf2go` into the
+`internal/tracer/snoopy_*_bpfel.{o,go}` files, which are committed so that a
+plain `go build` works.
+
+Some of this depends on other programs' internals, which their new releases
+can change. [release-risks.md](release-risks.md) lists what's likely
+to break and how it would show, and [maintenance.md](maintenance.md)
+explains how each of those parts was found and how to fix it when it breaks.
+
+## References
+
+
+- https://www.airplane.dev/blog/decrypting-ssl-at-scale-with-ebpf
+- https://medium.com/@yunwei356/ebpf-practical-tutorial-capturing-ssl-tls-plain-text-using-uprobe-fccb010cfd64
+- https://github.com/eunomia-bpf/bpf-developer-tutorial
+- https://www.datadoghq.com/blog/ebpf-guide/
+- https://blog.px.dev/ebpf-openssl-tracing/
+- https://github.com/cilium/ebpf

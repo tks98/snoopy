@@ -35,8 +35,8 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
   files). `SNOOPY_TEST_RUSTLS=1` adds the rustls test, which builds with
   cargo.
 - `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the signature-based
-  finding against real browser binaries; see the README's Development
-  section.
+  finding against real browser binaries; see
+  [CONTRIBUTING.md](CONTRIBUTING.md).
 - Browsers are tested by hand; docs/maintenance.md has the recipes.
 
 ## Changing the eBPF program
@@ -58,13 +58,14 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
 
 ## Keeping things in sync
 
-- **Output:** the README's examples come from real runs. Update them when the
-  text, `--brief` or JSON output changes, and the JSON field table too.
+- **Output:** the examples in README.md and docs/usage.md come from real
+  runs. Update them when the text, `--brief` or JSON output changes, and
+  docs/usage.md's JSON field table too.
 - **Demo GIF:** `docs/demo.gif` is recorded with `docs/demo/record.sh`.
   Record it again when the output changes, and read the capture it saves
   before committing the new one.
 - **Flags:** `--help` is written by hand (`usage` in `main.go`).
-  `TestUsage` fails if a flag is missing from it; the README repeats it.
+  `TestUsage` fails if a flag is missing from it; docs/usage.md repeats it.
 - **Messages:** docs/maintenance.md's "Which part broke?" table quotes
   warnings word for word.
 - **Behavior:** update HANDOFF.md's notes for the part you changed, and
