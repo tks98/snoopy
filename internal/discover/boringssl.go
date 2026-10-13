@@ -86,7 +86,7 @@ func cachedFindBoringSSL(f *elf.File) (map[string]uint64, error) {
 func findBoringSSL(f *elf.File) (map[string]uint64, error) {
 	b, err := funcfind.Open(f)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errNotBoringSSL, err)
 	}
 	file, ok := b.FindString("/ssl/ssl_lib.cc")
 	if !ok {

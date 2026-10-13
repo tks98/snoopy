@@ -267,6 +267,14 @@ section).
   SETTINGS; without them it assumes no wrap. `qpack_static.go` is generated
   from RFC 9204's text, and `TestQPACKExamples` runs its Appendix B
   examples.
+- **Output and filters:** the text printer writes each call's ends as
+  `source > destination`, in the direction the data went (`endpoints` in
+  `output/text.go`). `--brief` (`output/brief.go`) prints one line per call
+  from the same decoders, with a summary per protocol. `--host`, `--port` and
+  `--count` are applied in `main.go` before any printer, so they also limit
+  `--pcap`. A stripped BoringSSL whose functions can't be told apart becomes
+  a `Target` with a `Problem`, which is reported as a warning instead of
+  attached to.
 - **Compressed bodies** (`output/body.go`): a body with a Content-Encoding
   is decompressed as its pieces arrive. Go's decompressors pull from an
   io.Reader, so each runs in a goroutine fed through channels: `push`

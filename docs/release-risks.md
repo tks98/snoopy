@@ -44,8 +44,9 @@ thing it depends on ships.
   differently, BoringSSL renames a file (it went from `.c` to `.cc` once), or
   a build drops frame pointers.
 - **How it shows:** the finder needs exactly one candidate for each function,
-  so a change usually leaves none and snoopy doesn't attach to the program.
-  snoopy doesn't print why. A wrong but unique answer would put probes on the
+  so a change usually leaves none, and snoopy warns that the build can't be
+  traced and why. A build whose HTTP/3 functions weren't found is attached
+  to with a note saying so. A wrong but unique answer would put probes on the
   wrong function, and answers are cached by build ID until
   `boringSSLCacheVersion` is bumped.
 - **Already seen:** Chrome 156 stopped inlining `ssl_read_impl` into

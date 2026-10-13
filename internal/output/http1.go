@@ -57,9 +57,10 @@ type http1Dir struct {
 // bytes of a body as sent (chunked framing included) with what they decoded
 // to.
 type http1Segment struct {
-	msg  *httpMessage
-	raw  []byte
-	body bodyPart
+	msg    *httpMessage
+	raw    []byte
+	inBody bool // raw is (part of) a message body
+	body   bodyPart
 }
 
 const (
@@ -173,14 +174,14 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 		case h1Length:
 			n := min(int64(len(data)), d.left)
 			d.left -= n
-			segs = append(segs, http1Segment{raw: data[:n], body: decodeBody(d.body, data[:n], d.left == 0)})
+			segs = append(segs, http1Segment{raw: data[:n], inBody: true, body: decodeBody(d.body, data[:n], d.left == 0)})
 			if d.left == 0 {
 				d.body, d.state = nil, h1Start
 			}
 			data = data[n:]
 		case h1Chunked:
 			n, body, done, ok := d.chunked(data)
-			seg := http1Segment{raw: data[:n], body: decodeBody(d.body, body, done && ok)}
+			seg := http1Segment{raw: data[:n], inBody: true, body: decodeBody(d.body, body, done && ok)}
 			if !ok {
 				// Lost track of the framing; wait for the next message.
 				d.endBody(errors.New("bad chunked framing"))
@@ -195,7 +196,7 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 			}
 			data = data[n:]
 		case h1ToClose:
-			return append(segs, http1Segment{raw: data, body: decodeBody(d.body, data, false)})
+			return append(segs, http1Segment{raw: data, inBody: true, body: decodeBody(d.body, data, false)})
 		default: // h1Gone
 			return append(segs, http1Segment{raw: data})
 		}
