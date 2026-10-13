@@ -157,6 +157,18 @@ section).
   later seen with port 0, because the kernel releases the port on reset.
 - **NSS:** only *layered* `PRFileDesc`s (`file_type == PR_DESC_LAYERED`) are
   traced. Otherwise plain file and socket I/O through NSPR would show up.
+  `PR_Recv` with `PR_MSG_PEEK` is skipped: Firefox peeks at a byte of idle
+  connections, which is read again later.
+- **`--pid`** sets `filter_tgids`, and `should_trace` looks the process up in
+  `traced_tgids`. With BTF, `is_traced_tgid` also walks up to 8 parents
+  (`real_parent`, CO-RE) and adds a process that descends from a traced one,
+  so a fork that never executes a program (Chrome's network service) is
+  traced from its first call. Uprobes aren't attached per process for the
+  same reason. Without BTF, `main.go` adds new children from a `/proc` scan
+  every second, and the exec watcher adds those that execute a program.
+- **Counters** (`counters`, per CPU): chunks lost to a full ring buffer, and
+  Firefox QUIC packets of contexts created before snoopy, which `main.go`
+  warns about once.
 
 ### Go side
 
@@ -175,10 +187,13 @@ section).
   and the least recently used of 16384 streams is evicted.
 - **HTTP/2** (`internal/output/http2.go`) is decoded per (pid, connection,
   direction) from the connection preface on, as a byte stream: frames can
-  span calls. HPACK's table is built up over the connection, so connections
-  that started before snoopy only get the old per-call frame summary.
-  Missing bytes (truncated captures) are tolerated inside DATA payloads;
-  anywhere else, decoding stops for that direction with a note.
+  span calls. HPACK's table is built up over the connection, so a connection
+  that started before snoopy is followed without headers (`HeadersLost`)
+  from the first call that starts with a frame (`http2Aligned`, which also
+  takes a lone 9-byte frame header, as Firefox reads them), and found again
+  if the framing is lost. Missing bytes (truncated captures) are tolerated
+  inside DATA payloads; anywhere else, decoding stops for that direction
+  with a note.
 - **rustls** is found by mangled symbol names (v0 and legacy;
   `inspectRustls`). Its Reader and Writer do no socket I/O, so
   `io_threads` remembers, per thread that called them, the last receive's
@@ -264,17 +279,33 @@ section).
   streams go first, so a header block can use encoder instructions sent
   after it in the same packet. QPACK's Required Insert Count is decoded as
   in RFC 9204 4.5.1.1, with the table size from the other direction's
-  SETTINGS; without them it assumes no wrap. `qpack_static.go` is generated
+  SETTINGS; without them it assumes no wrap. A blocked header block on a
+  direction whose start wasn't seen (no stream 0 and no unidirectional
+  stream type: `startSeen`) is reported as probably from before snoopy, and
+  at most 64 blocked blocks are kept. `qpack_static.go` is generated
   from RFC 9204's text, and `TestQPACKExamples` runs its Appendix B
   examples.
 - **Output and filters:** the text printer writes each call's ends as
   `source > destination`, in the direction the data went (`endpoints` in
-  `output/text.go`). `--brief` (`output/brief.go`) prints one line per call
-  from the same decoders, with a summary per protocol. `--host`, `--port` and
-  `--count` are applied in `main.go` before any printer, so they also limit
-  `--pcap`. A stripped BoringSSL whose functions can't be told apart becomes
-  a `Target` with a `Problem`, which is reported as a warning instead of
-  attached to.
+  `output/text.go`). Text, `--brief` (`output/brief.go`) and JSON run the
+  same decoders (`output/decode.go`). Text and brief leave out calls that
+  only carry connection housekeeping (`decoded.housekeeping`: HTTP/2
+  SETTINGS, WINDOW_UPDATE, PING, PRIORITY, partial header blocks; QUIC
+  packets without HTTP/3, HTTP/3 SETTINGS and stream types) unless
+  `--verbose`, and count them (`Hider`). Text shows a body up to 2 KiB into
+  it (`bodyInfo` tracks each body's content type and offset per stream) and
+  describes binary bodies, unless `--full`. `--host`, `--port` and `--count`
+  are applied in `main.go`, so the first two also limit `--pcap`; `--count`
+  counts the calls shown. A stripped BoringSSL whose functions can't be told
+  apart becomes a `Target` with a `Problem`, which is reported as a warning
+  instead of attached to; one whose HTTP/3 functions weren't found gets
+  `Limits`, also a warning.
+- **Startup:** `main.go` loads the BPF program before discovery, so the
+  error without root comes first, then prints one line summarizing what it
+  attached to (each file with `--verbose`). The help text is written by
+  hand in `usage`; `TestUsage` checks that it lists every flag. With
+  `--comm`, discovery skips other processes and the known programs whose
+  names don't match.
 - **Compressed bodies** (`output/body.go`): a body with a Content-Encoding
   is decompressed as its pieces arrive. Go's decompressors pull from an
   io.Reader, so each runs in a goroutine fed through channels: `push`
@@ -322,7 +353,8 @@ section).
 - **HTTP/3 and bodies need the connection's start:** QPACK and HPACK tables
   are built up over a connection, Firefox's packet keys get their direction
   when created, and a body's decompressor needs its first bytes. Connections
-  that started before snoopy show less.
+  that started before snoopy show frames without headers, and encoded
+  bodies as binary data.
 - **HTTP/1 pipelining:** a response is matched to the last request sent, so
   with pipelined requests a response to HEAD can be taken to have a body.
 - **No socket details** (fd or addresses) for apps that do their own socket
@@ -331,7 +363,6 @@ section).
   - IPv6 end to end: the dev container had IPv6 disabled. Unit tests cover the
     decoding.
   - Kernels 5.8 and 5.9.
-  - The `docker run` example in the README.
 - **Go versions:** Go < 1.17 (amd64) and < 1.18 (arm64) are refused, since
   they predate the register ABI.
 - **Ideas:**

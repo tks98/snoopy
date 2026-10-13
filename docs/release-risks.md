@@ -46,7 +46,7 @@ thing it depends on ships.
 - **How it shows:** the finder needs exactly one candidate for each function,
   so a change usually leaves none, and snoopy warns that the build can't be
   traced and why. A build whose HTTP/3 functions weren't found is attached
-  to with a note saying so. A wrong but unique answer would put probes on the
+  to with a warning saying so. A wrong but unique answer would put probes on the
   wrong function, and answers are cached by build ID until
   `boringSSLCacheVersion` is bumped.
 - **Already seen:** Chrome 156 stopped inlining `ssl_read_impl` into
@@ -94,7 +94,8 @@ thing it depends on ships.
   crypto.
 - **Breaks when:** Mozilla moves neqo to another crypto backend, or a
   connection negotiates ChaCha20-Poly1305, which snoopy doesn't probe.
-- **How it shows:** Firefox's HTTP/3 stops appearing. Nothing says so.
+- **How it shows:** Firefox's HTTP/3 stops appearing. Nothing says so;
+  the warning about connections opened before snoopy only covers those.
 - **Already seen:** on arm64, `AES_AEAD`'s 32-bit length came with garbage in
   the upper half of its stack slot, which dropped most packets until it was
   truncated. Ubuntu's x86-64 freebl starts `FREEBL_GetVector` with `endbr64`,
@@ -152,8 +153,9 @@ thing it depends on ships.
 
 - **TLS libraries with exported functions.** OpenSSL, GnuTLS, NSS, wolfSSL,
   Mbed TLS and s2n-tls are probed at public API functions.
-- **The kernel side.** Socket and process details are read through BTF
-  relocations, and syscall numbers are fixed per architecture. Linux 5.10,
+- **The kernel side.** Socket and process details, and a process's parents
+  for `--pid`, are read through BTF relocations, and syscall numbers are
+  fixed per architecture. Linux 5.10,
   5.15, 6.1, 6.6 and 6.12 pass with the current program, and newer verifiers
   have only grown more lenient.
 - **Protocols and compression.** HTTP/2 with HPACK, QPACK, and gzip, deflate,
@@ -181,7 +183,8 @@ In order of how much each removes.
    `freebl.go` to reading decoded fields instead of printed text.
 3. **Make the QUIC parser keep what it parsed** before an unknown frame,
    instead of dropping the whole packet.
-4. **Warn about the quiet failures.** For example, say so when snoopy is
-   attached to a browser's QUIC functions but its connections keep showing
-   stuck header blocks, or when it attached to Firefox's freebl but captured
-   nothing while Firefox used UDP port 443.
+4. **Warn about the rest of the quiet failures.** snoopy now warns about
+   Firefox's QUIC connections from before it started. It could also say so
+   when a browser's connections keep showing stuck header blocks, or when it
+   attached to Firefox's freebl but captured nothing while Firefox used UDP
+   port 443.
