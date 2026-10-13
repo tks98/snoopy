@@ -262,6 +262,11 @@ The eBPF program is `bpf/snoopy.c`. It is compiled with `bpf2go` into the
 `internal/tracer/snoopy_*_bpfel.{o,go}` files, which are committed so that a
 plain `go build` works.
 
+Some of this depends on other programs' internals, which their new releases
+can change. [docs/release-risks.md](docs/release-risks.md) lists what's likely
+to break and how it would show, and [docs/maintenance.md](docs/maintenance.md)
+explains how each of those parts was found and how to fix it when it breaks.
+
 ## Development
 
 ```bash

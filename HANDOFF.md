@@ -3,7 +3,11 @@
 Notes for picking up work on snoopy, for people and Claude Code sessions:
 where things stand, how the pieces work and why, and what's left. The
 README covers what snoopy does; this covers what to keep in mind when
-changing it.
+changing it. Two more documents cover the parts that depend on other
+programs' internals: [docs/release-risks.md](docs/release-risks.md), what new
+releases are likely to break, and [docs/maintenance.md](docs/maintenance.md),
+how those parts were found and how to fix them, with the tools and commands
+used.
 
 ## Status
 
