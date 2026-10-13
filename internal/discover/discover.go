@@ -71,7 +71,7 @@ type Target struct {
 }
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
-var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libfreeblpriv3.so", "libfreebl3.so", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*"}
+var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libfreeblpriv3.so", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*"}
 
 // knownPrograms are where Chromium-based browsers, Electron apps and
 // Firefox's own NSS libraries are installed. Inspecting them at startup means
