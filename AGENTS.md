@@ -60,6 +60,9 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
 
 - **Output:** the README's examples come from real runs. Update them when the
   text, `--brief` or JSON output changes, and the JSON field table too.
+- **Demo GIF:** `docs/demo.gif` is recorded with `docs/demo/record.sh`.
+  Record it again when the output changes, and read the capture it saves
+  before committing the new one.
 - **Flags:** `--help` is written by hand (`usage` in `main.go`).
   `TestUsage` fails if a flag is missing from it; the README repeats it.
 - **Messages:** docs/maintenance.md's "Which part broke?" table quotes
