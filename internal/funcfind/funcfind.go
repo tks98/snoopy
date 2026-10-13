@@ -190,7 +190,7 @@ func (b *Binary) insts(fn *Func, visit func(ip uint64, inst x86asm.Inst) bool) {
 	text := b.code()
 	body := text[fn.Start-b.textAddr : min(fn.End, b.textAddr+uint64(len(text)))-b.textAddr]
 	for off := 0; off < len(body); {
-		inst, err := x86asm.Decode(body[off:], 64)
+		inst, err := decodeX86(body[off:])
 		if err != nil {
 			off++
 			continue
@@ -367,8 +367,19 @@ func (b *Binary) decode(ip uint64) (x86asm.Inst, bool) {
 	if ip < b.textAddr || ip >= b.textAddr+uint64(len(text)) {
 		return x86asm.Inst{}, false
 	}
-	inst, err := x86asm.Decode(text[ip-b.textAddr:], 64)
+	inst, err := decodeX86(text[ip-b.textAddr:])
 	return inst, err == nil
+}
+
+var endbr64 = []byte{0xf3, 0x0f, 0x1e, 0xfa}
+
+// decodeX86 decodes one instruction, including endbr64 (CET builds start
+// functions with it), which x86asm doesn't know: it's decoded as a no-op.
+func decodeX86(code []byte) (x86asm.Inst, error) {
+	if bytes.HasPrefix(code, endbr64) {
+		return x86asm.Inst{Op: x86asm.NOP, Len: len(endbr64)}, nil
+	}
+	return x86asm.Decode(code, 64)
 }
 
 // BuildID returns the GNU build ID of f, which identifies its exact build,

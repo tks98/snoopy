@@ -53,7 +53,7 @@ func cachedFindBoringSSL(f *elf.File) (map[string]uint64, error) {
 	offsets, err := findBoringSSL(f)
 	if err == nil && file != "" {
 		if data, err := json.Marshal(offsets); err == nil && os.MkdirAll(filepath.Dir(file), 0o755) == nil {
-			os.WriteFile(file, data, 0o644)
+			_ = os.WriteFile(file, data, 0o644) // a cache: failing only costs time
 		}
 	}
 	return offsets, err

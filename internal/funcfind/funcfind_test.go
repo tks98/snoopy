@@ -81,6 +81,7 @@ func testBinary(t *testing.T) (*Binary, map[string]uint64) {
 	a.call("read3")
 	a.call("onearg")
 	a.call("eightargs")
+	a.call("cet3")
 	a.bytes(0xc3) // ret
 	a.align()
 	a.label("report")
@@ -135,6 +136,16 @@ func testBinary(t *testing.T) (*Binary, map[string]uint64) {
 	a.call("helper")
 	a.bytes(0x5d, 0xc3)
 	a.align()
+	// cet3(x, buf, num): like read3 without the check, in a CET build.
+	a.label("cet3")
+	a.bytes(0xf3, 0x0f, 0x1e, 0xfa) // endbr64
+	a.bytes(0x55, 0x48, 0x89, 0xe5) // push rbp; mov rbp, rsp
+	a.bytes(0x89, 0xd3)             // mov ebx, edx
+	a.bytes(0x49, 0x89, 0xf7)       // mov r15, rsi
+	a.bytes(0x49, 0x89, 0xfe)       // mov r14, rdi
+	a.call("helper")
+	a.bytes(0x5d, 0xc3)
+	a.align()
 	code := a.finish()
 
 	return &Binary{
@@ -169,7 +180,7 @@ func TestFind(t *testing.T) {
 	if _, ok := b.FuncAt(0x1001); ok {
 		t.Error("found a function in code without a frame pointer prologue")
 	}
-	if h, ok := b.FuncAt(helper); !ok || h.Callers != 5 {
+	if h, ok := b.FuncAt(helper); !ok || h.Callers != 6 {
 		t.Errorf("helper: %+v %v", h, ok)
 	}
 
@@ -213,6 +224,7 @@ func TestReadsArgs(t *testing.T) {
 		{"onearg", 1, true},
 		{"onearg", 2, false}, // writes esi, edx without reading them
 		{"report", 1, false}, // overwrites edi first
+		{"cet3", 3, true},    // past endbr64
 	} {
 		fn, ok := b.FuncAt(at[tc.fn])
 		if !ok {
