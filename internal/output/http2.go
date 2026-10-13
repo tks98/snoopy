@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 
 	"golang.org/x/net/http2/hpack"
 
@@ -22,6 +23,52 @@ type http2Frame struct {
 	// Headers is the decoded header block, on the HEADERS, PUSH_PROMISE or
 	// CONTINUATION frame that completes it.
 	Headers []hpack.HeaderField
+	// For a body with a Content-Encoding: what this frame's part of it
+	// decoded to, or why it couldn't be.
+	Body bodyPart
+}
+
+// bodyPart is what a piece of a message body decoded to.
+type bodyPart struct {
+	Encoding string // the body's Content-Encoding; empty if it has none
+	Decoded  []byte
+	Err      string
+}
+
+// decodeBody passes a piece of a body to its decoder, ending the body if
+// last is set.
+func decodeBody(dec *bodyDecoder, piece []byte, last bool) bodyPart {
+	if dec == nil {
+		return bodyPart{}
+	}
+	part := bodyPart{Encoding: dec.encoding, Decoded: dec.write(piece)}
+	if last {
+		part.Decoded = append(part.Decoded, dec.end()...)
+	}
+	if err := dec.failed(); err != nil {
+		if dec.reported { // said so already: show the rest as sent
+			return bodyPart{}
+		}
+		part.Err, dec.reported = err.Error(), true
+	}
+	return part
+}
+
+// contentEncoding returns a message's Content-Encoding, if its headers
+// start one with a body: not an interim (1xx) response.
+func contentEncoding(fields []hpack.HeaderField) string {
+	var encoding string
+	for _, f := range fields {
+		switch f.Name {
+		case ":status":
+			if strings.HasPrefix(f.Value, "1") {
+				return ""
+			}
+		case "content-encoding":
+			encoding = f.Value
+		}
+	}
+	return encoding
 }
 
 // http2Conns decodes the HTTP/2 connections seen in events. HPACK
@@ -31,6 +78,7 @@ type http2Frame struct {
 type http2Conns struct {
 	conns map[http2Key]*http2Conn
 	clock uint64 // for evicting the least recently used connection
+	pool  *bodyPool
 }
 
 type http2Key struct {
@@ -45,12 +93,44 @@ type http2Conn struct {
 
 // http2Dir is one direction of a connection, as a byte stream of frames.
 type http2Dir struct {
-	dec        *hpack.Decoder
-	buf        []byte // unparsed bytes, starting at a frame header
-	dataLeft   int    // payload bytes still to come of the current DATA frame
-	dataStream uint32
-	block      []byte // header block being assembled
-	broken     bool
+	dec      *hpack.Decoder
+	buf      []byte // unparsed bytes, starting at a frame header
+	dataLeft int    // payload bytes still to come of the current DATA frame
+	data     dataFrame
+	block    []byte // header block being assembled
+	// The HEADERS frame the block started with: its stream, and whether it
+	// ends the stream.
+	blockStream    uint32
+	blockEndStream bool
+	broken         bool
+	bodies         map[uint32]*bodyDecoder // by stream, for encoded bodies
+}
+
+// dataFrame is the DATA frame being read, to find its body bytes: a padded
+// frame's payload starts with the padding length and ends with padding.
+type dataFrame struct {
+	stream    uint32
+	length    int  // payload length
+	off       int  // payload bytes read so far
+	pad       int  // padding length, -1 until read
+	endStream bool // END_STREAM
+}
+
+// bodyBytes returns the body bytes in the next piece of the frame's payload.
+func (f *dataFrame) bodyBytes(piece []byte) []byte {
+	start := f.off
+	f.off += len(piece)
+	if f.pad == 0 {
+		return piece
+	}
+	if f.pad < 0 && start == 0 && len(piece) > 0 {
+		f.pad = int(piece[0])
+	}
+	lo, hi := max(start, 1), min(f.off, f.length-f.pad)
+	if lo >= hi {
+		return nil
+	}
+	return piece[lo-start : hi-start]
 }
 
 const (
@@ -58,8 +138,8 @@ const (
 	maxHTTP2Pending = 1 << 20 // larger frames than this are given up on
 )
 
-func newHTTP2Conns() *http2Conns {
-	return &http2Conns{conns: map[http2Key]*http2Conn{}}
+func newHTTP2Conns(pool *bodyPool) *http2Conns {
+	return &http2Conns{conns: map[http2Key]*http2Conn{}, pool: pool}
 }
 
 // process returns the frames in an event of a connection whose start was
@@ -85,17 +165,20 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 	}
 
 	missing := max(int(ev.Size)-len(ev.Data), 0) // truncated, dropped or unreadable
-	more, err := d.add(data, missing)
+	more, err := d.add(data, missing, c.pool)
 	if err != nil {
 		d.broken = true
 		d.buf, d.block = nil, nil
+		d.endBodies(err)
 		return nil, false, "HTTP/2 decoding stopped for this direction of the connection: " + err.Error()
 	}
 	return append(frames, more...), true, ""
 }
 
 func (c *http2Conns) start(key http2Key) *http2Conn {
-	if _, ok := c.conns[key]; !ok && len(c.conns) >= maxHTTP2Conns {
+	if old, ok := c.conns[key]; ok {
+		old.close()
+	} else if len(c.conns) >= maxHTTP2Conns {
 		var oldest http2Key
 		var oldestUse uint64 = 1<<64 - 1
 		for k, v := range c.conns {
@@ -103,6 +186,7 @@ func (c *http2Conns) start(key http2Key) *http2Conn {
 				oldest, oldestUse = k, v.lastUsed
 			}
 		}
+		c.conns[oldest].close()
 		delete(c.conns, oldest)
 	}
 	conn := &http2Conn{}
@@ -111,30 +195,61 @@ func (c *http2Conns) start(key http2Key) *http2Conn {
 		// The peer's SETTINGS may allow a larger table; we only listen.
 		dec.SetAllowedMaxDynamicTableSize(1 << 24)
 		conn.dirs[i].dec = dec
+		conn.dirs[i].bodies = map[uint32]*bodyDecoder{}
 	}
 	c.conns[key] = conn
 	return conn
+}
+
+// close gives up on the bodies still being decoded.
+func (conn *http2Conn) close() {
+	for i := range conn.dirs {
+		conn.dirs[i].endBodies(errors.New("connection no longer followed"))
+	}
+}
+
+func (d *http2Dir) endBodies(err error) {
+	for stream, dec := range d.bodies {
+		dec.fail(err)
+		delete(d.bodies, stream)
+	}
 }
 
 // add parses the bytes of one call: data, followed by missing bytes that
 // weren't captured. Missing bytes are fine within the payload of a DATA
 // frame, which isn't needed to follow the connection; anywhere else, the
 // framing or the header table is lost.
-func (d *http2Dir) add(data []byte, missing int) ([]http2Frame, error) {
+func (d *http2Dir) add(data []byte, missing int, pool *bodyPool) ([]http2Frame, error) {
 	var frames []http2Frame
 	d.buf = append(d.buf, data...)
 	for {
 		if d.dataLeft > 0 {
 			n := min(d.dataLeft, len(d.buf))
 			if n > 0 {
-				frames = append(frames, http2Frame{Type: "DATA", Stream: d.dataStream, Continued: true, Data: d.buf[:n]})
+				f := http2Frame{Type: "DATA", Stream: d.data.stream, Continued: true, Data: d.buf[:n]}
 				d.buf, d.dataLeft = d.buf[n:], d.dataLeft-n
+				f.Body = d.dataBody(f.Data)
+				frames = append(frames, f)
 			}
 			if d.dataLeft > 0 { // all captured bytes used up
 				if missing > d.dataLeft {
 					return frames, errors.New("bytes after a DATA frame weren't captured (raise --max-size)")
 				}
+				if dec := d.bodies[d.data.stream]; dec != nil && missing > 0 {
+					dec.fail(errors.New("bytes of the body weren't captured (raise --max-size)"))
+					if p := decodeBody(dec, nil, false); p.Err != "" {
+						if n := len(frames); n > 0 && frames[n-1].Stream == d.data.stream {
+							frames[n-1].Body.Encoding, frames[n-1].Body.Err = p.Encoding, p.Err
+						} else {
+							frames = append(frames, http2Frame{Type: "DATA", Stream: d.data.stream, Continued: true, Body: p})
+						}
+					}
+				}
 				d.dataLeft -= missing
+				d.data.off += missing
+				if d.dataLeft == 0 && d.data.endStream {
+					delete(d.bodies, d.data.stream)
+				}
 				return frames, nil
 			}
 			continue
@@ -153,10 +268,16 @@ func (d *http2Dir) add(data []byte, missing int) ([]http2Frame, error) {
 		}
 		f := http2Frame{Type: http2FrameTypes[typ], Stream: stream, Length: length, Flags: http2FlagNames(typ, flags)}
 		if typ == 0 { // DATA: show the payload as it arrives
+			const endStream, padded = 0x1, 0x8
 			n := min(length, len(d.buf)-9)
 			f.Data = d.buf[9 : 9+n]
+			d.buf, d.dataLeft = d.buf[9+n:], length-n
+			d.data = dataFrame{stream: stream, length: length, endStream: flags&endStream != 0}
+			if flags&padded != 0 {
+				d.data.pad = -1
+			}
+			f.Body = d.dataBody(f.Data)
 			frames = append(frames, f)
-			d.buf, d.dataLeft, d.dataStream = d.buf[9+n:], length-n, stream
 			continue
 		}
 		if len(d.buf) < 9+length {
@@ -170,17 +291,37 @@ func (d *http2Dir) add(data []byte, missing int) ([]http2Frame, error) {
 		}
 		payload := d.buf[9 : 9+length]
 		d.buf = d.buf[9+length:]
-		if err := d.headerBlock(&f, typ, flags, payload); err != nil {
+		if err := d.headerBlock(&f, typ, flags, payload, pool); err != nil {
 			return frames, err
+		}
+		if typ == 3 { // RST_STREAM
+			if dec := d.bodies[stream]; dec != nil {
+				dec.fail(errors.New("the stream was reset"))
+				delete(d.bodies, stream)
+			}
 		}
 		frames = append(frames, f)
 	}
 }
 
+// dataBody decodes the body bytes in a piece of the current DATA frame's
+// payload, if the body has a Content-Encoding.
+func (d *http2Dir) dataBody(piece []byte) bodyPart {
+	stream := d.data.stream
+	body := d.data.bodyBytes(piece)
+	dec := d.bodies[stream]
+	last := d.data.off >= d.data.length && d.data.endStream
+	if last {
+		delete(d.bodies, stream)
+	}
+	return decodeBody(dec, body, last)
+}
+
 // headerBlock collects the header block fragments of HEADERS, PUSH_PROMISE
 // and CONTINUATION frames, and decodes the block once it's complete.
-func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte) error {
+func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *bodyPool) error {
 	const (
+		endStream  = 0x1
 		endHeaders = 0x4
 		padded     = 0x8
 		priority   = 0x20
@@ -203,6 +344,10 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte) error {
 			return fmt.Errorf("%s frame too short", f.Type)
 		}
 		d.block = append(d.block[:0], p[skip:]...)
+		d.blockStream, d.blockEndStream = 0, false
+		if typ == 1 {
+			d.blockStream, d.blockEndStream = f.Stream, flags&endStream != 0
+		}
 	case 9: // CONTINUATION
 		d.block = append(d.block, p...)
 	default:
@@ -217,5 +362,21 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte) error {
 		return fmt.Errorf("can't decode header block: %v", err)
 	}
 	f.Headers = fields
+	if stream := d.blockStream; stream != 0 {
+		dec := d.bodies[stream]
+		if dec == nil { // not trailers
+			if enc := contentEncoding(fields); enc != "" && !d.blockEndStream {
+				if dec := pool.start(enc); dec != nil {
+					d.bodies[stream] = dec
+					if err := dec.failed(); err != nil {
+						f.Body = bodyPart{Encoding: enc, Err: err.Error()}
+					}
+				}
+			}
+		} else if d.blockEndStream { // trailers end the body
+			delete(d.bodies, stream)
+			f.Body = decodeBody(dec, nil, true)
+		}
+	}
 	return nil
 }

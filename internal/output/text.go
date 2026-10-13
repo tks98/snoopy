@@ -23,6 +23,7 @@ type Printer interface {
 type Text struct {
 	w    io.Writer
 	hex  bool
+	h1   *http1Conns
 	h2   *http2Conns
 	quic *quicConns
 
@@ -35,11 +36,13 @@ func NewText(w io.Writer, hex bool) *Text {
 	s := func(attrs ...color.Attribute) func(a ...any) string {
 		return color.New(attrs...).SprintFunc()
 	}
+	pool := newBodyPool()
 	return &Text{
 		w:      w,
 		hex:    hex,
-		h2:     newHTTP2Conns(),
-		quic:   newQUICConns(),
+		h1:     newHTTP1Conns(pool),
+		h2:     newHTTP2Conns(pool),
+		quic:   newQUICConns(pool),
 		dim:    s(color.Faint),
 		title:  s(color.Bold),
 		fn:     s(color.FgHiMagenta, color.Bold),
@@ -91,9 +94,16 @@ func (t *Text) Print(ev *tracer.Event) error {
 		if note != "" {
 			fmt.Fprintln(&b, t.warn("["+note+"]"))
 		}
-		if isHTTP2 && !t.hex {
+		var segs []http1Segment
+		if !isHTTP2 {
+			segs = t.h1.process(ev)
+		}
+		switch {
+		case isHTTP2 && !t.hex:
 			t.writeHTTP2(&b, frames, len(ev.Data))
-		} else {
+		case decodesBody(segs) && !t.hex:
+			t.writeHTTP1(&b, segs)
+		default:
 			t.writePayload(&b, ev.Data)
 		}
 	}
@@ -134,6 +144,51 @@ func (t *Text) writePayload(b *strings.Builder, data []byte) {
 	t.writeBody(b, data)
 }
 
+// writeHTTP1 prints HTTP/1.x messages whose bodies are being decoded.
+func (t *Text) writeHTTP1(b *strings.Builder, segs []http1Segment) {
+	for i, s := range segs {
+		switch {
+		case s.msg != nil:
+			b.WriteString(t.title(escapeText([]byte(s.msg.startLine))) + "\n")
+			for _, h := range s.msg.headers {
+				fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h[0]))), escapeText([]byte(h[1])))
+			}
+			if s.msg.complete && i+1 < len(segs) {
+				b.WriteString("\n")
+			}
+		case s.body.Encoding != "":
+			t.writeBodyPart(b, s.raw, s.body)
+		case len(s.raw) > 0:
+			t.writeBody(b, s.raw)
+		}
+	}
+}
+
+func decodesBody(segs []http1Segment) bool {
+	for _, s := range segs {
+		if s.body.Encoding != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// writeBodyPart prints a piece of an encoded body as what it decoded to, or
+// as sent if it couldn't be decoded.
+func (t *Text) writeBodyPart(b *strings.Builder, raw []byte, part bodyPart) {
+	if part.Err != "" {
+		b.WriteString(t.warn(fmt.Sprintf("[%s body not decoded: %s]", part.Encoding, part.Err)) + "\n")
+		if len(raw) > 0 {
+			t.writeBody(b, raw)
+		}
+		return
+	}
+	b.WriteString(t.dim(fmt.Sprintf("[%s: %d bytes decoded to %d]", part.Encoding, len(raw), len(part.Decoded))) + "\n")
+	if len(part.Decoded) > 0 {
+		t.writeBody(b, part.Decoded)
+	}
+}
+
 // writeHTTP2 prints the frames of an HTTP/2 connection, with their decoded
 // headers.
 func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int) {
@@ -160,7 +215,10 @@ func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int)
 		for _, h := range f.Headers {
 			fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), escapeText([]byte(h.Value)))
 		}
-		if len(f.Data) > 0 {
+		switch {
+		case f.Body.Encoding != "":
+			t.writeBodyPart(b, f.Data, f.Body)
+		case len(f.Data) > 0:
 			t.writeBody(b, f.Data)
 		}
 	}
@@ -189,6 +247,9 @@ func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
 			for _, h := range it.Headers {
 				fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), escapeText([]byte(h.Value)))
 			}
+			if it.Body.Encoding != "" {
+				t.writeBodyPart(b, nil, it.Body)
+			}
 		case it.HTTP3 == "SETTINGS":
 			b.WriteString(t.dim(line+" "+string(it.Data)) + "\n")
 		default:
@@ -196,7 +257,10 @@ func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
 				line += fmt.Sprintf(" (%d bytes)", len(it.Data))
 			}
 			b.WriteString(t.dim(line) + "\n")
-			if len(it.Data) > 0 {
+			switch {
+			case it.Body.Encoding != "":
+				t.writeBodyPart(b, it.Data, it.Body)
+			case len(it.Data) > 0:
 				t.writeBody(b, it.Data)
 			}
 		}

@@ -48,8 +48,9 @@ server: cloudflare
 - **Connection details:** process, thread, socket and local and remote
   address for every call, plus the container ID when the process runs in one.
 - **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 and HTTP/3 are
-  shown frame by frame with their headers decoded (HPACK, QPACK), and binary
-  data is hex-dumped. With
+  shown frame by frame with their headers decoded (HPACK, QPACK), bodies
+  compressed with gzip, deflate, Brotli or zstd are shown decompressed as
+  they arrive, and binary data is hex-dumped. With
   `--json` you get one JSON object per line instead.
 - **Wireshark:** `--pcap` writes the plaintext as TCP streams so Wireshark
   can dissect the application protocol.
@@ -152,9 +153,10 @@ Each line is one call to a TLS read or write function:
 | `incomplete` | Set when part of the payload was dropped because the ring buffer was full. |
 | `read_error` | Set when the payload couldn't be read from the process's memory. |
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. |
-| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call) and decoded `headers` (`name`, `value`). Only for connections whose start snoopy saw: HPACK compresses headers against a table built up over the connection. |
+| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`) and `body` (see below). Only for connections whose start snoopy saw: HPACK compresses headers against a table built up over the connection. |
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
-| `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers` and an `error` if they couldn't be decoded. |
+| `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
+| `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
 
 Fields that don't apply are left out.
 

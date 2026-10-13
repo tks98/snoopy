@@ -92,7 +92,7 @@ func TestHTTP2Headers(t *testing.T) {
 	// Clients write the 24-byte connection preface in one call; after it,
 	// frames may be split anywhere.
 	for _, sizes := range [][]int{{1 << 20}, {24, 1}, {30, 7, 13, 1000}, {50}} {
-		c := newHTTP2Conns()
+		c := newHTTP2Conns(newBodyPool())
 		got := headersOf(t, c, events(tracer.FuncSSLWrite, client.buf.Bytes(), sizes...))
 		want := [][]string{
 			{":method: GET", ":path: /a", ":authority: example.com", "x-snoopy: one"},
@@ -122,7 +122,7 @@ func TestHTTP2MissingBytes(t *testing.T) {
 	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: server.block(":status", "204"), EndHeaders: true, EndStream: true})
 	b := server.buf.Bytes()
 
-	c := newHTTP2Conns()
+	c := newHTTP2Conns(newBodyPool())
 	c.start(http2Key{7, 0x1000}) // as if the client's preface was seen
 	// One call returns everything, but only the first 100 bytes are captured.
 	ev := &tracer.Event{PID: 7, ConnID: 0x1000, Function: tracer.FuncSSLRead, Size: uint32(len(b)), Data: b[:100]}
@@ -130,7 +130,7 @@ func TestHTTP2MissingBytes(t *testing.T) {
 		t.Errorf("hole across frames: ok %v, note %q", ok, note)
 	}
 
-	c = newHTTP2Conns()
+	c = newHTTP2Conns(newBodyPool())
 	c.start(http2Key{7, 0x1000})
 	dataEnd := len(b) - 9 - 1 // the last HEADERS frame: 9-byte header, 1-byte block
 	evs := []*tracer.Event{
@@ -145,7 +145,7 @@ func TestHTTP2MissingBytes(t *testing.T) {
 func TestHTTP2NeedsConnectionStart(t *testing.T) {
 	server := newHTTP2Writer(false)
 	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: server.block(":status", "200"), EndHeaders: true})
-	c := newHTTP2Conns()
+	c := newHTTP2Conns(newBodyPool())
 	for _, ev := range events(tracer.FuncSSLRead, server.buf.Bytes(), 1<<20) {
 		if _, ok, _ := c.process(ev); ok {
 			t.Error("decoded a connection whose start wasn't seen")

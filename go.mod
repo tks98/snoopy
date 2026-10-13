@@ -3,8 +3,10 @@ module github.com/tks98/snoopy
 go 1.25.0
 
 require (
+	github.com/andybalholm/brotli v1.2.5
 	github.com/cilium/ebpf v0.22.0
 	github.com/fatih/color v1.19.0
+	github.com/klauspost/compress v1.20.1
 	golang.org/x/arch v0.30.0
 	golang.org/x/net v0.48.0
 	golang.org/x/sys v0.43.0

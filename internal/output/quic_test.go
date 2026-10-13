@@ -85,7 +85,7 @@ func http3OfEvent(t *testing.T, c *quicConns, ev *tracer.Event) []string {
 }
 
 func TestHTTP3(t *testing.T) {
-	c := newQUICConns()
+	c := newQUICConns(newBodyPool())
 	ack := []byte{0x02, 0x05, 0x00, 0x00, 0x00} // ACK largest=5, no extra ranges
 
 	// Control stream (client unidirectional stream 2) with SETTINGS.
@@ -152,7 +152,7 @@ func TestQUICFrameSummaries(t *testing.T) {
 // contexts each uses, and the QPACK table of one is bounded by the other's
 // SETTINGS.
 func TestQUICConnectionBySocket(t *testing.T) {
-	c := newQUICConns()
+	c := newQUICConns(newBodyPool())
 	local := netip.MustParseAddrPort("10.0.0.2:5000")
 	ev := func(fn tracer.Function, ctx uint64, local netip.AddrPort, data []byte) *tracer.Event {
 		e := quicEvent(fn, data)
@@ -198,7 +198,7 @@ func TestQUICConnectionBySocket(t *testing.T) {
 // A connection moving to a new socket keeps its streams; a closed one's
 // keys being reused on a new socket don't.
 func TestQUICMigration(t *testing.T) {
-	c := newQUICConns()
+	c := newQUICConns(newBodyPool())
 	now := time.Now()
 	ev := func(fd int32, port uint16, ctx uint64, at time.Duration, data []byte) *tracer.Event {
 		e := quicEvent(tracer.FuncQUICRecv, data)

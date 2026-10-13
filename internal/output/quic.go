@@ -22,8 +22,9 @@ type quicItem struct {
 	HTTP3   string // frame type, e.g. "HEADERS"
 	Stream  uint64
 	Headers []hpack.HeaderField
-	Data    []byte // DATA payload, or a summary's details
-	Err     string // why a HEADERS frame couldn't be decoded
+	Data    []byte   // DATA payload, or a summary's details
+	Err     string   // why a HEADERS frame couldn't be decoded
+	Body    bodyPart // what an encoded body's DATA decoded to
 }
 
 // quicConns follows the HTTP/3 traffic in QUIC packets. Packets are
@@ -38,6 +39,7 @@ type quicConns struct {
 	dirs   map[quicKey]*quicDir // several keys share one after a migration
 	locals map[quicKey]netip.AddrPort
 	clock  uint64
+	pool   *bodyPool
 }
 
 type quicKey struct {
@@ -59,10 +61,13 @@ type quicDir struct {
 	// SETTINGS, which bounds the other direction's dynamic table; -1 if not
 	// seen.
 	maxTableCapacity int64
+	bodies           map[uint64]*bodyDecoder // by stream, for encoded bodies
+	pool             *bodyPool
 }
 
-func newQUICDir() *quicDir {
-	return &quicDir{streams: map[uint64]*quicStream{}, maxTableCapacity: -1}
+func newQUICDir(pool *bodyPool) *quicDir {
+	return &quicDir{streams: map[uint64]*quicStream{}, maxTableCapacity: -1,
+		bodies: map[uint64]*bodyDecoder{}, pool: pool}
 }
 
 func quicKeyOf(ev *tracer.Event) quicKey {
@@ -88,6 +93,9 @@ type quicStream struct {
 	uniType  int64             // a unidirectional stream's type once read; -1 before
 	dataLeft uint64            // payload bytes still to come of the current DATA frame
 	broken   bool
+	finSeen  bool   // the stream's final size is known
+	final    uint64 // and is this
+	dataSeen bool   // a DATA frame was read
 }
 
 const (
@@ -101,8 +109,8 @@ const (
 // context's memory may be reused by a later connection.
 const migrationWindow = 10 * time.Second
 
-func newQUICConns() *quicConns {
-	return &quicConns{dirs: map[quicKey]*quicDir{}, locals: map[quicKey]netip.AddrPort{}}
+func newQUICConns(pool *bodyPool) *quicConns {
+	return &quicConns{dirs: map[quicKey]*quicDir{}, locals: map[quicKey]netip.AddrPort{}, pool: pool}
 }
 
 // dir returns the state for an event's direction of its connection.
@@ -126,7 +134,7 @@ func (c *quicConns) dir(key quicKey, ev *tracer.Event) *quicDir {
 		if len(c.dirs) >= maxQUICDirs {
 			c.evict()
 		}
-		d = newQUICDir()
+		d = newQUICDir(c.pool)
 	}
 	c.dirs[key] = d
 	if ev.Local.IsValid() {
@@ -420,6 +428,9 @@ func (d *quicDir) streamData(sf streamFrame) []quicItem {
 	if s.broken {
 		return nil
 	}
+	if sf.fin {
+		s.finSeen, s.final = true, sf.offset+uint64(len(sf.data))
+	}
 	// Keep what's ahead, drop what's already delivered (retransmissions).
 	data, off := sf.data, sf.offset
 	if off < s.next {
@@ -435,6 +446,10 @@ func (d *quicDir) streamData(sf streamFrame) []quicItem {
 		}
 		if s.pending > maxQUICStreamEarly {
 			s.broken = true
+			if dec := d.bodies[sf.id]; dec != nil {
+				dec.fail(errors.New("too much of the stream arrived out of order"))
+				delete(d.bodies, sf.id)
+			}
 			return []quicItem{{HTTP3: "(stream given up)", Stream: sf.id, Err: "too much data arrived out of order"}}
 		}
 		return nil
@@ -466,7 +481,23 @@ func (d *quicDir) streamData(sf streamFrame) []quicItem {
 		s.buf = append(s.buf, next...)
 		s.next += uint64(len(next))
 	}
-	return d.http3(sf.id, s)
+	items := d.http3(sf.id, s)
+	if dec := d.bodies[sf.id]; dec != nil && s.finSeen && s.next >= s.final {
+		delete(d.bodies, sf.id)
+		end := decodeBody(dec, nil, true)
+		if len(end.Decoded) == 0 && end.Err == "" {
+			return items
+		}
+		for i := len(items) - 1; i >= 0; i-- {
+			if it := &items[i]; it.Stream == sf.id && it.Body.Encoding != "" {
+				it.Body.Decoded = append(it.Body.Decoded, end.Decoded...)
+				it.Body.Err = end.Err
+				return items
+			}
+		}
+		items = append(items, quicItem{HTTP3: "DATA (end)", Stream: sf.id, Body: end})
+	}
+	return items
 }
 
 // http3 parses the HTTP/3 frames in a stream's delivered bytes (RFC 9114).
@@ -506,7 +537,8 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 	for len(s.buf) > 0 {
 		if s.dataLeft > 0 { // more of a DATA frame
 			n := min(s.dataLeft, uint64(len(s.buf)))
-			items = append(items, quicItem{HTTP3: "DATA (continued)", Stream: id, Data: s.buf[:n]})
+			items = append(items, quicItem{HTTP3: "DATA (continued)", Stream: id, Data: s.buf[:n],
+				Body: decodeBody(d.bodies[id], s.buf[:n], false)})
 			s.buf, s.dataLeft = s.buf[n:], s.dataLeft-n
 			continue
 		}
@@ -520,8 +552,10 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 		}
 		header := n + m
 		if typ == 0x00 { // DATA: show the payload as it arrives
+			s.dataSeen = true
 			avail := min(length, uint64(len(s.buf)-header))
-			items = append(items, quicItem{HTTP3: "DATA", Stream: id, Data: s.buf[header : header+int(avail)]})
+			data := s.buf[header : header+int(avail)]
+			items = append(items, quicItem{HTTP3: "DATA", Stream: id, Data: data, Body: decodeBody(d.bodies[id], data, false)})
 			s.buf, s.dataLeft = s.buf[header+int(avail):], length-avail
 			continue
 		}
@@ -563,7 +597,33 @@ func (d *quicDir) headers(id uint64, block []byte) quicItem {
 	if err != nil {
 		return quicItem{HTTP3: "HEADERS", Stream: id, Err: err.Error()}
 	}
-	return quicItem{HTTP3: "HEADERS", Stream: id, Headers: fields}
+	item := quicItem{HTTP3: "HEADERS", Stream: id, Headers: fields}
+	item.Body = d.startBody(id, fields)
+	return item
+}
+
+// startBody starts decoding the body of a request or response whose
+// headers give it a Content-Encoding. Headers after the body has started
+// are trailers.
+func (d *quicDir) startBody(id uint64, fields []hpack.HeaderField) bodyPart {
+	// Header blocks waiting for QPACK data are decoded late; if the body
+	// went by meanwhile, it's too late to decode it.
+	if s := d.streams[id]; d.bodies[id] != nil || s != nil && s.dataSeen {
+		return bodyPart{}
+	}
+	enc := contentEncoding(fields)
+	if enc == "" {
+		return bodyPart{}
+	}
+	dec := d.pool.start(enc)
+	if dec == nil {
+		return bodyPart{}
+	}
+	d.bodies[id] = dec
+	if err := dec.failed(); err != nil {
+		return bodyPart{Encoding: enc, Err: err.Error()}
+	}
+	return bodyPart{}
 }
 
 // retryBlocked decodes the header blocks that the encoder stream data just
@@ -579,7 +639,9 @@ func (d *quicDir) retryBlocked() []quicItem {
 		case err != nil:
 			items = append(items, quicItem{HTTP3: "HEADERS", Stream: b.stream, Err: err.Error()})
 		default:
-			items = append(items, quicItem{HTTP3: "HEADERS", Stream: b.stream, Headers: fields})
+			item := quicItem{HTTP3: "HEADERS", Stream: b.stream, Headers: fields}
+			item.Body = d.startBody(b.stream, fields)
+			items = append(items, item)
 		}
 	}
 	d.blocked = still

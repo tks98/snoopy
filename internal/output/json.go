@@ -1,6 +1,7 @@
 package output
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 // JSON prints one JSON object per line (NDJSON).
 type JSON struct {
 	enc  *json.Encoder
+	h1   *http1Conns
 	h2   *http2Conns
 	quic *quicConns
 }
@@ -20,7 +22,8 @@ type JSON struct {
 func NewJSON(w io.Writer) *JSON {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	return &JSON{enc: enc, h2: newHTTP2Conns(), quic: newQUICConns()}
+	pool := newBodyPool()
+	return &JSON{enc: enc, h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool)}
 }
 
 // jsonEvent is the documented JSON schema; see README.md.
@@ -53,6 +56,32 @@ type jsonEvent struct {
 	// For QUIC packets: the frames, and the HTTP/3 frames they completed.
 	QUICFrames []string         `json:"quic_frames,omitempty"`
 	HTTP3      []jsonHTTP3Frame `json:"http3,omitempty"`
+	// For HTTP/1.x: what the bytes of an encoded body in the data decoded to.
+	Body *jsonBody `json:"body,omitempty"`
+}
+
+// jsonBody is what a piece of a body with a Content-Encoding decoded to.
+type jsonBody struct {
+	ContentEncoding string  `json:"content_encoding"`
+	Decoded         *string `json:"decoded,omitempty"`
+	DecodedBase64   []byte  `json:"decoded_base64,omitempty"`
+	Error           string  `json:"error,omitempty"`
+}
+
+func newJSONBody(p bodyPart) *jsonBody {
+	if p.Encoding == "" {
+		return nil
+	}
+	jb := &jsonBody{ContentEncoding: p.Encoding, Error: p.Err}
+	if len(p.Decoded) > 0 {
+		if utf8.Valid(p.Decoded) {
+			s := string(p.Decoded)
+			jb.Decoded = &s
+		} else {
+			jb.DecodedBase64 = p.Decoded
+		}
+	}
+	return jb
 }
 
 type jsonHTTP3Frame struct {
@@ -61,6 +90,7 @@ type jsonHTTP3Frame struct {
 	DataBytes int          `json:"data_bytes,omitempty"`
 	Headers   []jsonHeader `json:"headers,omitempty"`
 	Error     string       `json:"error,omitempty"`
+	Body      *jsonBody    `json:"body,omitempty"`
 }
 
 type jsonHTTP2Frame struct {
@@ -71,6 +101,7 @@ type jsonHTTP2Frame struct {
 	Continued bool         `json:"continued,omitempty"`
 	DataBytes int          `json:"data_bytes,omitempty"`
 	Headers   []jsonHeader `json:"headers,omitempty"`
+	Body      *jsonBody    `json:"body,omitempty"`
 }
 
 type jsonHeader struct {
@@ -121,7 +152,7 @@ func (j *JSON) Print(ev *tracer.Event) error {
 				out.QUICFrames = append(out.QUICFrames, it.Frame)
 				continue
 			}
-			jf := jsonHTTP3Frame{Type: it.HTTP3, Stream: it.Stream, DataBytes: len(it.Data), Error: it.Err}
+			jf := jsonHTTP3Frame{Type: it.HTTP3, Stream: it.Stream, DataBytes: len(it.Data), Error: it.Err, Body: newJSONBody(it.Body)}
 			for _, h := range it.Headers {
 				jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
 			}
@@ -129,10 +160,23 @@ func (j *JSON) Print(ev *tracer.Event) error {
 		}
 		return j.enc.Encode(out)
 	}
-	frames, _, note := j.h2.process(ev)
+	frames, isHTTP2, note := j.h2.process(ev)
 	out.HTTP2Error = note
+	if !isHTTP2 {
+		// Encoded bodies' pieces in the event, decoded, as one.
+		var body bodyPart
+		for _, s := range j.h1.process(ev) {
+			if s.body.Encoding != "" {
+				body.Encoding = s.body.Encoding
+				body.Decoded = append(body.Decoded, s.body.Decoded...)
+				body.Err = cmp.Or(body.Err, s.body.Err)
+			}
+		}
+		out.Body = newJSONBody(body)
+	}
 	for _, f := range frames {
-		jf := jsonHTTP2Frame{Type: f.Type, Stream: f.Stream, Length: f.Length, Flags: f.Flags, Continued: f.Continued, DataBytes: len(f.Data)}
+		jf := jsonHTTP2Frame{Type: f.Type, Stream: f.Stream, Length: f.Length, Flags: f.Flags, Continued: f.Continued,
+			DataBytes: len(f.Data), Body: newJSONBody(f.Body)}
 		for _, h := range f.Headers {
 			jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
 		}

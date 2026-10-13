@@ -241,6 +241,19 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
   SETTINGS; without them it assumes no wrap. `qpack_static.go` is generated
   from RFC 9204's text, and `TestQPACKExamples` runs its Appendix B
   examples.
+- **Compressed bodies** (`output/body.go`): a body with a Content-Encoding
+  is decompressed as its pieces arrive. Go's decompressors pull from an
+  io.Reader, so each runs in a goroutine fed through channels: `push`
+  returns once the decompressor asks for more input, by which time it has
+  produced all it can (gzip's multistream mode is off, since it would hold
+  the last bytes back while looking for another member; zstd decodes whole
+  blocks of up to 128 KiB). `bodyPool` caps live decompressors at 256
+  (least recently used ones are given up on) and each body at 16 MiB.
+  HTTP/2 and HTTP/3 find the encoding in a stream's HEADERS and end the body
+  at END_STREAM or FIN; HTTP/1 (`output/http1.go`) follows messages per
+  connection: Content-Length, chunked framing, until close, no body for HEAD
+  responses, 1xx, 204 and 304, and it stops at 101 and CONNECT. Bytes that
+  weren't captured stop a body's decoding, said once.
 - **x86 testing on an Apple Silicon Mac:** `limactl start --arch=x86_64
   --vm-type=qemu template://ubuntu-24.04` gives an emulated x86 VM where
   uprobes work (Docker's amd64 emulation is user-space only). Slow, but fine
