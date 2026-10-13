@@ -48,14 +48,16 @@ On Linux 5.10 or later, x86_64 or arm64, with Go 1.25 or later:
 
 ```bash
 go install github.com/tks98/snoopy/v2@latest
-sudo "$(go env GOPATH)/bin/snoopy" --brief
+sudo install "$(go env GOPATH)/bin/snoopy" /usr/local/bin/
+sudo snoopy --brief
 ```
 
 Then run `curl https://example.com` in another terminal. snoopy needs root,
-and `sudo` doesn't search your Go bin directory, hence the full path. To
-trace one program, name it: `--comm curl`, `--comm firefox`, `--comm chrome`.
-Binaries are on the [releases page](https://github.com/tks98/snoopy/releases)
-once a version is tagged.
+and `sudo` only looks for programs in a few system directories, not in Go's,
+hence the copy to `/usr/local/bin`. To trace one program, name it:
+`--comm curl`, `--comm firefox`, `--comm chrome`. Without Go, download a
+binary from the [releases page](https://github.com/tks98/snoopy/releases)
+instead (see [Install](#install)).
 
 ## Features
 
@@ -102,18 +104,26 @@ once a version is tagged.
 
 ## Install
 
-With Go 1.25 or later:
+Download the archive for your architecture (`linux_amd64` or `linux_arm64`)
+from the [releases page](https://github.com/tks98/snoopy/releases), unpack it,
+and copy the binary to where `sudo` finds it:
+
+```bash
+tar xzf snoopy_*_linux_amd64.tar.gz snoopy
+sudo install snoopy /usr/local/bin/
+```
+
+Or build it with Go 1.25 or later:
 
 ```bash
 go install github.com/tks98/snoopy/v2@latest
+sudo install "$(go env GOPATH)/bin/snoopy" /usr/local/bin/
 ```
 
-This builds the committed eBPF objects into the binary, so it needs no
-compiler or kernel headers. `sudo snoopy` won't find it, since `sudo` uses its
-own `PATH`; run `sudo "$(go env GOPATH)/bin/snoopy"`, or copy the binary
-somewhere like `/usr/local/bin`. Or clone the repository and run
-`make build`. Tagged versions also come as binaries on the
-[releases page](https://github.com/tks98/snoopy/releases).
+`go install` puts the binary in Go's bin directory, which `sudo` doesn't
+search, so `sudo snoopy` alone would say "command not found"; hence the
+copy. The committed eBPF objects are built into the binary, so neither way
+needs a compiler or kernel headers. To build from a clone, run `make build`.
 
 ## Usage
 
@@ -329,8 +339,9 @@ example), programs that use OpenSSL only through its BIO layer (e.g.
 
 ## Troubleshooting
 
-**`sudo: snoopy: command not found`** after `go install`: `sudo` doesn't
-search your Go bin directory. Run `sudo "$(go env GOPATH)/bin/snoopy"`.
+**`sudo snoopy` says command not found** after `go install`: `sudo` doesn't
+search Go's bin directory. Copy the binary to one it does search, once:
+`sudo install "$(go env GOPATH)/bin/snoopy" /usr/local/bin/`.
 
 **Nothing from a browser, or HTTP/2 frames without headers.** Browsers keep
 connections open for minutes, and snoopy can't decode the headers of a
