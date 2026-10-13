@@ -5,6 +5,12 @@ certificates, proxies or changes to the applications. It uses eBPF uprobes on
 the functions applications call to send and receive data through their TLS
 library, so it sees the data before it is encrypted and after it is decrypted.
 
+![snoopy in one terminal and Chromium, opened from another, loading pages while their requests and responses scroll by](docs/demo.gif)
+
+Chromium loading example.com and Cloudflare's test page over HTTP/3, and
+Wikipedia over HTTP/2, recorded with
+[docs/demo/record.sh](docs/demo/record.sh).
+
 ```console
 $ sudo snoopy
 snoopy: attached to the openssl and gnutls libraries, and to the program chrome (--verbose lists every file)
