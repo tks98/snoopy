@@ -265,8 +265,8 @@ func (d *qpackDecoder) requiredInsertCount(encoded uint64) (int, error) {
 	if encoded == 0 {
 		return 0, nil
 	}
-	if d.maxEntries <= 0 {
-		return int(min(encoded, 1<<40)) - 1, nil
+	if d.maxEntries <= 0 { // the table's capacity is unknown: assume no wrapping
+		return max(int(min(encoded, 1<<40))-1, 1), nil
 	}
 	fullRange := 2 * d.maxEntries
 	if encoded > uint64(fullRange) {

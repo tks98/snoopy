@@ -133,6 +133,8 @@ struct files_struct {
 struct task_struct {
 	struct files_struct *files;
 	struct task_struct *group_leader;
+	struct task_struct *real_parent;
+	__s32 tgid; // pid_t
 	char comm[16];
 } __attribute__((preserve_access_index));
 

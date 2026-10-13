@@ -8,22 +8,19 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // JSON prints one JSON object per line (NDJSON).
 type JSON struct {
-	enc  *json.Encoder
-	h1   *http1Conns
-	h2   *http2Conns
-	quic *quicConns
+	enc *json.Encoder
+	dec decoders
 }
 
 func NewJSON(w io.Writer) *JSON {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	pool := newBodyPool()
-	return &JSON{enc: enc, h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool)}
+	return &JSON{enc: enc, dec: newDecoders()}
 }
 
 // jsonEvent is the documented JSON schema; see README.md.
@@ -50,7 +47,9 @@ type jsonEvent struct {
 	// set when bytes were captured.
 	Data       *string `json:"data,omitempty"`
 	DataBase64 []byte  `json:"data_base64,omitempty"`
-	// The HTTP/2 frames in the data, for connections whose start was seen.
+	// The HTTP/2 frames in the data. A connection that started before
+	// snoopy is followed from a call that starts with a frame, and its
+	// headers can't be decoded.
 	HTTP2      []jsonHTTP2Frame `json:"http2,omitempty"`
 	HTTP2Error string           `json:"http2_error,omitempty"`
 	// For QUIC packets: the frames, and the HTTP/3 frames they completed.
@@ -101,7 +100,10 @@ type jsonHTTP2Frame struct {
 	Continued bool         `json:"continued,omitempty"`
 	DataBytes int          `json:"data_bytes,omitempty"`
 	Headers   []jsonHeader `json:"headers,omitempty"`
-	Body      *jsonBody    `json:"body,omitempty"`
+	// A header block that couldn't be decoded, because the connection
+	// started before snoopy.
+	HeadersNotDecoded bool      `json:"headers_not_decoded,omitempty"`
+	Body              *jsonBody `json:"body,omitempty"`
 }
 
 type jsonHeader struct {
@@ -145,9 +147,9 @@ func (j *JSON) Print(ev *tracer.Event) error {
 			out.DataBase64 = ev.Data
 		}
 	}
-	if ev.Function.IsQUIC() {
-		items, _ := j.quic.process(ev)
-		for _, it := range items {
+	dc := j.dec.decode(ev)
+	if dc.isQUIC {
+		for _, it := range dc.quic {
 			if it.Frame != "" {
 				out.QUICFrames = append(out.QUICFrames, it.Frame)
 				continue
@@ -160,12 +162,11 @@ func (j *JSON) Print(ev *tracer.Event) error {
 		}
 		return j.enc.Encode(out)
 	}
-	frames, isHTTP2, note := j.h2.process(ev)
-	out.HTTP2Error = note
-	if !isHTTP2 {
+	if !dc.isHTTP2 {
+		out.HTTP2Error = dc.note
 		// Encoded bodies' pieces in the event, decoded, as one.
 		var body bodyPart
-		for _, s := range j.h1.process(ev) {
+		for _, s := range dc.http1 {
 			if s.body.Encoding != "" {
 				body.Encoding = s.body.Encoding
 				body.Decoded = append(body.Decoded, s.body.Decoded...)
@@ -174,9 +175,9 @@ func (j *JSON) Print(ev *tracer.Event) error {
 		}
 		out.Body = newJSONBody(body)
 	}
-	for _, f := range frames {
+	for _, f := range dc.http2 {
 		jf := jsonHTTP2Frame{Type: f.Type, Stream: f.Stream, Length: f.Length, Flags: f.Flags, Continued: f.Continued,
-			DataBytes: len(f.Data), Body: newJSONBody(f.Body)}
+			DataBytes: len(f.Data), HeadersNotDecoded: f.HeadersLost, Body: newJSONBody(f.Body)}
 		for _, h := range f.Headers {
 			jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
 		}

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/netip"
 	"strings"
 	"testing"
@@ -11,7 +13,7 @@ import (
 
 	"github.com/fatih/color"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 func init() {
@@ -74,24 +76,18 @@ func TestParseHTTP1(t *testing.T) {
 	}
 }
 
-func TestSummarizeHTTP2(t *testing.T) {
-	frames := http2Preface +
-		"\x00\x00\x06\x04\x00\x00\x00\x00\x00" + "\x00\x03\x00\x00\x00\x64" + // SETTINGS
-		"\x00\x00\x02\x01\x05\x00\x00\x00\x01" + "\x82\x84" // HEADERS, END_STREAM|END_HEADERS
-	got := strings.Join(summarizeHTTP2([]byte(frames)), "; ")
-	want := "connection preface; SETTINGS stream=0 length=6; HEADERS stream=1 length=2 [END_STREAM,END_HEADERS]"
-	if got != want {
-		t.Errorf("got %q\nwant %q", got, want)
-	}
-
+func TestHTTP2Aligned(t *testing.T) {
 	ping := "\x00\x00\x08\x06\x00\x00\x00\x00\x00" + "12345678"
-	cut := summarizeHTTP2([]byte(ping + "\x00\x00\x10\x00\x01\x00\x00\x00\x03abc"))
-	if len(cut) != 2 || cut[1] != "DATA stream=3 length=16 [END_STREAM] (cut off)" {
-		t.Errorf("cut-off frame: %q", cut)
-	}
-	partial := summarizeHTTP2([]byte(ping + "\x00\x00"))
-	if len(partial) != 2 || partial[1] != "2 bytes of the next frame" {
-		t.Errorf("partial header: %q", partial)
+	for name, in := range map[string]string{
+		"frames": "\x00\x00\x06\x04\x00\x00\x00\x00\x00" + "\x00\x03\x00\x00\x00\x64" + // SETTINGS
+			"\x00\x00\x02\x01\x05\x00\x00\x00\x01" + "\x82\x84", // HEADERS, END_STREAM|END_HEADERS
+		"cut-off frame":  ping + "\x00\x00\x10\x00\x01\x00\x00\x00\x03abc",
+		"partial header": ping + "\x00\x00",
+		"frame header":   "\x00\x40\x00\x00\x00\x00\x00\x00\x03", // of a DATA frame, read on its own
+	} {
+		if !http2Aligned([]byte(in)) {
+			t.Errorf("%s: not taken for HTTP/2", name)
+		}
 	}
 
 	for name, in := range map[string]string{
@@ -100,11 +96,12 @@ func TestSummarizeHTTP2(t *testing.T) {
 		"undefined DATA flag": "\x00\x00\x01\x00\x02\x00\x00\x00\x01x",
 		"SETTINGS on stream":  "\x00\x00\x00\x04\x00\x00\x00\x00\x01",
 		"bad PING length":     "\x00\x00\x01\x06\x00\x00\x00\x00\x00x",
+		"HTTP/1":              "GET / HTTP/1.1\r\n\r\n",
 		// Seen in the wild: binary data that once passed as a DATA frame.
 		"seen in the wild": "\x00\xfe\x04\x00\x8a\x02\xbb\x93\xba\x30\x8d\xbe",
 	} {
-		if got := summarizeHTTP2([]byte(in)); got != nil {
-			t.Errorf("%s: %q", name, got)
+		if http2Aligned([]byte(in)) {
+			t.Errorf("%s: taken for HTTP/2", name)
 		}
 	}
 }
@@ -112,7 +109,7 @@ func TestSummarizeHTTP2(t *testing.T) {
 func TestTextHTTP(t *testing.T) {
 	var buf bytes.Buffer
 	ev := event(tracer.FuncSSLWrite, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
-	if err := NewText(&buf, false).Print(ev); err != nil {
+	if err := NewText(&buf, Options{}).Print(ev); err != nil {
 		t.Fatal(err)
 	}
 	want := "03:04:05.000006 curl (pid 42) SSL_write 10.0.0.2:51234 > 93.184.216.34:443  37 bytes  1.5ms  fd 5, conn 0xbeef\n" +
@@ -130,7 +127,7 @@ func TestTextBinaryAndNotes(t *testing.T) {
 	ev.FD = -1
 	ev.ContainerID = "4b825dc642cb6eb9a060"
 	ev.TID = 43
-	if err := NewText(&buf, false).Print(ev); err != nil {
+	if err := NewText(&buf, Options{}).Print(ev); err != nil {
 		t.Fatal(err)
 	}
 	out := buf.String()
@@ -149,9 +146,66 @@ func TestTextBinaryAndNotes(t *testing.T) {
 	}
 
 	buf.Reset()
-	NewText(&buf, true).Print(event(tracer.FuncSSLRead, "hi"))
+	NewText(&buf, Options{Hex: true}).Print(event(tracer.FuncSSLRead, "hi"))
 	if !strings.Contains(buf.String(), "00000000  68 69") {
 		t.Errorf("--hex didn't hex-dump text:\n%s", buf.String())
+	}
+}
+
+// Text shows a body's first maxBodyShown bytes, and describes the rest and
+// binary data, unless Full is set.
+func TestTextBodyLimits(t *testing.T) {
+	var body []byte
+	for i := range 150 {
+		body = fmt.Appendf(body, "line %04d xxxxxxxxx\n", i) // 20 bytes
+	}
+	head := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n", len(body))
+	calls := []string{head + string(body[:1500]), string(body[1500:2500]), string(body[2500:])}
+	png := "\x89PNG\r\n\x1a\n" + strings.Repeat("\x00\x01", 46)
+	image := "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 100\r\n\r\n" + png
+	other := strings.Repeat("\x00\x01\x02\x03", 250)
+
+	print := func(opts Options, data ...string) []string {
+		var out []string
+		p := NewText(io.Discard, opts)
+		for i, d := range data {
+			var buf bytes.Buffer
+			p.w = &buf
+			ev := event(tracer.FuncSSLRead, d)
+			ev.ConnID = uint64(i/len(calls) + 1)
+			if err := p.Print(ev); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, buf.String())
+		}
+		return out
+	}
+
+	got := print(Options{}, calls...)
+	if !strings.Contains(got[0], "line 0074") || strings.Contains(got[0], "more bytes") {
+		t.Errorf("first call:\n%s", got[0])
+	}
+	if !strings.Contains(got[1], "line 0101 xxxxxxxxx\n[… 460 more bytes; --full shows all]") || strings.Contains(got[1], "line 0102") {
+		t.Errorf("second call:\n%s", got[1])
+	}
+	if !strings.Contains(got[2], "[500 more bytes of text/html]") || strings.Contains(got[2], "line 01") {
+		t.Errorf("third call:\n%s", got[2])
+	}
+	got = print(Options{Full: true}, calls...)
+	if all := strings.Join(got, ""); strings.Count(all, "line ") != 150 || strings.Contains(all, "more bytes") {
+		t.Errorf("--full:\n%s", all)
+	}
+
+	got = print(Options{}, image, other)
+	if !strings.Contains(got[0], "[100 bytes of image/png]") || strings.Contains(got[0], "00000000") {
+		t.Errorf("binary body:\n%s", got[0])
+	}
+	if strings.Count(got[1], "\n000") != 16 || !strings.Contains(got[1], "[… 744 more bytes; --full shows all]") {
+		t.Errorf("binary data:\n%s", got[1])
+	}
+	got = print(Options{Full: true}, image, other)
+	if !strings.Contains(got[0], "00000000  89 50 4e 47") || strings.Contains(got[1], "more bytes") {
+		t.Errorf("--full binary:\n%s", strings.Join(got, ""))
 	}
 }
 

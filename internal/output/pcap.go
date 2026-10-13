@@ -8,7 +8,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // Pcap writes the plaintext of each TLS connection as a synthetic TCP

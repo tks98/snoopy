@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -350,7 +351,7 @@ func TestBoringSSLBinaries(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer f.Close()
-			got, err := findBoringSSL(f)
+			got, err := findBoringSSL(f, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -496,4 +497,31 @@ int main(void) { printf("%s %d\n", "third_party/boringssl/src/ssl/ssl_lib.cc", 0
 		t.Fatalf("got %+v", targets)
 	}
 	t.Log(targets[0].Problem)
+}
+
+func TestDescendants(t *testing.T) {
+	proc := t.TempDir()
+	for pid, stat := range map[int]string{
+		1:  "1 (init) S 0 1 1",
+		10: "10 (chrome) S 1 10 10",
+		11: "11 (chrome (net) x) S 10 10 10", // a name with parentheses and a space
+		12: "12 (cat) S 11 10 10",
+		20: "20 (other) S 1 20 20",
+	} {
+		dir := filepath.Join(proc, strconv.Itoa(pid))
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat+" 0 -1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := descendants(proc, 10)
+	slices.Sort(got)
+	if !slices.Equal(got, []int{10, 11, 12}) {
+		t.Errorf("descendants of 10: %v", got)
+	}
+	if !isDescendant(proc, 12, 10) || isDescendant(proc, 20, 10) || isDescendant(proc, 10, 10) {
+		t.Error("isDescendant is wrong")
+	}
 }

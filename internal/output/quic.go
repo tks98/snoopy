@@ -10,7 +10,7 @@ import (
 
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // quicItem is something found in a QUIC packet: a frame, or an HTTP/3 frame
@@ -25,6 +25,10 @@ type quicItem struct {
 	Data    []byte   // DATA payload, or a summary's details
 	Err     string   // why a HEADERS frame couldn't be decoded
 	Body    bodyPart // what an encoded body's DATA decoded to
+	// For DATA: the body's content type, if known, and how many of its
+	// bytes came before these.
+	ContentType string
+	Offset      int64
 }
 
 // quicConns follows the HTTP/3 traffic in QUIC packets. Packets are
@@ -57,6 +61,10 @@ type quicDir struct {
 	lastCtx  uint64    // the encryption context of the last packet
 	lastTime time.Time // and when it was
 	closed   bool      // a CONNECTION_CLOSE was seen
+	// The connection's start was seen: the first request's stream, or a
+	// unidirectional stream's type, which comes at its start. Header blocks
+	// can refer to QPACK encoder stream data sent at any time before them.
+	startSeen bool
 	// The QPACK_MAX_TABLE_CAPACITY this direction's sender advertised in its
 	// SETTINGS, which bounds the other direction's dynamic table; -1 if not
 	// seen.
@@ -96,12 +104,14 @@ type quicStream struct {
 	finSeen  bool   // the stream's final size is known
 	final    uint64 // and is this
 	dataSeen bool   // a DATA frame was read
+	body     bodyInfo
 }
 
 const (
 	maxQUICDirs        = 4096
 	maxQUICStreamEarly = 1 << 20 // out-of-order bytes kept per stream
 	maxHTTP3Frame      = 1 << 20 // larger non-DATA frames are given up on
+	maxBlocked         = 64      // header blocks kept waiting for encoder stream data
 )
 
 // migrationWindow is how recently a connection must have used a context for
@@ -507,12 +517,16 @@ func (d *quicDir) streamData(sf streamFrame) []quicItem {
 func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 	var items []quicItem
 	unidirectional := id&0x02 != 0
+	if id == 0 {
+		d.startSeen = true
+	}
 	if unidirectional && s.uniType < 0 {
 		t, n, ok := quicVarint(s.buf)
 		if !ok {
 			return nil
 		}
 		s.uniType, s.buf = int64(t), s.buf[n:]
+		d.startSeen = true
 		name := map[int64]string{0: "control", 1: "push", 2: "QPACK encoder", 3: "QPACK decoder"}[s.uniType]
 		if name == "" {
 			name = fmt.Sprintf("type %#x", s.uniType)
@@ -537,8 +551,7 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 	for len(s.buf) > 0 {
 		if s.dataLeft > 0 { // more of a DATA frame
 			n := min(s.dataLeft, uint64(len(s.buf)))
-			items = append(items, quicItem{HTTP3: "DATA (continued)", Stream: id, Data: s.buf[:n],
-				Body: decodeBody(d.bodies[id], s.buf[:n], false)})
+			items = append(items, s.data("DATA (continued)", id, s.buf[:n], d.bodies[id]))
 			s.buf, s.dataLeft = s.buf[n:], s.dataLeft-n
 			continue
 		}
@@ -555,7 +568,7 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 			s.dataSeen = true
 			avail := min(length, uint64(len(s.buf)-header))
 			data := s.buf[header : header+int(avail)]
-			items = append(items, quicItem{HTTP3: "DATA", Stream: id, Data: data, Body: decodeBody(d.bodies[id], data, false)})
+			items = append(items, s.data("DATA", id, data, d.bodies[id]))
 			s.buf, s.dataLeft = s.buf[header+int(avail):], length-avail
 			continue
 		}
@@ -588,16 +601,40 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 	return items
 }
 
+// data returns the item for a piece of a DATA frame's payload.
+func (s *quicStream) data(typ string, id uint64, data []byte, dec *bodyDecoder) quicItem {
+	item := quicItem{HTTP3: typ, Stream: id, Data: data, Body: decodeBody(dec, data, false),
+		ContentType: s.body.contentType, Offset: s.body.seen}
+	s.body.seen += int64(len(data))
+	return item
+}
+
 func (d *quicDir) headers(id uint64, block []byte) quicItem {
 	fields, err := d.qpack.fieldSection(block)
 	if errors.Is(err, errBlocked) {
+		if len(d.blocked) >= maxBlocked {
+			d.blocked = append(d.blocked[:0], d.blocked[1:]...)
+		}
 		d.blocked = append(d.blocked, blockedSection{id, append([]byte(nil), block...)})
+		if !d.startSeen {
+			return quicItem{HTTP3: "HEADERS", Stream: id,
+				Err: "headers not decoded: the connection probably started before snoopy"}
+		}
 		return quicItem{HTTP3: "HEADERS", Stream: id, Err: "waiting for QPACK encoder stream data"}
 	}
 	if err != nil {
 		return quicItem{HTTP3: "HEADERS", Stream: id, Err: err.Error()}
 	}
+	return d.decoded(id, fields)
+}
+
+// decoded returns the item for a decoded header block, and starts following
+// the body it heads.
+func (d *quicDir) decoded(id uint64, fields []hpack.HeaderField) quicItem {
 	item := quicItem{HTTP3: "HEADERS", Stream: id, Headers: fields}
+	if s := d.streams[id]; s != nil && !s.dataSeen {
+		s.body.contentType = contentType(fields)
+	}
 	item.Body = d.startBody(id, fields)
 	return item
 }
@@ -639,9 +676,7 @@ func (d *quicDir) retryBlocked() []quicItem {
 		case err != nil:
 			items = append(items, quicItem{HTTP3: "HEADERS", Stream: b.stream, Err: err.Error()})
 		default:
-			item := quicItem{HTTP3: "HEADERS", Stream: b.stream, Headers: fields}
-			item.Body = d.startBody(b.stream, fields)
-			items = append(items, item)
+			items = append(items, d.decoded(b.stream, fields))
 		}
 	}
 	d.blocked = still

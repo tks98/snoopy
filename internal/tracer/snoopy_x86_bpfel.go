@@ -117,11 +117,12 @@ const (
 	snoopyMapAesGcmCtxs             = "aes_gcm_ctxs"
 	snoopyMapCallDepth              = "call_depth"
 	snoopyMapConnInfos              = "conn_infos"
+	snoopyMapCounters               = "counters"
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
 	snoopyMapIoThreads              = "io_threads"
-	snoopyMapLostEvents             = "lost_events"
 	snoopyMapRecvBufs               = "recv_bufs"
+	snoopyMapTracedTgids            = "traced_tgids"
 	snoopyProgPR_ReadEnter          = "PR_Read_enter"
 	snoopyProgPR_RecvEnter          = "PR_Recv_enter"
 	snoopyProgPR_SendEnter          = "PR_Send_enter"
@@ -152,10 +153,10 @@ const (
 	snoopyProgWolfsslReadEnter      = "wolfssl_read_enter"
 	snoopyProgWolfsslWriteEnter     = "wolfssl_write_enter"
 	snoopyVarFilterComm             = "filter_comm"
+	snoopyVarFilterTgids            = "filter_tgids"
 	snoopyVarHaveBtf                = "have_btf"
 	snoopyVarMaxCapture             = "max_capture"
 	snoopyVarTargComm               = "targ_comm"
-	snoopyVarTargTgid               = "targ_tgid"
 	snoopyVarUnusedEventHeader      = "unused_event_header"
 )
 
@@ -241,11 +242,12 @@ type snoopyMapSpecs struct {
 	AesGcmCtxs  *ebpf.MapSpec `ebpf:"aes_gcm_ctxs"`
 	CallDepth   *ebpf.MapSpec `ebpf:"call_depth"`
 	ConnInfos   *ebpf.MapSpec `ebpf:"conn_infos"`
+	Counters    *ebpf.MapSpec `ebpf:"counters"`
 	Events      *ebpf.MapSpec `ebpf:"events"`
 	Execs       *ebpf.MapSpec `ebpf:"execs"`
 	IoThreads   *ebpf.MapSpec `ebpf:"io_threads"`
-	LostEvents  *ebpf.MapSpec `ebpf:"lost_events"`
 	RecvBufs    *ebpf.MapSpec `ebpf:"recv_bufs"`
+	TracedTgids *ebpf.MapSpec `ebpf:"traced_tgids"`
 }
 
 // snoopyVariableSpecs contains global variables before they are loaded into the kernel.
@@ -253,10 +255,10 @@ type snoopyMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type snoopyVariableSpecs struct {
 	FilterComm        *ebpf.VariableSpec `ebpf:"filter_comm"`
+	FilterTgids       *ebpf.VariableSpec `ebpf:"filter_tgids"`
 	HaveBtf           *ebpf.VariableSpec `ebpf:"have_btf"`
 	MaxCapture        *ebpf.VariableSpec `ebpf:"max_capture"`
 	TargComm          *ebpf.VariableSpec `ebpf:"targ_comm"`
-	TargTgid          *ebpf.VariableSpec `ebpf:"targ_tgid"`
 	UnusedEventHeader *ebpf.VariableSpec `ebpf:"unused_event_header"`
 }
 
@@ -285,11 +287,12 @@ type snoopyMaps struct {
 	AesGcmCtxs  *ebpf.Map `ebpf:"aes_gcm_ctxs"`
 	CallDepth   *ebpf.Map `ebpf:"call_depth"`
 	ConnInfos   *ebpf.Map `ebpf:"conn_infos"`
+	Counters    *ebpf.Map `ebpf:"counters"`
 	Events      *ebpf.Map `ebpf:"events"`
 	Execs       *ebpf.Map `ebpf:"execs"`
 	IoThreads   *ebpf.Map `ebpf:"io_threads"`
-	LostEvents  *ebpf.Map `ebpf:"lost_events"`
 	RecvBufs    *ebpf.Map `ebpf:"recv_bufs"`
+	TracedTgids *ebpf.Map `ebpf:"traced_tgids"`
 }
 
 func (m *snoopyMaps) Close() error {
@@ -299,11 +302,12 @@ func (m *snoopyMaps) Close() error {
 		m.AesGcmCtxs,
 		m.CallDepth,
 		m.ConnInfos,
+		m.Counters,
 		m.Events,
 		m.Execs,
 		m.IoThreads,
-		m.LostEvents,
 		m.RecvBufs,
+		m.TracedTgids,
 	)
 }
 
@@ -312,10 +316,10 @@ func (m *snoopyMaps) Close() error {
 // It can be passed to loadSnoopyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type snoopyVariables struct {
 	FilterComm        *ebpf.Variable `ebpf:"filter_comm"`
+	FilterTgids       *ebpf.Variable `ebpf:"filter_tgids"`
 	HaveBtf           *ebpf.Variable `ebpf:"have_btf"`
 	MaxCapture        *ebpf.Variable `ebpf:"max_capture"`
 	TargComm          *ebpf.Variable `ebpf:"targ_comm"`
-	TargTgid          *ebpf.Variable `ebpf:"targ_tgid"`
 	UnusedEventHeader *ebpf.Variable `ebpf:"unused_event_header"`
 }
 

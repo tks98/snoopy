@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/netip"
 	"reflect"
+	"strings"
 	"testing"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/discover"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 func TestParseFlags(t *testing.T) {
@@ -38,6 +40,9 @@ func TestParseFlags(t *testing.T) {
 		{"--json", "--hex"},
 		{"--brief", "--json"},
 		{"--brief", "--hex"},
+		{"--full", "--json"},
+		{"--full", "--brief"},
+		{"--full", "--hex"},
 		{"--port", "0"},
 		{"--port", "https"},
 		{"--count", "-1"},
@@ -46,6 +51,53 @@ func TestParseFlags(t *testing.T) {
 	} {
 		if _, err := parseFlags(args, io.Discard); err == nil {
 			t.Errorf("%q: no error", args)
+		}
+	}
+}
+
+// Each flag is in the help text, which is written by hand.
+func TestUsage(t *testing.T) {
+	var help strings.Builder
+	if _, err := parseFlags([]string{"--help"}, &help); !errors.Is(err, flag.ErrHelp) {
+		t.Fatal(err)
+	}
+	if help.String() != usage {
+		t.Error("--help doesn't print the help text")
+	}
+	n := 0
+	flags(&config{}, io.Discard).VisitAll(func(f *flag.Flag) {
+		n++
+		if !strings.Contains(usage, "\n  --"+f.Name+" ") {
+			t.Errorf("--%s isn't in the help text", f.Name)
+		}
+	})
+	if m := strings.Count(usage, "\n  --"); m != n {
+		t.Errorf("the help text has %d flags, not %d", m, n)
+	}
+}
+
+func TestAttachSummary(t *testing.T) {
+	target := func(lib discover.Library, path string) discover.Target {
+		return discover.Target{Library: lib, Path: path}
+	}
+	for _, tc := range []struct {
+		targets []discover.Target
+		want    string
+	}{
+		{[]discover.Target{target(discover.OpenSSL, "/usr/lib/libssl.so.3")}, "the openssl library"},
+		{[]discover.Target{
+			target(discover.OpenSSL, "/usr/lib/libssl.so.3"),
+			target(discover.OpenSSL, "/proc/7/root/usr/lib/libssl.so.1.1"),
+			target(discover.NSS, "/usr/lib/libnspr4.so"),
+			target(discover.OpenSSL, "/opt/google/chrome/chrome"),
+		}, "the openssl and nss libraries, and to the program chrome"},
+		{[]discover.Target{
+			target(discover.GoTLS, "/a/one"), target(discover.GoTLS, "/a/two"), target(discover.GoTLS, "/a/three"),
+			target(discover.GoTLS, "/a/four"), target(discover.GoTLS, "/a/five"), target(discover.GoTLS, "/a/six"),
+		}, "the programs one, two, three, four and 2 more"},
+	} {
+		if got := attachSummary(tc.targets); got != tc.want {
+			t.Errorf("got %q, want %q", got, tc.want)
 		}
 	}
 }

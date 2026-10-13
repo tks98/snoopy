@@ -1,4 +1,4 @@
-module github.com/tks98/snoopy
+module github.com/tks98/snoopy/v2
 
 go 1.25.0
 

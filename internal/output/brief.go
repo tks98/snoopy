@@ -10,7 +10,7 @@ import (
 	"github.com/fatih/color"
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // Brief prints one line per event, like tcpdump: the time, the process, where
@@ -18,10 +18,10 @@ import (
 //
 //	06:27:36.512901 curl[5565] 192.168.5.15:41794 > 172.66.147.243:443 TLS 74: GET / HTTP/1.1, host example.com
 type Brief struct {
-	w    io.Writer
-	h1   *http1Conns
-	h2   *http2Conns
-	quic *quicConns
+	w      io.Writer
+	opts   Options
+	dec    decoders
+	hidden int
 
 	dim, title, write, read, warn func(a ...any) string
 }
@@ -29,17 +29,16 @@ type Brief struct {
 // maxSummary bounds a line's summary, in characters.
 const maxSummary = 200
 
-// NewBrief returns a Brief printer. Colors follow color.NoColor.
-func NewBrief(w io.Writer) *Brief {
+// NewBrief returns a Brief printer. Of the options, only Verbose applies.
+// Colors follow color.NoColor.
+func NewBrief(w io.Writer, opts Options) *Brief {
 	s := func(attrs ...color.Attribute) func(a ...any) string {
 		return color.New(attrs...).SprintFunc()
 	}
-	pool := newBodyPool()
 	return &Brief{
 		w:     w,
-		h1:    newHTTP1Conns(pool),
-		h2:    newHTTP2Conns(pool),
-		quic:  newQUICConns(pool),
+		opts:  opts,
+		dec:   newDecoders(),
 		dim:   s(color.Faint),
 		title: s(color.Bold),
 		write: s(color.FgCyan),
@@ -48,7 +47,16 @@ func NewBrief(w io.Writer) *Brief {
 	}
 }
 
+// Hidden returns how many events were left out because they only kept a
+// connection going.
+func (b *Brief) Hidden() int { return b.hidden }
+
 func (b *Brief) Print(ev *tracer.Event) error {
+	dc := b.dec.decode(ev)
+	if !b.opts.Verbose && dc.housekeeping() {
+		b.hidden++
+		return nil
+	}
 	paint, proto := b.read, "TLS"
 	if ev.Function.Direction() == tracer.Write {
 		paint = b.write
@@ -58,8 +66,11 @@ func (b *Brief) Print(ev *tracer.Event) error {
 	}
 	line := fmt.Sprintf("%s %s %s %s %d", b.dim(ev.Time.Format("15:04:05.000000")),
 		b.title(fmt.Sprintf("%s[%d]", ev.Comm, ev.PID)), paint(endpoints(ev)), proto, ev.Size)
-	if s := clip(b.summary(ev)); s != "" {
+	if s := clip(b.summary(ev, dc)); s != "" {
 		line += ": " + s
+	}
+	if dc.isHTTP2 && dc.note != "" {
+		line += " " + b.warn("[started before snoopy; headers not decoded]")
 	}
 	switch {
 	case ev.ReadError:
@@ -74,34 +85,33 @@ func (b *Brief) Print(ev *tracer.Event) error {
 }
 
 // summary describes what an event's data holds.
-func (b *Brief) summary(ev *tracer.Event) string {
-	if ev.Function.IsQUIC() {
-		items, ok := b.quic.process(ev)
-		if !ok {
-			return "packet that doesn't parse as QUIC"
-		}
-		return briefQUIC(items)
-	}
-	frames, isHTTP2, note := b.h2.process(ev)
-	if isHTTP2 {
-		return briefHTTP2(frames)
-	}
-	if note != "" {
-		return note
-	}
-	if segs := b.h1.process(ev); segs != nil {
-		return briefHTTP1(segs)
+func (b *Brief) summary(ev *tracer.Event, dc decoded) string {
+	switch {
+	case dc.notQUIC:
+		return "packet that doesn't parse as QUIC"
+	case dc.isQUIC:
+		return briefQUIC(dc.quic, b.opts.Verbose)
+	case dc.isHTTP2:
+		return briefHTTP2(dc.http2, b.opts.Verbose)
+	case dc.note != "":
+		return dc.note
+	case dc.http1 != nil:
+		return briefHTTP1(dc.http1)
 	}
 	return briefData(ev.Data)
 }
 
-func briefQUIC(items []quicItem) string {
+// briefQUIC describes the HTTP/3 frames in a packet, or else its QUIC
+// frames. Unless verbose, HTTP/3 frames that only keep the connection going
+// are left out.
+func briefQUIC(items []quicItem, verbose bool) string {
 	var frames, parts []string
 	for _, it := range items {
 		switch {
 		case it.Frame != "":
 			frames = append(frames, it.Frame)
 		case strings.HasPrefix(it.HTTP3, "stream:"): // a stream's type: noise here
+		case !verbose && it.housekeeping():
 		case it.Err != "":
 			parts = append(parts, fmt.Sprintf("%s s%d: %s", it.HTTP3, it.Stream, it.Err))
 		case it.Headers != nil:
@@ -118,7 +128,9 @@ func briefQUIC(items []quicItem) string {
 	return "HTTP/3 " + strings.Join(parts, "; ")
 }
 
-func briefHTTP2(frames []http2Frame) string {
+// briefHTTP2 describes HTTP/2 frames. Unless verbose, frames that only keep
+// the connection going are left out.
+func briefHTTP2(frames []http2Frame, verbose bool) string {
 	if len(frames) == 0 {
 		return "HTTP/2, part of a frame"
 	}
@@ -128,12 +140,17 @@ func briefHTTP2(frames []http2Frame) string {
 	}
 	var runs []run
 	for _, f := range frames {
+		if !verbose && f.housekeeping() {
+			continue
+		}
 		var p string
 		switch {
 		case f.Type == "connection preface":
 			p = "preface"
 		case f.Headers != nil:
 			p = fmt.Sprintf("%s s%d %s", f.Type, f.Stream, briefFields(f.Headers))
+		case f.HeadersLost:
+			p = fmt.Sprintf("%s s%d (not decoded)", f.Type, f.Stream)
 		case f.Type == "DATA":
 			p = fmt.Sprintf("DATA s%d %d bytes%s", f.Stream, len(f.Data), bodyNote(f.Body))
 		case f.Stream != 0 && f.Type != "CONTINUATION":
@@ -153,6 +170,9 @@ func briefHTTP2(frames []http2Frame) string {
 			continue
 		}
 		runs = append(runs, run{p, 1})
+	}
+	if len(runs) == 0 {
+		return "HTTP/2 settings and flow control"
 	}
 	parts := make([]string, len(runs))
 	for i, r := range runs {

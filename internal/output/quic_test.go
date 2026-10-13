@@ -1,13 +1,15 @@
 package output
 
 import (
+	"bytes"
+	"fmt"
 	"net/netip"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/tks98/snoopy/internal/tracer"
+	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // quicVar encodes a QUIC variable-length integer.
@@ -222,5 +224,40 @@ func TestQUICMigration(t *testing.T) {
 	got = http3OfEvent(t, c, ev(9, 7000, 0xa, 4*time.Second, streamFrameBytes(0, 0, block, true)))
 	if !slices.Equal(got, []string{"HEADERS :status=200"}) {
 		t.Errorf("new connection reusing the context: %q", got)
+	}
+}
+
+// A header block that refers to QPACK state from before snoopy started
+// can't be decoded, and says why.
+func TestHTTP3StartedBeforeSnoopy(t *testing.T) {
+	c := newQUICConns(newBodyPool())
+	request := streamFrameBytes(48, 0, h3Frame(0x01, []byte{0x05, 0x00, 0x80}), true)
+	got := http3Of(t, c, request)
+	if len(got) != 1 || !strings.Contains(got[0], "the connection probably started before snoopy") {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestTextQUIC(t *testing.T) {
+	ack := []byte{0x02, 0x05, 0x00, 0x00, 0x00}
+	block := append([]byte{0x00, 0x00, 0xd9}, literalField("content-type", "image/png")...) // :status 200
+	png := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x10")
+	response := quicEvent(tracer.FuncQUICRecv, cat(ack, streamFrameBytes(0, 0, cat(h3Frame(0x01, block), h3Frame(0x00, png)), true)))
+	for _, verbose := range []bool{false, true} {
+		var out bytes.Buffer
+		p := NewText(&out, Options{Verbose: verbose})
+		for _, ev := range []*tracer.Event{quicEvent(tracer.FuncQUICSend, ack), response} {
+			if err := p.Print(ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+		text := out.String()
+		if !strings.Contains(text, "content-type: image/png") || !strings.Contains(text, fmt.Sprintf("[%d bytes of image/png]", len(png))) {
+			t.Errorf("verbose %v: no response:\n%s", verbose, text)
+		}
+		// The ACK-only packet, and the frames line, are only shown verbose.
+		if n := strings.Count(text, "QUIC: ACK"); n != map[bool]int{false: 0, true: 2}[verbose] || p.Hidden() != map[bool]int{false: 1, true: 0}[verbose] {
+			t.Errorf("verbose %v: %d frame lines, %d hidden:\n%s", verbose, n, p.Hidden(), text)
+		}
 	}
 }

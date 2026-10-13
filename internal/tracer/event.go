@@ -4,7 +4,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/tks98/snoopy/internal/discover"
+	"github.com/tks98/snoopy/v2/internal/discover"
 )
 
 // Function is a traced TLS function. Keep in sync with enum fn_id in

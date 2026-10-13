@@ -31,7 +31,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tks98/snoopy/internal/discover"
+	"github.com/tks98/snoopy/v2/internal/discover"
 )
 
 func requireRoot(t *testing.T) {
@@ -252,6 +252,38 @@ func TestOpenSSL(t *testing.T) {
 	waitFor(t, events, "SSL_read", func(ev *Event) bool {
 		return ev.Function == FuncSSLRead && contains("served /curl-test")(ev)
 	})
+}
+
+// With PID, the processes it starts are traced too, and no others.
+func TestPIDFollowsChildren(t *testing.T) {
+	requireRoot(t)
+	curl := requireTool(t, "curl")
+	srv, _ := newServer(t)
+	// The process traced: a shell that runs curl once told to (": " keeps
+	// the shell from replacing itself with curl).
+	sh := exec.Command("sh", "-c", `read x; "$0" -sk --http1.1 "$1"; :`, curl, srv.URL+"/child")
+	stdin, err := sh.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sh.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sh.Process.Kill(); sh.Wait() })
+	events := startTracer(t, Options{PID: sh.Process.Pid}, systemTargets(t, discover.OpenSSL))
+
+	if out, err := exec.Command(curl, "-sk", "--http1.1", srv.URL+"/other").CombinedOutput(); err != nil {
+		t.Fatalf("curl: %v: %s", err, out)
+	}
+	stdin.Write([]byte("\n"))
+	stdin.Close()
+	if err := sh.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, events, "the shell's curl", contains("GET /child HTTP/1.1"))
+	if events.find(contains("GET /other")) != nil {
+		t.Error("traced a curl that the shell didn't start")
+	}
 }
 
 func TestOpenSSLLargePayload(t *testing.T) {
