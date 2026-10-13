@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"bytes"
 	"debug/elf"
 	"encoding/binary"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -300,5 +303,172 @@ func TestFind(t *testing.T) {
 	_, warnings, err = Find(Options{Extra: []string{notTLS}, NoScan: true})
 	if err != nil || len(warnings) != 1 {
 		t.Errorf("want one warning for a non-TLS --lib, got %v, %v", warnings, err)
+	}
+}
+
+func TestRustlsSymbols(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		read, write bool
+	}{
+		// From a rustls 0.23 build with rustc 1.99 (v0 mangling).
+		{"_RNvXs2_NtNtCs1eO8RepwP5M_6rustls4conn10connectionNtB5_6ReaderNtNtNtCscoGKTY0KSTf_5alloc2io4read4Read4read", true, false},
+		{"_RNvXs5_NtNtCs1eO8RepwP5M_6rustls4conn10connectionNtB5_6WriterNtNtNtCslpfLnFkgLmC_4core2io5write5Write5write", false, true},
+		// Legacy mangling, older rustls and Rust.
+		{"_ZN66_$LT$rustls..conn..connection..Reader$u20$as$u20$std..io..Read$GT$4read17h0123456789abcdefE", true, false},
+		{"_ZN55_$LT$rustls..conn..Writer$u20$as$u20$std..io..Write$GT$5write17h0ee1e61402b1a37cE", false, true},
+		// Other methods and types.
+		{"_ZN66_$LT$rustls..conn..connection..Reader$u20$as$u20$std..io..Read$GT$10read_exact17h0123456789abcdefE", false, false},
+		{"_RNvXs3_NtNtCs1eO8RepwP5M_6rustls4conn10connectionNtB5_6ReaderNtNtCscoGKTY0KSTf_5alloc2io7BufRead8fill_buf", false, false},
+		{"_ZN58_$LT$std..io..buffered..BufReader$u20$as$u20$std..io..Read$GT$4read17h0123456789abcdefE", false, false},
+	} {
+		if got := rustlsRead.MatchString(tc.name); got != tc.read {
+			t.Errorf("read %v for %s", got, tc.name)
+		}
+		if got := rustlsWrite.MatchString(tc.name); got != tc.write {
+			t.Errorf("write %v for %s", got, tc.name)
+		}
+	}
+}
+
+// TestBoringSSLBinaries runs findBoringSSL on real binaries, which are too
+// large to keep here, e.g. Chrome, Brave or Edge from their .deb packages:
+//
+//	SNOOPY_BORINGSSL_TEST=chrome=chrome.debug,brave go test -run BoringSSLBinaries ./internal/discover
+//
+// A debug file after "=" (from Chrome's debug-info zips) is checked against.
+func TestBoringSSLBinaries(t *testing.T) {
+	spec := os.Getenv("SNOOPY_BORINGSSL_TEST")
+	if spec == "" {
+		t.Skip("set SNOOPY_BORINGSSL_TEST to binaries to check")
+	}
+	for _, item := range strings.Split(spec, ",") {
+		path, debug, _ := strings.Cut(item, "=")
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			f, err := elf.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			got, err := findBoringSSL(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("SSL_read %#x, SSL_write %#x, EVP_AEAD_CTX_seal %#x, EVP_AEAD_CTX_open %#x",
+				got["SSL_read"], got["SSL_write"], got["EVP_AEAD_CTX_seal"], got["EVP_AEAD_CTX_open"])
+			if debug == "" {
+				return
+			}
+			checked := 0
+			for name, addr := range debugSymbols(t, debug) {
+				if name != "SSL_read" && name != "SSL_write" && name != "EVP_AEAD_CTX_seal" && name != "EVP_AEAD_CTX_open" {
+					continue
+				}
+				want, err := fileOffset(f, addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got[name] != want {
+					t.Errorf("%s at %#x, debug symbols say %#x", name, got[name], want)
+				}
+				checked++
+			}
+			if checked != 4 {
+				t.Errorf("debug file has %d of the 4 functions", checked)
+			}
+		})
+	}
+}
+
+// debugSymbols returns the function addresses in an ELF debug file or a
+// Breakpad symbol file (what Electron publishes; Chrome's are on
+// chrome-symbols too).
+func debugSymbols(t *testing.T, path string) map[string]uint64 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]uint64{}
+	if bytes.HasPrefix(data, []byte("MODULE ")) {
+		// FUNC [m] address size parameter_size name
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 5 || fields[0] != "FUNC" {
+				continue
+			}
+			if fields[1] == "m" {
+				fields = fields[1:]
+			}
+			if addr, err := strconv.ParseUint(fields[1], 16, 64); err == nil {
+				out[strings.Join(fields[4:], " ")] = addr
+			}
+		}
+		return out
+	}
+	d, err := elf.NewFile(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	syms, err := d.Symbols()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range syms {
+		out[s.Name] = s.Value
+	}
+	return out
+}
+
+// TestFreeblBinaries runs findFreebl on real freebl libraries:
+//
+//	SNOOPY_FREEBL_TEST=/usr/lib/x86_64-linux-gnu/libfreeblpriv3.so=libfreeblpriv3.debug go test -run FreeblBinaries ./internal/discover
+//
+// A file with symbols after "=" (for distribution builds, debuginfod has them)
+// is checked against.
+func TestFreeblBinaries(t *testing.T) {
+	spec := os.Getenv("SNOOPY_FREEBL_TEST")
+	if spec == "" {
+		t.Skip("set SNOOPY_FREEBL_TEST to freebl libraries to check")
+	}
+	for _, item := range strings.Split(spec, ",") {
+		path, debug, _ := strings.Cut(item, "=")
+		t.Run(path, func(t *testing.T) {
+			f, err := elf.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			got, err := findFreebl(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("AES_CreateContext %#x, AES_AEAD %#x", got["AES_CreateContext"], got["AES_AEAD"])
+			if debug == "" {
+				return
+			}
+			d, err := elf.Open(debug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Close()
+			syms, err := d.Symbols()
+			if err != nil {
+				t.Fatal(err)
+			}
+			checked := 0
+			for _, s := range syms {
+				if want, ok := got[s.Name]; ok {
+					off, err := fileOffset(f, s.Value)
+					if err != nil || off != want {
+						t.Errorf("%s at %#x, symbols say %#x", s.Name, want, off)
+					}
+					checked++
+				}
+			}
+			if checked != 2 {
+				t.Errorf("symbols have %d of the 2 functions", checked)
+			}
+		})
 	}
 }

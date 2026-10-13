@@ -24,16 +24,33 @@ Server: BaseHTTP/0.6 Python/3.13.16
 Content-Type: application/json
 Content-Length: 35
 
-00:27:03.800050 curl (pid 5567) SSL_read ← 127.0.0.1:8445  122 bytes  80µs  fd 5, conn 0x55d9efe75f80
-HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_STREAM]
-00000000  00 00 31 01 04 00 00 00  01 88 5f 92 49 7c a5 8a  |..1......._.I|..|
+16:21:30.061843 curl (pid 754998) SSL_read ← 104.20.23.154:443  171 bytes  127µs  fd 5, conn 0xbe9168ce6300
+HTTP/2 HEADERS stream=1 length=162 [END_HEADERS]
+:status: 200
+content-type: text/html; charset=utf-8
+server: cloudflare
 ...
+
+20:38:45.316878 chrome (pid 14779, tid 14792) EVP_AEAD_CTX_open ← 172.66.147.243:443  553 bytes  53µs  fd 30, conn 0x1f5400297058
+QUIC: STREAM id=0 off=0 len=548 FIN
+HTTP/3 HEADERS stream=0
+:status: 200
+content-type: text/html; charset=utf-8
+content-encoding: br
+...
+HTTP/3 DATA stream=0 (334 bytes)
+[br: 334 bytes decoded to 577]
+<!doctype html><html lang=en><head><meta charset=utf-8>...<title>Example Domain</title>...
 ```
 
 ## Features
 
 - **Libraries:** OpenSSL (also BoringSSL and LibreSSL), GnuTLS, NSS, wolfSSL,
-  Mbed TLS, s2n-tls and Go's `crypto/tls`, including stripped Go binaries.
+  Mbed TLS, s2n-tls, rustls (synchronous use) and Go's `crypto/tls`,
+  including stripped Go binaries, and the stripped BoringSSL inside Chrome,
+  other Chromium-based browsers and Electron apps, on x86_64 and arm64.
+- **HTTP/3:** the QUIC traffic of Chrome, other Chromium-based programs and
+  Firefox, captured where each packet is encrypted and decrypted.
 - **Finds what to trace:** system libraries, libraries loaded by running
   processes (including inside containers, and copies that an upgrade has
   since replaced), Go programs, and anything you point it at with `--lib`.
@@ -43,9 +60,11 @@ HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_S
   not as the TLS records sent to the proxy.
 - **Connection details:** process, thread, socket and local and remote
   address for every call, plus the container ID when the process runs in one.
-- **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 frames are
-  summarized and binary data is hex-dumped. With `--json` you get one JSON
-  object per line instead.
+- **Readable output:** HTTP/1.x is pretty-printed, HTTP/2 and HTTP/3 are
+  shown frame by frame with their headers decoded (HPACK, QPACK), bodies
+  compressed with gzip, deflate, Brotli or zstd are shown decompressed as
+  they arrive, and binary data is hex-dumped. With
+  `--json` you get one JSON object per line instead.
 - **Wireshark:** `--pcap` writes the plaintext as TCP streams so Wireshark
   can dissect the application protocol.
 - **Single static binary:** the eBPF program is compiled ahead of time and
@@ -53,8 +72,10 @@ HTTP/2: HEADERS stream=1 length=49 [END_HEADERS]; DATA stream=1 length=55 [END_S
 
 ## Requirements
 
-- Linux 5.10 or later on x86_64 or arm64. CI tests 5.10, 5.15, 6.1, 6.6 and
-  current kernels; 5.8 and 5.9 should work but aren't tested.
+- Linux 5.10 or later on x86_64 or arm64. CI tests the current kernels of
+  GitHub's x86_64 and arm64 runners; 5.10, 5.15, 6.1, 6.6 and 6.12 have been
+  tested in VMs (see [Development](#development)), and 5.8 and 5.9 should
+  work but aren't tested.
 - Root. The minimal set of capabilities is `CAP_BPF`, `CAP_PERFMON`,
   `CAP_SYS_RESOURCE` and `CAP_SYS_PTRACE` (to inspect other processes), plus
   `CAP_SYS_ADMIN` to trace libraries that were replaced while in use.
@@ -94,7 +115,7 @@ sudo snoopy --lib /usr/bin/node     # also attach to a binary with OpenSSL linke
 | `--lib PATH` | Also attach to this library or executable. Can be repeated. |
 | `--no-scan` | Don't scan running or newly started processes; attach only to system libraries and `--lib`. |
 | `--json` | Print one JSON object per line. |
-| `--hex` | Always hex-dump payloads. |
+| `--hex` | Always hex-dump payloads as captured, without decoding HTTP. |
 | `--max-size N` | Maximum bytes captured per call, up to 1 MiB. Defaults to 16384. |
 | `--pcap FILE` | Also write the plaintext to a pcap file; `-` writes it to stdout. |
 | `--quiet` | Don't print events. Useful with `--pcap`. |
@@ -135,11 +156,11 @@ Each line is one call to a TLS read or write function:
 | Field | Description |
 | --- | --- |
 | `time` | When the call returned. |
-| `function`, `library` | The traced function, e.g. `SSL_read`, and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n` or `go`. |
+| `function`, `library` | The traced function, e.g. `SSL_read`, `EVP_AEAD_CTX_open` or `AES_AEAD (decrypt)` (QUIC packets), and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n`, `rustls` or `go`. |
 | `direction` | `read` (received from the peer) or `write` (sent to it). |
 | `process_name`, `pid`, `tid` | The calling process and thread. |
 | `container_id` | The container the process runs in, if any. |
-| `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*`, `WOLFSSL*`, `mbedtls_ssl_context*`, `struct s2n_connection*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. |
+| `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*`, `WOLFSSL*`, `mbedtls_ssl_context*`, `struct s2n_connection*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. For QUIC packets it is the encryption context, of which a connection uses several. |
 | `fd`, `local_addr`, `remote_addr` | The socket, if known. |
 | `latency_ns` | Time spent inside the call. |
 | `size` | Bytes the call transferred. |
@@ -147,6 +168,10 @@ Each line is one call to a TLS read or write function:
 | `incomplete` | Set when part of the payload was dropped because the ring buffer was full. |
 | `read_error` | Set when the payload couldn't be read from the process's memory. |
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. |
+| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`) and `body` (see below). Only for connections whose start snoopy saw: HPACK compresses headers against a table built up over the connection. |
+| `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
+| `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
+| `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
 
 Fields that don't apply are left out.
 
@@ -165,24 +190,25 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 | Library | Functions | Notes |
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Any copy whose symbols are visible, including ones statically linked into an executable that exports them (e.g. Node.js). |
+| BoringSSL without symbols (Chrome, Brave, Edge, Electron apps) | `SSL_read`, `SSL_write`, found by signature | x86_64 and arm64. The functions are recognized by the error codes they report (see [How it works](#how-it-works)); snoopy attaches only if that gives one clear answer. Checked against published debug symbols on Chrome 155 and 156 (x86_64) and Electron 42 and 44 (arm64), and on Brave 1.97, Edge 155 and Ubuntu's Chromium 155 snap (arm64). Browsers in their usual install locations are analyzed at startup, so they are traced from the moment they start; results are cached by build ID. Chrome's HTTP/3 traffic is captured too, see below. |
+| QUIC (HTTP/3) in Chrome, Brave, Edge, Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | x86_64 and arm64. QUIC encrypts each packet with these, and the plaintext is the packet's frames, which snoopy reassembles into HTTP/3 with QPACK-decoded headers. Packets are told apart from TLS records and other callers by their header. |
+| QUIC (HTTP/3) in Firefox | NSS's `AES_CreateContext` and `AES_AEAD` in freebl, found through its exported function table | x86_64 and arm64. Firefox's QUIC stack (neqo) calls freebl's AES-GCM directly, so packets are captured there, as for Chrome. AES-GCM only: a connection that negotiates ChaCha20-Poly1305 isn't captured. Neither are connections set up before snoopy started, since a context's direction is learned when it's created. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird, ...) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` in NSPR | Only layered descriptors (the SSL layer) are captured, not plain files or sockets. Includes the copy bundled with Firefox, also when Firefox starts after snoopy. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | Also covers `wolfSSL_recv` and `wolfSSL_send`, which call them. |
 | Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
 | s2n-tls | `s2n_recv`, `s2n_send` | Data sent with `s2n_sendv` isn't captured. |
+| rustls | `Reader::read`, `Writer::write`, found by their mangled names | Programs that use rustls's reader and writer directly, such as `ureq` or `rustls::Stream`. Needs the program's symbol table, which Cargo keeps by default. Not async stacks built on tokio-rustls (`hyper`, `reqwest`, `axum`): there the read path is inlined and writes are vectored. |
 | Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64. Works on stripped binaries. |
 
 Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
-Not supported: rustls, Java, TLS libraries with stripped symbols (such as the
-BoringSSL inside Chrome), QUIC/HTTP/3, and programs that use OpenSSL only
-through its BIO layer (e.g. `openssl s_server -www`).
-
-Browsers use HTTP/3 (QUIC) with many sites, and that traffic doesn't pass
-through the TLS library's read and write functions, so snoopy doesn't see it.
-To see it in Firefox, set `network.http.http3.enable` to `false` in
-`about:config`; Firefox then uses HTTP/2 or HTTP/1.1 over TLS.
+Not supported: rustls under tokio (see above), Java, stripped TLS libraries
+other than BoringSSL, QUIC/HTTP/3 outside Chromium and Firefox, programs that
+use OpenSSL only through its BIO layer (e.g. `openssl s_server -www`), and
+bodies compressed with a shared dictionary (Chrome's `dcb` and `dcz`), which
+are shown as sent.
 
 ## How it works
 
@@ -202,6 +228,36 @@ To see it in Firefox, set `network.http.http3.enable` to `false` in
    version.
 4. User space reassembles the chunks and adds the container ID.
 
+Stripped programs that link BoringSSL statically, like Chrome, have no
+`SSL_read` or `SSL_write` symbols, so snoopy recognizes the functions by what
+they do (`internal/funcfind`). BoringSSL reports errors with the source file's
+name and a reason code, and those codes are fixed constants. Among the
+functions that load the address of `ssl/ssl_lib.cc`, `SSL_write` is the one
+that reports "bad length" besides "uninitialized" and "protocol is shutdown",
+and `SSL_read` reports "uninitialized", "protocol is shutdown" and "should not
+have been called", counting the BoringSSL functions they call (the compiler
+inlines differently from build to build). Both must take three arguments,
+which rules out callers that BoringSSL code was inlined into. Function starts
+are direct call targets (with a frame pointer prologue, on x86_64). If any of
+this doesn't give exactly one answer for each function, snoopy doesn't
+attach.
+
+QUIC (HTTP/3) encrypts each packet separately, with the packet's header as
+associated data, so snoopy captures packets where they're encrypted and
+decrypted: BoringSSL's `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open` in Chrome,
+freebl's `AES_AEAD` in Firefox. The same functions protect TLS records, whose
+associated data looks different. None of them touch the socket. A received
+packet is usually decrypted from the buffer it was received into, so for
+threads that decrypt packets the BPF program remembers which socket each
+receive buffer was last filled from, and otherwise uses the thread's last
+receive. A packet is sent just after it's encrypted, so the thread's next
+send tells its connection's socket; when the BPF program learns a socket that
+way, it sends user space a notice, and packets that went out before it are
+held back until then (rustls's writes work the same way). User space
+reassembles each direction's streams per socket, across the encryption keys a
+connection goes through and the sockets it migrates to, and decodes the
+HTTP/3 frames and QPACK headers.
+
 The eBPF program is `bpf/snoopy.c`. It is compiled with `bpf2go` into the
 `internal/tracer/snoopy_*_bpfel.{o,go}` files, which are committed so that a
 plain `go build` works.
@@ -219,11 +275,23 @@ make generate     # recompile bpf/snoopy.c after changing it (needs clang 18 and
 The integration tests use whichever of `curl`, `python3`, `gnutls-cli` and the
 NSS, wolfSSL, Mbed TLS and s2n-tls development files (`libnss3-dev`,
 `libwolfssl-dev`, `libmbedtls-dev`; s2n-tls has to be built from source) are
-installed, and skip the rest. CI runs
+installed, and skip the rest. The rustls test builds a client with `cargo`,
+which takes a while, so it only runs with `SNOOPY_TEST_RUSTLS=1`. CI runs
 them on x86_64 and arm64. To run them on an older kernel in a VM, use
 [vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
 Install vimto with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`; a build
 with cgo refuses to run.
+
+Two tests check the signature-based finding against real programs, and only
+run when pointed at them. `SNOOPY_BORINGSSL_TEST` takes a comma-separated list
+of Chromium-based executables, each optionally followed by `=` and a file
+with its symbols to compare with: an ELF debug file (Google publishes them for
+Chrome) or a Breakpad `.sym` file (Electron publishes them with each release).
+`SNOOPY_FREEBL_TEST` does the same for freebl libraries:
+
+```bash
+SNOOPY_BORINGSSL_TEST=/opt/google/chrome/chrome=chrome.debug go test ./internal/discover -run TestBoringSSLBinaries -v
+```
 
 To release, push a tag like `v2.0.0`. GoReleaser builds and publishes the
 binaries.

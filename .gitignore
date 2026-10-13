@@ -2,3 +2,4 @@
 /snoopy
 /dist/
 *.test
+internal/tracer/testdata/rustlsclient/target/

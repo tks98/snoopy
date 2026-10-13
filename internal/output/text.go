@@ -18,10 +18,14 @@ type Printer interface {
 }
 
 // Text prints events for humans: a header line per call followed by the
-// payload, pretty-printed if it is HTTP/1.x and hex-dumped if it is binary.
+// payload, pretty-printed if it is HTTP/1.x or HTTP/2 and hex-dumped if it
+// is binary.
 type Text struct {
-	w   io.Writer
-	hex bool
+	w    io.Writer
+	hex  bool
+	h1   *http1Conns
+	h2   *http2Conns
+	quic *quicConns
 
 	dim, title, fn, write, read, header, warn func(a ...any) string
 }
@@ -32,9 +36,13 @@ func NewText(w io.Writer, hex bool) *Text {
 	s := func(attrs ...color.Attribute) func(a ...any) string {
 		return color.New(attrs...).SprintFunc()
 	}
+	pool := newBodyPool()
 	return &Text{
 		w:      w,
 		hex:    hex,
+		h1:     newHTTP1Conns(pool),
+		h2:     newHTTP2Conns(pool),
+		quic:   newQUICConns(pool),
 		dim:    s(color.Faint),
 		title:  s(color.Bold),
 		fn:     s(color.FgHiMagenta, color.Bold),
@@ -75,7 +83,30 @@ func (t *Text) Print(ev *tracer.Event) error {
 	}
 	fmt.Fprintf(&b, "  %s\n", t.dim(strings.Join(extra, ", ")))
 
-	t.writePayload(&b, ev.Data)
+	if ev.Function.IsQUIC() {
+		if items, ok := t.quic.process(ev); ok && !t.hex {
+			t.writeQUIC(&b, items)
+		} else {
+			b.WriteString(hexdump(ev.Data) + "\n")
+		}
+	} else {
+		frames, isHTTP2, note := t.h2.process(ev)
+		if note != "" {
+			fmt.Fprintln(&b, t.warn("["+note+"]"))
+		}
+		var segs []http1Segment
+		if !isHTTP2 {
+			segs = t.h1.process(ev)
+		}
+		switch {
+		case isHTTP2 && !t.hex:
+			t.writeHTTP2(&b, frames, len(ev.Data))
+		case decodesBody(segs) && !t.hex:
+			t.writeHTTP1(&b, segs)
+		default:
+			t.writePayload(&b, ev.Data)
+		}
+	}
 
 	switch {
 	case ev.ReadError:
@@ -111,6 +142,129 @@ func (t *Text) writePayload(b *strings.Builder, data []byte) {
 		return
 	}
 	t.writeBody(b, data)
+}
+
+// writeHTTP1 prints HTTP/1.x messages whose bodies are being decoded.
+func (t *Text) writeHTTP1(b *strings.Builder, segs []http1Segment) {
+	for i, s := range segs {
+		switch {
+		case s.msg != nil:
+			b.WriteString(t.title(escapeText([]byte(s.msg.startLine))) + "\n")
+			for _, h := range s.msg.headers {
+				fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h[0]))), escapeText([]byte(h[1])))
+			}
+			if s.msg.complete && i+1 < len(segs) {
+				b.WriteString("\n")
+			}
+		case s.body.Encoding != "":
+			t.writeBodyPart(b, s.raw, s.body)
+		case len(s.raw) > 0:
+			t.writeBody(b, s.raw)
+		}
+	}
+}
+
+func decodesBody(segs []http1Segment) bool {
+	for _, s := range segs {
+		if s.body.Encoding != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// writeBodyPart prints a piece of an encoded body as what it decoded to, or
+// as sent if it couldn't be decoded.
+func (t *Text) writeBodyPart(b *strings.Builder, raw []byte, part bodyPart) {
+	if part.Err != "" {
+		b.WriteString(t.warn(fmt.Sprintf("[%s body not decoded: %s]", part.Encoding, part.Err)) + "\n")
+		if len(raw) > 0 {
+			t.writeBody(b, raw)
+		}
+		return
+	}
+	b.WriteString(t.dim(fmt.Sprintf("[%s: %d bytes decoded to %d]", part.Encoding, len(raw), len(part.Decoded))) + "\n")
+	if len(part.Decoded) > 0 {
+		t.writeBody(b, part.Decoded)
+	}
+}
+
+// writeHTTP2 prints the frames of an HTTP/2 connection, with their decoded
+// headers.
+func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int) {
+	if len(frames) == 0 && captured > 0 {
+		b.WriteString(t.dim(fmt.Sprintf("HTTP/2: %d bytes of a frame that continues in a later call", captured)) + "\n")
+	}
+	for _, f := range frames {
+		line := "HTTP/2 " + f.Type
+		switch {
+		case f.Type == "connection preface":
+		case f.Continued:
+			line += fmt.Sprintf(" stream=%d (continued)", f.Stream)
+		default:
+			line += fmt.Sprintf(" stream=%d length=%d", f.Stream, f.Length)
+		}
+		if len(f.Flags) > 0 {
+			line += " [" + strings.Join(f.Flags, ",") + "]"
+		}
+		if f.Headers != nil {
+			b.WriteString(t.title(line) + "\n")
+		} else {
+			b.WriteString(t.dim(line) + "\n")
+		}
+		for _, h := range f.Headers {
+			fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), escapeText([]byte(h.Value)))
+		}
+		switch {
+		case f.Body.Encoding != "":
+			t.writeBodyPart(b, f.Data, f.Body)
+		case len(f.Data) > 0:
+			t.writeBody(b, f.Data)
+		}
+	}
+}
+
+// writeQUIC prints a QUIC packet's frames on one line, then the HTTP/3
+// frames its stream data completed.
+func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
+	var frames []string
+	for _, it := range items {
+		if it.Frame != "" {
+			frames = append(frames, it.Frame)
+		}
+	}
+	b.WriteString(t.dim("QUIC: "+strings.Join(frames, ", ")) + "\n")
+	for _, it := range items {
+		if it.Frame != "" {
+			continue
+		}
+		line := fmt.Sprintf("HTTP/3 %s stream=%d", it.HTTP3, it.Stream)
+		switch {
+		case it.Err != "":
+			b.WriteString(t.warn(line+": "+it.Err) + "\n")
+		case it.Headers != nil:
+			b.WriteString(t.title(line) + "\n")
+			for _, h := range it.Headers {
+				fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), escapeText([]byte(h.Value)))
+			}
+			if it.Body.Encoding != "" {
+				t.writeBodyPart(b, nil, it.Body)
+			}
+		case it.HTTP3 == "SETTINGS":
+			b.WriteString(t.dim(line+" "+string(it.Data)) + "\n")
+		default:
+			if it.Data != nil {
+				line += fmt.Sprintf(" (%d bytes)", len(it.Data))
+			}
+			b.WriteString(t.dim(line) + "\n")
+			switch {
+			case it.Body.Encoding != "":
+				t.writeBodyPart(b, it.Data, it.Body)
+			case len(it.Data) > 0:
+				t.writeBody(b, it.Data)
+			}
+		}
+	}
 }
 
 func (t *Text) writeBody(b *strings.Builder, data []byte) {

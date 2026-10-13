@@ -30,6 +30,12 @@ const (
 	FuncMbedTLSWrite
 	FuncS2NRecv
 	FuncS2NSend
+	FuncRustlsRead
+	FuncRustlsWrite
+	FuncQUICSend
+	FuncQUICRecv
+	FuncNSSQUICSend
+	FuncNSSQUICRecv
 )
 
 var functionNames = map[Function]string{
@@ -51,6 +57,12 @@ var functionNames = map[Function]string{
 	FuncMbedTLSWrite: "mbedtls_ssl_write",
 	FuncS2NRecv:      "s2n_recv",
 	FuncS2NSend:      "s2n_send",
+	FuncRustlsRead:   "rustls::Reader::read",
+	FuncRustlsWrite:  "rustls::Writer::write",
+	FuncQUICSend:     "EVP_AEAD_CTX_seal",
+	FuncQUICRecv:     "EVP_AEAD_CTX_open",
+	FuncNSSQUICSend:  "AES_AEAD (encrypt)",
+	FuncNSSQUICRecv:  "AES_AEAD (decrypt)",
 }
 
 func (f Function) String() string {
@@ -63,11 +75,11 @@ func (f Function) String() string {
 // Library returns the TLS library the function belongs to.
 func (f Function) Library() discover.Library {
 	switch f {
-	case FuncSSLRead, FuncSSLWrite, FuncSSLReadEx, FuncSSLWriteEx:
+	case FuncSSLRead, FuncSSLWrite, FuncSSLReadEx, FuncSSLWriteEx, FuncQUICSend, FuncQUICRecv:
 		return discover.OpenSSL
 	case FuncGnuTLSRecv, FuncGnuTLSSend:
 		return discover.GnuTLS
-	case FuncPRRead, FuncPRWrite, FuncPRRecv, FuncPRSend:
+	case FuncPRRead, FuncPRWrite, FuncPRRecv, FuncPRSend, FuncNSSQUICSend, FuncNSSQUICRecv:
 		return discover.NSS
 	case FuncGoRead, FuncGoWrite:
 		return discover.GoTLS
@@ -77,8 +89,16 @@ func (f Function) Library() discover.Library {
 		return discover.MbedTLS
 	case FuncS2NRecv, FuncS2NSend:
 		return discover.S2N
+	case FuncRustlsRead, FuncRustlsWrite:
+		return discover.Rustls
 	}
 	return 0
+}
+
+// IsQUIC reports whether the function's data is the frames of a QUIC packet
+// (HTTP/3), captured where the packet is encrypted or decrypted.
+func (f Function) IsQUIC() bool {
+	return f == FuncQUICSend || f == FuncQUICRecv || f == FuncNSSQUICSend || f == FuncNSSQUICRecv
 }
 
 // Direction is whether data was received or sent.
@@ -100,7 +120,7 @@ func (d Direction) String() string {
 func (f Function) Direction() Direction {
 	switch f {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
-		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend:
+		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend:
 		return Write
 	}
 	return Read

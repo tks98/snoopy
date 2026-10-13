@@ -26,6 +26,12 @@ type snoopyActiveCall struct {
 	Pad     [2]uint8
 }
 
+type snoopyAesCtxKey struct {
+	_    structs.HostLayout
+	Tgid uint64
+	Ctx  uint64
+}
+
 type snoopyCallKey struct {
 	_      structs.HostLayout
 	Thread uint64
@@ -80,20 +86,49 @@ type snoopyEventHeader struct {
 	Pad         [4]uint8
 }
 
+type snoopyIoThread struct {
+	_          structs.HostLayout
+	WantConn   uint64
+	LastFd     int32
+	DgramFd    int32
+	DgramStart uint64
+	DgramEnd   uint64
+}
+
+type snoopyRecvBuf struct {
+	_    structs.HostLayout
+	File uint64
+	Fd   int32
+	Len  uint32
+}
+
+type snoopyRecvBufKey struct {
+	_    structs.HostLayout
+	Tgid uint64
+	Buf  uint64
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	snoopyMapActiveCalls            = "active_calls"
+	snoopyMapAesCreating            = "aes_creating"
+	snoopyMapAesGcmCtxs             = "aes_gcm_ctxs"
 	snoopyMapCallDepth              = "call_depth"
 	snoopyMapConnInfos              = "conn_infos"
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
+	snoopyMapIoThreads              = "io_threads"
 	snoopyMapLostEvents             = "lost_events"
+	snoopyMapRecvBufs               = "recv_bufs"
 	snoopyProgPR_ReadEnter          = "PR_Read_enter"
 	snoopyProgPR_RecvEnter          = "PR_Recv_enter"
 	snoopyProgPR_SendEnter          = "PR_Send_enter"
 	snoopyProgPR_WriteEnter         = "PR_Write_enter"
+	snoopyProgAesAeadEnter          = "aes_aead_enter"
+	snoopyProgAesCreateEnter        = "aes_create_enter"
+	snoopyProgAesCreateReturn       = "aes_create_return"
 	snoopyProgGnutlsRecordRecvEnter = "gnutls_record_recv_enter"
 	snoopyProgGnutlsRecordSendEnter = "gnutls_record_send_enter"
 	snoopyProgGoTlsReadEnter        = "go_tls_read_enter"
@@ -101,6 +136,10 @@ const (
 	snoopyProgGoTlsWriteEnter       = "go_tls_write_enter"
 	snoopyProgMbedtlsSslReadEnter   = "mbedtls_ssl_read_enter"
 	snoopyProgMbedtlsSslWriteEnter  = "mbedtls_ssl_write_enter"
+	snoopyProgQuicOpenEnter         = "quic_open_enter"
+	snoopyProgQuicSealEnter         = "quic_seal_enter"
+	snoopyProgRustlsReadEnter       = "rustls_read_enter"
+	snoopyProgRustlsWriteEnter      = "rustls_write_enter"
 	snoopyProgS2nRecvEnter          = "s2n_recv_enter"
 	snoopyProgS2nSendEnter          = "s2n_send_enter"
 	snoopyProgSchedProcessExec      = "sched_process_exec"
@@ -166,6 +205,9 @@ type snoopyProgramSpecs struct {
 	PR_RecvEnter          *ebpf.ProgramSpec `ebpf:"PR_Recv_enter"`
 	PR_SendEnter          *ebpf.ProgramSpec `ebpf:"PR_Send_enter"`
 	PR_WriteEnter         *ebpf.ProgramSpec `ebpf:"PR_Write_enter"`
+	AesAeadEnter          *ebpf.ProgramSpec `ebpf:"aes_aead_enter"`
+	AesCreateEnter        *ebpf.ProgramSpec `ebpf:"aes_create_enter"`
+	AesCreateReturn       *ebpf.ProgramSpec `ebpf:"aes_create_return"`
 	GnutlsRecordRecvEnter *ebpf.ProgramSpec `ebpf:"gnutls_record_recv_enter"`
 	GnutlsRecordSendEnter *ebpf.ProgramSpec `ebpf:"gnutls_record_send_enter"`
 	GoTlsReadEnter        *ebpf.ProgramSpec `ebpf:"go_tls_read_enter"`
@@ -173,6 +215,10 @@ type snoopyProgramSpecs struct {
 	GoTlsWriteEnter       *ebpf.ProgramSpec `ebpf:"go_tls_write_enter"`
 	MbedtlsSslReadEnter   *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_read_enter"`
 	MbedtlsSslWriteEnter  *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_write_enter"`
+	QuicOpenEnter         *ebpf.ProgramSpec `ebpf:"quic_open_enter"`
+	QuicSealEnter         *ebpf.ProgramSpec `ebpf:"quic_seal_enter"`
+	RustlsReadEnter       *ebpf.ProgramSpec `ebpf:"rustls_read_enter"`
+	RustlsWriteEnter      *ebpf.ProgramSpec `ebpf:"rustls_write_enter"`
 	S2nRecvEnter          *ebpf.ProgramSpec `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.ProgramSpec `ebpf:"s2n_send_enter"`
 	SchedProcessExec      *ebpf.ProgramSpec `ebpf:"sched_process_exec"`
@@ -191,11 +237,15 @@ type snoopyProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type snoopyMapSpecs struct {
 	ActiveCalls *ebpf.MapSpec `ebpf:"active_calls"`
+	AesCreating *ebpf.MapSpec `ebpf:"aes_creating"`
+	AesGcmCtxs  *ebpf.MapSpec `ebpf:"aes_gcm_ctxs"`
 	CallDepth   *ebpf.MapSpec `ebpf:"call_depth"`
 	ConnInfos   *ebpf.MapSpec `ebpf:"conn_infos"`
 	Events      *ebpf.MapSpec `ebpf:"events"`
 	Execs       *ebpf.MapSpec `ebpf:"execs"`
+	IoThreads   *ebpf.MapSpec `ebpf:"io_threads"`
 	LostEvents  *ebpf.MapSpec `ebpf:"lost_events"`
+	RecvBufs    *ebpf.MapSpec `ebpf:"recv_bufs"`
 }
 
 // snoopyVariableSpecs contains global variables before they are loaded into the kernel.
@@ -231,21 +281,29 @@ func (o *snoopyObjects) Close() error {
 // It can be passed to loadSnoopyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type snoopyMaps struct {
 	ActiveCalls *ebpf.Map `ebpf:"active_calls"`
+	AesCreating *ebpf.Map `ebpf:"aes_creating"`
+	AesGcmCtxs  *ebpf.Map `ebpf:"aes_gcm_ctxs"`
 	CallDepth   *ebpf.Map `ebpf:"call_depth"`
 	ConnInfos   *ebpf.Map `ebpf:"conn_infos"`
 	Events      *ebpf.Map `ebpf:"events"`
 	Execs       *ebpf.Map `ebpf:"execs"`
+	IoThreads   *ebpf.Map `ebpf:"io_threads"`
 	LostEvents  *ebpf.Map `ebpf:"lost_events"`
+	RecvBufs    *ebpf.Map `ebpf:"recv_bufs"`
 }
 
 func (m *snoopyMaps) Close() error {
 	return _SnoopyClose(
 		m.ActiveCalls,
+		m.AesCreating,
+		m.AesGcmCtxs,
 		m.CallDepth,
 		m.ConnInfos,
 		m.Events,
 		m.Execs,
+		m.IoThreads,
 		m.LostEvents,
+		m.RecvBufs,
 	)
 }
 
@@ -269,6 +327,9 @@ type snoopyPrograms struct {
 	PR_RecvEnter          *ebpf.Program `ebpf:"PR_Recv_enter"`
 	PR_SendEnter          *ebpf.Program `ebpf:"PR_Send_enter"`
 	PR_WriteEnter         *ebpf.Program `ebpf:"PR_Write_enter"`
+	AesAeadEnter          *ebpf.Program `ebpf:"aes_aead_enter"`
+	AesCreateEnter        *ebpf.Program `ebpf:"aes_create_enter"`
+	AesCreateReturn       *ebpf.Program `ebpf:"aes_create_return"`
 	GnutlsRecordRecvEnter *ebpf.Program `ebpf:"gnutls_record_recv_enter"`
 	GnutlsRecordSendEnter *ebpf.Program `ebpf:"gnutls_record_send_enter"`
 	GoTlsReadEnter        *ebpf.Program `ebpf:"go_tls_read_enter"`
@@ -276,6 +337,10 @@ type snoopyPrograms struct {
 	GoTlsWriteEnter       *ebpf.Program `ebpf:"go_tls_write_enter"`
 	MbedtlsSslReadEnter   *ebpf.Program `ebpf:"mbedtls_ssl_read_enter"`
 	MbedtlsSslWriteEnter  *ebpf.Program `ebpf:"mbedtls_ssl_write_enter"`
+	QuicOpenEnter         *ebpf.Program `ebpf:"quic_open_enter"`
+	QuicSealEnter         *ebpf.Program `ebpf:"quic_seal_enter"`
+	RustlsReadEnter       *ebpf.Program `ebpf:"rustls_read_enter"`
+	RustlsWriteEnter      *ebpf.Program `ebpf:"rustls_write_enter"`
 	S2nRecvEnter          *ebpf.Program `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.Program `ebpf:"s2n_send_enter"`
 	SchedProcessExec      *ebpf.Program `ebpf:"sched_process_exec"`
@@ -295,6 +360,9 @@ func (p *snoopyPrograms) Close() error {
 		p.PR_RecvEnter,
 		p.PR_SendEnter,
 		p.PR_WriteEnter,
+		p.AesAeadEnter,
+		p.AesCreateEnter,
+		p.AesCreateReturn,
 		p.GnutlsRecordRecvEnter,
 		p.GnutlsRecordSendEnter,
 		p.GoTlsReadEnter,
@@ -302,6 +370,10 @@ func (p *snoopyPrograms) Close() error {
 		p.GoTlsWriteEnter,
 		p.MbedtlsSslReadEnter,
 		p.MbedtlsSslWriteEnter,
+		p.QuicOpenEnter,
+		p.QuicSealEnter,
+		p.RustlsReadEnter,
+		p.RustlsWriteEnter,
 		p.S2nRecvEnter,
 		p.S2nSendEnter,
 		p.SchedProcessExec,

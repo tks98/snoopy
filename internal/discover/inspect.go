@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -73,10 +75,22 @@ func Inspect(path string) ([]Target, error) {
 		targets = append(targets, Target{Path: path, Library: GoTLS, Go: gi})
 	}
 
+	if ri := inspectRustls(f); ri != nil {
+		targets = append(targets, Target{Path: path, Library: Rustls, Rust: ri})
+	}
+
 	defined := definedFuncs(f)
 	for _, rs := range readSymbols {
 		if defined[rs.symbol] {
 			targets = append(targets, Target{Path: path, Library: rs.lib})
+		}
+	}
+	if offsets, err := findFreebl(f); err == nil {
+		targets = append(targets, Target{Path: path, Library: NSS, Offsets: offsets, Note: "freebl, for QUIC"})
+	}
+	if !defined["SSL_read"] {
+		if offsets, err := cachedFindBoringSSL(f); err == nil {
+			targets = append(targets, Target{Path: path, Library: OpenSSL, Offsets: offsets, Note: "BoringSSL found by signature"})
 		}
 	}
 	return targets, nil
@@ -357,4 +371,55 @@ func fileOffset(f *elf.File, addr uint64) (uint64, error) {
 		}
 	}
 	return 0, fmt.Errorf("address %#x is not in an executable segment", addr)
+}
+
+// RustInfo locates rustls's plaintext functions in a Rust program: the read
+// method of its Reader and the write method of its Writer, which are
+// mangled Rust symbols, possibly several of each if more than one rustls
+// version is linked in. Programs stripped of their symbol table can't be
+// traced.
+type RustInfo struct {
+	Reads  []uint64 // file offsets of <rustls Reader as Read>::read
+	Writes []uint64 // file offsets of <rustls Writer as Write>::write
+}
+
+// The symbols, in Rust's v0 mangling (the default since Rust 1.9x) and the
+// legacy one, e.g.
+//
+//	_RNvXs2_NtNtCs1eO8RepwP5M_6rustls4conn10connectionNtB5_6ReaderNtNtNtCscoGKTY0KSTf_5alloc2io4read4Read4read
+//	_ZN66_$LT$rustls..conn..connection..Reader$u20$as$u20$std..io..Read$GT$4read17h0123456789abcdefE
+var (
+	rustlsRead = regexp.MustCompile(`^_R.*6rustls.*4conn.*6Reader.*4Read4read$` +
+		`|^_ZN.*rustls\.\.conn\.\.(connection\.\.)?Reader\$u20\$as\$u20\$[a-z]+\.\.io\.\.(read\.\.)?Read\$GT\$4read17h[0-9a-f]{16}E$`)
+	rustlsWrite = regexp.MustCompile(`^_R.*6rustls.*4conn.*6Writer.*5Write5write$` +
+		`|^_ZN.*rustls\.\.conn\.\.(connection\.\.)?Writer\$u20\$as\$u20\$[a-z]+\.\.io\.\.(write\.\.)?Write\$GT\$5write17h[0-9a-f]{16}E$`)
+)
+
+func inspectRustls(f *elf.File) *RustInfo {
+	syms, err := f.Symbols()
+	if err != nil {
+		return nil
+	}
+	var ri RustInfo
+	for _, s := range syms {
+		if s.Section == elf.SHN_UNDEF || elf.ST_TYPE(s.Info) != elf.STT_FUNC || !strings.Contains(s.Name, "rustls") {
+			continue
+		}
+		var list *[]uint64
+		switch {
+		case rustlsRead.MatchString(s.Name):
+			list = &ri.Reads
+		case rustlsWrite.MatchString(s.Name):
+			list = &ri.Writes
+		default:
+			continue
+		}
+		if off, err := fileOffset(f, s.Value); err == nil && !slices.Contains(*list, off) {
+			*list = append(*list, off)
+		}
+	}
+	if len(ri.Reads) == 0 && len(ri.Writes) == 0 {
+		return nil
+	}
+	return &ri
 }

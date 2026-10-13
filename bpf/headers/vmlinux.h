@@ -38,6 +38,7 @@ enum bpf_map_type {
 
 enum {
 	BPF_ANY = 0,
+	BPF_NOEXIST = 1,
 };
 
 /* uprobe context. The layout is the kernel's, which is fixed ABI. */

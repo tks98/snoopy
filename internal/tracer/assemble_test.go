@@ -2,6 +2,7 @@ package tracer
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"os"
 	"reflect"
@@ -59,9 +60,16 @@ func TestFunctionsMatchBPFEnum(t *testing.T) {
 		"FN_WOLFSSL_READ": FuncWolfSSLRead, "FN_WOLFSSL_WRITE": FuncWolfSSLWrite,
 		"FN_MBEDTLS_SSL_READ": FuncMbedTLSRead, "FN_MBEDTLS_SSL_WRITE": FuncMbedTLSWrite,
 		"FN_S2N_RECV": FuncS2NRecv, "FN_S2N_SEND": FuncS2NSend,
+		"FN_RUSTLS_READ": FuncRustlsRead, "FN_RUSTLS_WRITE": FuncRustlsWrite,
+		"FN_QUIC_SEND": FuncQUICSend, "FN_QUIC_RECV": FuncQUICRecv,
+		"FN_NSS_QUIC_SEND": FuncNSSQUICSend, "FN_NSS_QUIC_RECV": FuncNSSQUICRecv,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("C enum has %d functions, Go has %d", len(names), len(want))
+	}
+	notice := regexp.MustCompile(`#define FN_SOCKET_NOTICE (0x[0-9a-f]+)`).FindSubmatch(src)
+	if notice == nil || string(notice[1]) != fmt.Sprintf("%#x", fnSocketNotice) {
+		t.Errorf("FN_SOCKET_NOTICE doesn't match fnSocketNotice (%#x)", fnSocketNotice)
 	}
 	for i, name := range names {
 		if fn, ok := want[name]; !ok || int(fn) != i+1 {
@@ -81,6 +89,8 @@ func TestFunctionDirection(t *testing.T) {
 		FuncPRSend: Write, FuncGoRead: Read, FuncGoWrite: Write,
 		FuncWolfSSLRead: Read, FuncWolfSSLWrite: Write, FuncMbedTLSRead: Read,
 		FuncMbedTLSWrite: Write, FuncS2NRecv: Read, FuncS2NSend: Write,
+		FuncRustlsRead: Read, FuncRustlsWrite: Write, FuncQUICSend: Write, FuncQUICRecv: Read,
+		FuncNSSQUICSend: Write, FuncNSSQUICRecv: Read,
 	} {
 		if got := fn.Direction(); got != want {
 			t.Errorf("%s: direction %s, want %s", fn, got, want)

@@ -1,0 +1,226 @@
+package output
+
+import (
+	"net/netip"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/tks98/snoopy/internal/tracer"
+)
+
+// quicVar encodes a QUIC variable-length integer.
+func quicVar(v uint64) []byte {
+	switch {
+	case v < 1<<6:
+		return []byte{byte(v)}
+	case v < 1<<14:
+		return []byte{0x40 | byte(v>>8), byte(v)}
+	default:
+		return []byte{0x80 | byte(v>>24), byte(v >> 16), byte(v >> 8), byte(v)}
+	}
+}
+
+// streamFrameBytes builds a STREAM frame with offset and length.
+func streamFrameBytes(id, off uint64, data []byte, fin bool) []byte {
+	typ := byte(0x0e)
+	if fin {
+		typ |= 0x01
+	}
+	b := []byte{typ}
+	b = append(b, quicVar(id)...)
+	b = append(b, quicVar(off)...)
+	b = append(b, quicVar(uint64(len(data)))...)
+	return append(b, data...)
+}
+
+// h3Frame builds an HTTP/3 frame.
+func h3Frame(typ uint64, payload []byte) []byte {
+	b := append(quicVar(typ), quicVar(uint64(len(payload)))...)
+	return append(b, payload...)
+}
+
+func cat(parts ...[]byte) []byte {
+	var out []byte
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
+func quicEvent(fn tracer.Function, data []byte) *tracer.Event {
+	return &tracer.Event{PID: 9, ConnID: 0xc0de, Function: fn, Size: uint32(len(data)), Data: data}
+}
+
+// http3Of collects the HTTP/3 items of a packet as text.
+func http3Of(t *testing.T, c *quicConns, data []byte) []string {
+	t.Helper()
+	return http3OfEvent(t, c, quicEvent(tracer.FuncQUICSend, data))
+}
+
+func http3OfEvent(t *testing.T, c *quicConns, ev *tracer.Event) []string {
+	t.Helper()
+	items, ok := c.process(ev)
+	if !ok {
+		t.Fatalf("not parsed as QUIC: % x", ev.Data)
+	}
+	var out []string
+	for _, it := range items {
+		switch {
+		case it.Frame != "":
+		case it.Err != "":
+			out = append(out, it.HTTP3+" error: "+it.Err)
+		case it.Headers != nil:
+			var h []string
+			for _, f := range it.Headers {
+				h = append(h, f.Name+"="+f.Value)
+			}
+			out = append(out, it.HTTP3+" "+strings.Join(h, " "))
+		default:
+			out = append(out, it.HTTP3+" "+string(it.Data))
+		}
+	}
+	return out
+}
+
+func TestHTTP3(t *testing.T) {
+	c := newQUICConns(newBodyPool())
+	ack := []byte{0x02, 0x05, 0x00, 0x00, 0x00} // ACK largest=5, no extra ranges
+
+	// Control stream (client unidirectional stream 2) with SETTINGS.
+	settings := h3Frame(0x04, cat(quicVar(0x01), quicVar(4096), quicVar(0x07), quicVar(16)))
+	got := http3Of(t, c, cat(ack, streamFrameBytes(2, 0, cat(quicVar(0x00), settings), false)))
+	if strings.Join(got, "|") != "stream: control |SETTINGS QPACK_BLOCKED_STREAMS=16 QPACK_MAX_TABLE_CAPACITY=4096" {
+		t.Errorf("control: %q", got)
+	}
+
+	// A request whose header block refers to dynamic table entries that the
+	// encoder stream (unidirectional stream 6) delivers later, and out of
+	// order: RFC 9204's example B.2.
+	enc := unhex(t, "3fbd01 c00f 7777 772e 6578 616d 706c 652e 636f 6d c10c 2f73 616d 706c 652f 7061 7468")
+	encStream := cat(quicVar(0x02), enc)
+	got = http3Of(t, c, streamFrameBytes(0, 0, h3Frame(0x01, unhex(t, "0381 10 11")), true))
+	if strings.Join(got, "|") != "HEADERS error: waiting for QPACK encoder stream data" {
+		t.Errorf("blocked: %q", got)
+	}
+	got = http3Of(t, c, streamFrameBytes(6, 10, encStream[10:], false)) // second half first
+	if len(got) != 0 {
+		t.Errorf("early encoder data: %q", got)
+	}
+	got = http3Of(t, c, cat(streamFrameBytes(6, 0, encStream[:10], false), []byte{0x00, 0x00, 0x00})) // and padding
+	if strings.Join(got, "|") != "stream: QPACK encoder |HEADERS :authority=www.example.com :path=/sample/path" {
+		t.Errorf("unblocked: %q", got)
+	}
+	// A retransmission changes nothing.
+	if got = http3Of(t, c, streamFrameBytes(6, 0, encStream[:10], false)); len(got) != 0 {
+		t.Errorf("retransmission: %q", got)
+	}
+
+	// A response body in two packets, the second of which also starts
+	// the next request.
+	body := h3Frame(0x00, []byte("hello, quic"))
+	got = http3Of(t, c, streamFrameBytes(4, 0, body[:6], false))
+	if strings.Join(got, "|") != "DATA hell" {
+		t.Errorf("data: %q", got)
+	}
+	got = http3Of(t, c, cat(streamFrameBytes(4, 6, body[6:], true), streamFrameBytes(8, 0, h3Frame(0x01, unhex(t, "0000 510b 2f69 6e64 6578 2e68 746d 6c")), true)))
+	if strings.Join(got, "|") != "DATA (continued) o, quic|HEADERS :path=/index.html" {
+		t.Errorf("data continued: %q", got)
+	}
+
+	// Not QUIC frames.
+	if _, ok := c.process(quicEvent(tracer.FuncQUICRecv, []byte{0x17, 0x03, 0x03})); ok {
+		t.Error("parsed a TLS record as QUIC")
+	}
+}
+
+func TestQUICFrameSummaries(t *testing.T) {
+	pkt := cat([]byte{0x01}, []byte{0x02, 0x40, 0x64, 0x00, 0x01, 0x03, 0x02, 0x01}, // PING, ACK 100 with one range
+		[]byte{0x06, 0x00, 0x03, 'a', 'b', 'c'}, // CRYPTO
+		[]byte{0x1e}, []byte{0x00, 0x00})        // HANDSHAKE_DONE, PADDING×2
+	frames, streams, err := parseQUICFrames(pkt)
+	if err != nil || len(streams) != 0 {
+		t.Fatal(err, streams)
+	}
+	if got := strings.Join(frames, ", "); got != "PING, ACK largest=100, CRYPTO off=0 len=3, HANDSHAKE_DONE, PADDING×2" {
+		t.Errorf("got %s", got)
+	}
+}
+
+// A connection's directions are followed by socket, across the encryption
+// contexts each uses, and the QPACK table of one is bounded by the other's
+// SETTINGS.
+func TestQUICConnectionBySocket(t *testing.T) {
+	c := newQUICConns(newBodyPool())
+	local := netip.MustParseAddrPort("10.0.0.2:5000")
+	ev := func(fn tracer.Function, ctx uint64, local netip.AddrPort, data []byte) *tracer.Event {
+		e := quicEvent(fn, data)
+		e.ConnID, e.FD, e.Local = ctx, 5, local
+		return e
+	}
+
+	// The server's control stream: a table of at most 64 bytes, two entries.
+	settings := cat(quicVar(0), h3Frame(0x04, cat(quicVar(0x01), quicVar(64))))
+	http3OfEvent(t, c, ev(tracer.FuncQUICRecv, 0x1, local, streamFrameBytes(3, 0, settings, false)))
+
+	// The client's encoder stream sets that capacity and inserts five
+	// entries, each evicting the one before.
+	enc := cat(quicVar(2), []byte{0x3f, 0x21})
+	for i := range 5 {
+		enc = append(enc, 0x41, 'a', 0x02, 'v', byte('0'+i))
+	}
+	http3OfEvent(t, c, ev(tracer.FuncQUICSend, 0xa, local, streamFrameBytes(2, 0, enc, false)))
+
+	// After a key update, a request refers to the fifth entry: its Required
+	// Insert Count of 5 is sent as 5 mod 4 + 1.
+	request := streamFrameBytes(0, 0, h3Frame(0x01, []byte{0x02, 0x00, 0x80}), true)
+	got := http3OfEvent(t, c, ev(tracer.FuncQUICSend, 0xb, local, request))
+	if !slices.Equal(got, []string{"HEADERS a=v4"}) {
+		t.Errorf("after a key update: %q", got)
+	}
+
+	// A header block whose insertions come after it in the same packet.
+	got = http3OfEvent(t, c, ev(tracer.FuncQUICSend, 0xb, local, cat(
+		streamFrameBytes(4, 0, h3Frame(0x01, []byte{0x03, 0x00, 0x80}), true),
+		streamFrameBytes(2, uint64(len(enc)), []byte{0x41, 'b', 0x02, 'v', '5'}, false))))
+	if !slices.Equal(got, []string{"HEADERS b=v5"}) {
+		t.Errorf("insertion later in the packet: %q", got)
+	}
+
+	// The same fd on a new socket is a new connection.
+	got = http3OfEvent(t, c, ev(tracer.FuncQUICSend, 0xc, netip.MustParseAddrPort("10.0.0.2:6000"), request))
+	if !slices.Equal(got, []string{"HEADERS error: waiting for QPACK encoder stream data"}) {
+		t.Errorf("new socket: %q", got)
+	}
+}
+
+// A connection moving to a new socket keeps its streams; a closed one's
+// keys being reused on a new socket don't.
+func TestQUICMigration(t *testing.T) {
+	c := newQUICConns(newBodyPool())
+	now := time.Now()
+	ev := func(fd int32, port uint16, ctx uint64, at time.Duration, data []byte) *tracer.Event {
+		e := quicEvent(tracer.FuncQUICRecv, data)
+		e.ConnID, e.FD, e.Time = ctx, fd, now.Add(at)
+		e.Local = netip.AddrPortFrom(netip.MustParseAddr("10.0.0.2"), port)
+		return e
+	}
+	// A response's HEADERS frame, in two pieces.
+	block := h3Frame(0x01, []byte{0x00, 0x00, 0xd9}) // :status 200, static entry 25
+	first, rest := block[:2], block[2:]
+
+	http3OfEvent(t, c, ev(5, 5000, 0xa, 0, streamFrameBytes(0, 0, first, false)))
+	http3OfEvent(t, c, ev(7, 6000, 0xa, time.Second, []byte{0x1b, 1, 2, 3, 4, 5, 6, 7, 8})) // PATH_RESPONSE
+	got := http3OfEvent(t, c, ev(7, 6000, 0xa, 2*time.Second, streamFrameBytes(0, uint64(len(first)), rest, true)))
+	if !slices.Equal(got, []string{"HEADERS :status=200"}) {
+		t.Errorf("after migrating: %q", got)
+	}
+
+	// The connection closes; a new one gets the same context on a new socket.
+	http3OfEvent(t, c, ev(7, 6000, 0xa, 3*time.Second, []byte{0x1c, 0x00, 0x00, 0x00}))
+	got = http3OfEvent(t, c, ev(9, 7000, 0xa, 4*time.Second, streamFrameBytes(0, 0, block, true)))
+	if !slices.Equal(got, []string{"HEADERS :status=200"}) {
+		t.Errorf("new connection reusing the context: %q", got)
+	}
+}

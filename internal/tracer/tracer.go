@@ -200,8 +200,9 @@ func monotonicClock() func(uint64) time.Time {
 }
 
 type cProbe struct {
-	symbol string
-	prog   *ebpf.Program
+	symbol    string
+	prog      *ebpf.Program
+	entryOnly bool // captures on entry; no return probe
 }
 
 // Attach attaches probes to a target and returns the names of the functions
@@ -216,58 +217,86 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 	switch target.Library {
 	case discover.OpenSSL:
 		probes = []cProbe{
-			{"SSL_read", t.objs.SslReadEnter},
-			{"SSL_write", t.objs.SslWriteEnter},
-			{"SSL_read_ex", t.objs.SslReadExEnter},
-			{"SSL_write_ex", t.objs.SslWriteExEnter},
+			{"SSL_read", t.objs.SslReadEnter, false},
+			{"SSL_write", t.objs.SslWriteEnter, false},
+			{"SSL_read_ex", t.objs.SslReadExEnter, false},
+			{"SSL_write_ex", t.objs.SslWriteExEnter, false},
+			// BoringSSL's packet encryption for QUIC (HTTP/3).
+			{"EVP_AEAD_CTX_seal", t.objs.QuicSealEnter, true},
+			{"EVP_AEAD_CTX_open", t.objs.QuicOpenEnter, false},
 		}
 	case discover.GnuTLS:
 		probes = []cProbe{
-			{"gnutls_record_recv", t.objs.GnutlsRecordRecvEnter},
-			{"gnutls_record_send", t.objs.GnutlsRecordSendEnter},
+			{"gnutls_record_recv", t.objs.GnutlsRecordRecvEnter, false},
+			{"gnutls_record_send", t.objs.GnutlsRecordSendEnter, false},
 		}
 	case discover.NSS:
+		if target.Offsets["AES_AEAD"] != 0 { // freebl, for Firefox's QUIC
+			probes = []cProbe{
+				{"AES_CreateContext", t.objs.AesCreateEnter, false},
+				{"AES_AEAD", t.objs.AesAeadEnter, false},
+			}
+			break
+		}
 		probes = []cProbe{
-			{"PR_Read", t.objs.PR_ReadEnter},
-			{"PR_Write", t.objs.PR_WriteEnter},
-			{"PR_Recv", t.objs.PR_RecvEnter},
-			{"PR_Send", t.objs.PR_SendEnter},
+			{"PR_Read", t.objs.PR_ReadEnter, false},
+			{"PR_Write", t.objs.PR_WriteEnter, false},
+			{"PR_Recv", t.objs.PR_RecvEnter, false},
+			{"PR_Send", t.objs.PR_SendEnter, false},
 		}
 	case discover.WolfSSL:
 		probes = []cProbe{
-			{"wolfSSL_read", t.objs.WolfsslReadEnter},
-			{"wolfSSL_write", t.objs.WolfsslWriteEnter},
+			{"wolfSSL_read", t.objs.WolfsslReadEnter, false},
+			{"wolfSSL_write", t.objs.WolfsslWriteEnter, false},
 		}
 	case discover.MbedTLS:
 		probes = []cProbe{
-			{"mbedtls_ssl_read", t.objs.MbedtlsSslReadEnter},
-			{"mbedtls_ssl_write", t.objs.MbedtlsSslWriteEnter},
+			{"mbedtls_ssl_read", t.objs.MbedtlsSslReadEnter, false},
+			{"mbedtls_ssl_write", t.objs.MbedtlsSslWriteEnter, false},
 		}
 	case discover.S2N:
 		probes = []cProbe{
-			{"s2n_recv", t.objs.S2nRecvEnter},
-			{"s2n_send", t.objs.S2nSendEnter},
+			{"s2n_recv", t.objs.S2nRecvEnter, false},
+			{"s2n_send", t.objs.S2nSendEnter, false},
 		}
 	case discover.GoTLS:
 		return t.attachGo(ex, target.Go)
+	case discover.Rustls:
+		return t.attachRustls(ex, target.Rust)
 	default:
 		return nil, fmt.Errorf("unsupported library %v", target.Library)
 	}
 
-	opts := &link.UprobeOptions{PID: t.opts.PID}
 	var attached []string
 	for _, p := range probes {
+		opts := &link.UprobeOptions{PID: t.opts.PID}
+		if target.Offsets != nil { // a stripped copy: functions found by signature
+			off, ok := target.Offsets[p.symbol]
+			if !ok {
+				continue
+			}
+			opts.Address = off
+		}
 		// Attach the return probe first so no entry goes unmatched.
-		ret, err := ex.Uretprobe(p.symbol, t.objs.TlsReturn, opts)
-		if errors.Is(err, link.ErrNoSymbol) {
-			continue // e.g. SSL_read_ex before OpenSSL 1.1.1
+		if !p.entryOnly {
+			retProg := t.objs.TlsReturn
+			if p.symbol == "AES_CreateContext" { // records the new context's direction
+				retProg = t.objs.AesCreateReturn
+			}
+			ret, err := ex.Uretprobe(p.symbol, retProg, opts)
+			if errors.Is(err, link.ErrNoSymbol) {
+				continue // e.g. SSL_read_ex before OpenSSL 1.1.1
+			}
+			if err != nil {
+				return attached, fmt.Errorf("%s: %w", p.symbol, err)
+			}
+			t.addLink(ret)
 		}
-		if err != nil {
-			return attached, fmt.Errorf("%s: %w", p.symbol, err)
-		}
-		t.addLink(ret)
 
 		entry, err := ex.Uprobe(p.symbol, p.prog, opts)
+		if errors.Is(err, link.ErrNoSymbol) {
+			continue
+		}
 		if err != nil {
 			return attached, fmt.Errorf("%s: %w", p.symbol, err)
 		}
@@ -276,6 +305,41 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 	}
 	if len(attached) == 0 {
 		return nil, errors.New("none of the expected functions were found")
+	}
+	return attached, nil
+}
+
+// attachRustls attaches to rustls's Reader::read and Writer::write, found by
+// their mangled names, at their file offsets.
+func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]string, error) {
+	if ri == nil {
+		return nil, errors.New("missing rustls function information")
+	}
+	var attached []string
+	for _, p := range []struct {
+		name    string
+		offsets []uint64
+		prog    *ebpf.Program
+	}{
+		{"rustls::Reader::read", ri.Reads, t.objs.RustlsReadEnter},
+		{"rustls::Writer::write", ri.Writes, t.objs.RustlsWriteEnter},
+	} {
+		for _, off := range p.offsets {
+			opts := &link.UprobeOptions{Address: off, PID: t.opts.PID}
+			ret, err := ex.Uretprobe("", t.objs.TlsReturn, opts)
+			if err != nil {
+				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
+			}
+			t.addLink(ret)
+			entry, err := ex.Uprobe("", p.prog, opts)
+			if err != nil {
+				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
+			}
+			t.addLink(entry)
+		}
+		if len(p.offsets) > 0 {
+			attached = append(attached, p.name)
+		}
 	}
 	return attached, nil
 }
@@ -407,17 +471,20 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) boo
 }
 
 // Run delivers events to handle until ctx is cancelled. handle is called
-// from Run's goroutine.
+// from Run's goroutine. A connection's writes that went out before its
+// socket was known are held back until it is, briefly.
 func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 	const (
-		pollInterval = 200 * time.Millisecond
-		maxChunkWait = time.Second
+		pollInterval  = 200 * time.Millisecond
+		maxChunkWait  = time.Second
+		maxSocketWait = 300 * time.Millisecond
 	)
 	asm := newAssembler(t.clock)
+	sockets := newSocketWaiter()
 	lastExpire := time.Now()
 	var rec ringbuf.Record
 
-	deliver := func(ev *Event) {
+	release := func(ev *Event) {
 		if !t.haveBTF {
 			ev.Comm = t.processName(ev.PID, ev.Comm)
 			if t.opts.Comm != "" && ev.Comm != t.opts.Comm {
@@ -426,11 +493,20 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 		}
 		handle(ev)
 	}
+	deliver := func(ev *Event, now time.Time) {
+		for _, ev := range sockets.add(ev, now) {
+			release(ev)
+		}
+	}
 
 	for {
 		if ctx.Err() != nil {
-			for _, ev := range asm.expire(time.Now(), 0) {
-				deliver(ev)
+			now := time.Now()
+			for _, ev := range asm.expire(now, 0) {
+				deliver(ev, now)
+			}
+			for _, ev := range sockets.expire(now, 0) {
+				release(ev)
 			}
 			return nil
 		}
@@ -449,14 +525,23 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 			if err != nil {
 				return err
 			}
+			if c.Fn == fnSocketNotice {
+				for _, ev := range sockets.notice(c) {
+					release(ev)
+				}
+				break
+			}
 			for _, ev := range asm.add(c, now) {
-				deliver(ev)
+				deliver(ev, now)
 			}
 		}
 
 		if now.Sub(lastExpire) >= pollInterval {
 			for _, ev := range asm.expire(now, maxChunkWait) {
-				deliver(ev)
+				deliver(ev, now)
+			}
+			for _, ev := range sockets.expire(now, maxSocketWait) {
+				release(ev)
 			}
 			lastExpire = now
 		}
