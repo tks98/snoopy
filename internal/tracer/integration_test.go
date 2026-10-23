@@ -788,6 +788,64 @@ func TestNewProcess(t *testing.T) {
 
 // TestRustls needs a Rust toolchain, and building the client takes a while,
 // so it only runs with SNOOPY_TEST_RUSTLS=1.
+// rustls under tokio, with its default crypto provider (aws-lc-rs): seen
+// where aws-lc encrypts and decrypts each record, over TLS 1.3 and 1.2.
+func TestRustlsAsync(t *testing.T) {
+	requireRoot(t)
+	if os.Getenv("SNOOPY_TEST_RUSTLS") != "1" {
+		t.Skip("set SNOOPY_TEST_RUSTLS=1 to build the rustls client with cargo and run this test")
+	}
+	cargo := requireTool(t, "cargo")
+	build := exec.Command(cargo, "build", "--release", "--quiet", "--manifest-path", "testdata/rustlsasync/Cargo.toml")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build rustls client: %v: %s", err, out)
+	}
+	client, err := filepath.Abs("testdata/rustlsasync/target/release/rustlsasync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := discover.Inspect(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Rust == nil || !targets[0].Rust.AtRecords() {
+		t.Fatalf("aws-lc's AEAD functions not found: %+v", targets)
+	}
+	events := startTracer(t, Options{Comm: "rustlsasync"}, targets)
+	srv, port := newServer(t)
+	server := srv.Listener.Addr().String()
+
+	for _, version := range []string{"tls13", "tls12"} {
+		path := "/async-" + version
+		out, err := exec.Command(client, port, path, version).CombinedOutput()
+		if err != nil || !bytes.Contains(out, []byte("served "+path)) {
+			t.Fatalf("rustlsasync %s: %v: %s", version, err, out)
+		}
+		// The connection's first write goes out before its socket is known;
+		// it is held back until the socket notice fills it in.
+		write := waitFor(t, events, version+" request", func(ev *Event) bool {
+			return ev.Function == FuncRecordSend && contains("GET "+path+" HTTP/1.1")(ev)
+		})
+		checkConnection(t, write, server)
+		read := waitFor(t, events, version+" response", func(ev *Event) bool {
+			return ev.Function == FuncRecordRecv && contains("served "+path)(ev)
+		})
+		checkConnection(t, read, server)
+		// Only application data: no handshake messages, no TLS 1.3 content
+		// type left at the end.
+		if !bytes.HasPrefix(write.Data, []byte("GET ")) || !bytes.HasSuffix(write.Data, []byte("\r\n\r\n")) {
+			t.Errorf("%s request: %q", version, write.Data)
+		}
+		if !bytes.HasPrefix(read.Data, []byte("HTTP/1.1 200 OK")) {
+			t.Errorf("%s response: %q", version, read.Data)
+		}
+	}
+	// Records only: the Writer isn't probed too, or writes would show twice.
+	if ev := events.find(func(ev *Event) bool { return ev.Function == FuncRustlsWrite || ev.Function == FuncRustlsRead }); ev != nil {
+		t.Errorf("%s probed as well", ev.Function)
+	}
+}
+
 func TestRustls(t *testing.T) {
 	requireRoot(t)
 	if os.Getenv("SNOOPY_TEST_RUSTLS") != "1" {

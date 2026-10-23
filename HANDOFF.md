@@ -34,13 +34,11 @@ github.com/tks98/snoopy/v2@latest` installs it.
 
 ### To do
 
-1. **Dependabot.** #11 bumps the Go dependencies to versions that need Go
-   1.26 (`golang.org/x/net` 0.59 and later), so it raises the `go` directive
-   and its lint job fails. It also bumps `golang.org/x/arch`, which needs the
-   check in [docs/maintenance.md](docs/maintenance.md#funcfind-and-golangorgxarch)
-   before merging. `x/net` itself is at 0.58.0, the last release for Go 1.25,
-   which has the fix for the advisory Dependabot raised. #5
-   (golangci-lint-action 9) and #7 (goreleaser-action 7) are open too.
+1. **Dependabot.** #5 (golangci-lint-action 9) and #7 (goreleaser-action
+   7) are open. Go is at 1.26, with `golang.org/x/arch` 0.32 checked as
+   [docs/maintenance.md](docs/maintenance.md#funcfind-and-golangorgxarch)
+   describes: the arm64 finder gives the same answers on Debian's Chromium
+   155 and Firefox ESR 153 as with 0.30.
 2. **Guard against browser releases.** The list in
    [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it), the
    weekly canary job against the latest Chrome, Electron and Firefox first.
@@ -54,7 +52,7 @@ compile for darwin, and `go test ./...` fails on macOS. Work inside a Linux VM:
 - **OrbStack** or **Lima** (`brew install lima && limactl start
   template://ubuntu-24.04`) give you an Ubuntu 24.04 arm64 VM on Apple Silicon.
   That also tests the arm64 code natively. Ubuntu 24.04 matches CI.
-- In the VM, install Go 1.25+ and run:
+- In the VM, install Go 1.26+ and run:
 
   ```bash
   sudo apt-get install -y clang-18 llvm-18 curl python3 gnutls-bin libnss3-dev pkg-config qemu-system-x86 iproute2
@@ -200,7 +198,18 @@ signature finding against real binaries (see
   if the framing is lost. Missing bytes (truncated captures) are tolerated
   inside DATA payloads; anywhere else, decoding stops for that direction
   with a note.
-- **rustls** is found by mangled symbol names (v0 and legacy;
+- **rustls with aws-lc-rs** (its default provider) is read at aws-lc's
+  `EVP_AEAD_CTX_seal`, `seal_scatter` (TLS 1.2) and `open`, found by
+  symbol (`awsLCAEAD`) and probed with `aead_*_enter`, which unlike
+  Chromium's `quic_*_enter` keep TLS records as well as QUIC packets
+  (`classify_aad`). A TLS 1.3 record's type is its plaintext's last non-zero
+  byte (`tls13_content_len`); only application data is emitted, as
+  `FN_RECORD_SEND`/`FN_RECORD_RECV`. Each direction has its own AEAD
+  context, so `output.connOf` ties a connection's directions together by
+  socket. Contexts' memory gets reused by later connections, so
+  `conn_infos` keeps the socket's struct file and `emit` only trusts it
+  while the fd still refers to that socket (`conn_info_live`).
+- **rustls with ring** is found by mangled symbol names (v0 and legacy;
   `inspectRustls`). Its Reader and Writer do no socket I/O, so
   `io_threads` remembers, per thread that called them, the last receive's
   socket (a read's socket is the one just read from) and which Writer is
@@ -350,8 +359,9 @@ signature finding against real binaries (see
   3 s after the exec. TLS calls made before a new library is attached are
   missed, and libraries a long-running process `dlopen`s more than 3 s after
   its exec aren't picked up.
-- **Not supported:** rustls under tokio (hyper, reqwest: `Reader::read` is
-  inlined into tokio-rustls, writes use `write_vectored`), Java, QUIC/HTTP/3
+- **Not supported:** rustls under tokio with the ring provider (reqwest 0.12's
+  default: `Reader::read` is inlined into tokio-rustls; see
+  docs/plan-rustls-http3.md), Java, QUIC/HTTP/3
   outside Chromium and Firefox, Firefox's QUIC with ChaCha20-Poly1305
   (freebl's `ChaCha20Poly1305_Seal`/`Open`, table entries 214/215, would be
   the place), apps using OpenSSL only via its BIO layer (`openssl s_server
@@ -372,7 +382,8 @@ signature finding against real binaries (see
 - **Go versions:** Go < 1.17 (amd64) and < 1.18 (arm64) are refused, since
   they predate the register ABI.
 - **Ideas:**
-  - rustls under tokio, the biggest gap that looks reachable.
+  - rustls under tokio with ring, and HTTP/3 in curl and Go:
+    docs/plan-rustls-http3.md.
   - Java's TLS (JSSE), a big gap but hard: the code is JIT-compiled.
   - Publish a container image (the static binary makes it trivial).
   - An `--sslkeylog` mode.

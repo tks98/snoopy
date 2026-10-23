@@ -76,7 +76,11 @@ func Inspect(path string) ([]Target, error) {
 	}
 
 	if ri := inspectRustls(f); ri != nil {
-		targets = append(targets, Target{Path: path, Library: Rustls, Rust: ri})
+		t := Target{Path: path, Library: Rustls, Rust: ri}
+		if ri.AtRecords() {
+			t.Note = "records through aws-lc"
+		}
+		targets = append(targets, t)
 	}
 
 	defined := definedFuncs(f)
@@ -254,6 +258,8 @@ func pclntabBounds(f *elf.File, name string) (start, end uint64, err error) {
 	textStart := text.Addr
 	if ts, ok := pclntabTextStart(data); ok {
 		textStart = ts
+	} else if ts, ok := moduledataTextStart(f, pcln.Addr, data); ok {
+		textStart = ts
 	}
 	table, err := gosym.NewTable(nil, gosym.NewLineTable(data, textStart))
 	if err != nil {
@@ -267,9 +273,10 @@ func pclntabBounds(f *elf.File, name string) (start, end uint64, err error) {
 }
 
 // pclntabTextStart returns the address of runtime.text recorded in a Go
-// 1.18+ pclntab header, which function offsets are relative to. It is not
-// the start of .text when the program was linked externally (cgo), where C
-// code comes first.
+// 1.18 to 1.25 pclntab header, which function offsets are relative to. It
+// is not the start of .text when the program was linked externally (cgo),
+// where C code comes first. Go 1.26 leaves the field zero, since it needed a
+// relocation; moduledataTextStart finds the address then.
 func pclntabTextStart(pclntab []byte) (uint64, bool) {
 	// magic uint32; pad1, pad2, minLC, ptrSize uint8; nfunc int; nfiles uint; textStart uintptr
 	if len(pclntab) < 8 {
@@ -285,7 +292,56 @@ func pclntabTextStart(pclntab []byte) (uint64, bool) {
 	if ptrSize != 8 || len(pclntab) < off+8 {
 		return 0, false
 	}
-	return binary.LittleEndian.Uint64(pclntab[off:]), true
+	ts := binary.LittleEndian.Uint64(pclntab[off:])
+	return ts, ts != 0
+}
+
+// moduledataTextStart finds runtime.text in the runtime's moduledata for
+// the main program: a struct in a data section whose first field points
+// to the pclntab header, and whose text field is 22 words in (after
+// pcHeader, six slices, findfunctab, minpc and maxpc), as it has been since
+// Go 1.16. The pointer to the function name table, the next field, must
+// agree with the header, and the address must be in executable code.
+func moduledataTextStart(f *elf.File, pclntabAddr uint64, pclntab []byte) (uint64, bool) {
+	const (
+		funcnameOffsetAt = 32     // in the pcHeader, for 8-byte pointers
+		textWord         = 22     // in the moduledata
+		size             = 24 * 8 // through etext
+	)
+	if len(pclntab) < funcnameOffsetAt+8 || pclntab[7] != 8 {
+		return 0, false
+	}
+	funcnametab := pclntabAddr + binary.LittleEndian.Uint64(pclntab[funcnameOffsetAt:])
+	// .noptrdata, or .go.module when the system linker linked the program.
+	for _, sec := range f.Sections {
+		if sec.Type != elf.SHT_PROGBITS || sec.Flags&(elf.SHF_ALLOC|elf.SHF_WRITE) != elf.SHF_ALLOC|elf.SHF_WRITE {
+			continue
+		}
+		data, err := sec.Data()
+		if err != nil {
+			continue
+		}
+		for off := 0; off+size <= len(data); off += 8 {
+			word := func(i int) uint64 { return binary.LittleEndian.Uint64(data[off+8*i:]) }
+			if word(0) != pclntabAddr || word(1) != funcnametab {
+				continue
+			}
+			text, etext := word(textWord), word(textWord+1)
+			if text < etext && inExecutableSection(f, text) {
+				return text, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func inExecutableSection(f *elf.File, addr uint64) bool {
+	for _, s := range f.Sections {
+		if s.Flags&elf.SHF_EXECINSTR != 0 && addr >= s.Addr && addr < s.Addr+s.Size {
+			return true
+		}
+	}
+	return false
 }
 
 // goBodyOffset verifies that code starts like a Go function that checks for
@@ -382,15 +438,31 @@ func fileOffset(f *elf.File, addr uint64) (uint64, error) {
 	return 0, fmt.Errorf("address %#x is not in an executable segment", addr)
 }
 
-// RustInfo locates rustls's plaintext functions in a Rust program: the read
-// method of its Reader and the write method of its Writer, which are
-// mangled Rust symbols, possibly several of each if more than one rustls
-// version is linked in. Programs stripped of their symbol table can't be
-// traced.
+// RustInfo locates rustls's plaintext in a Rust program. With rustls's
+// default crypto provider, aws-lc-rs, that's where aws-lc encrypts and
+// decrypts each record: its EVP_AEAD_CTX_seal and EVP_AEAD_CTX_open, C
+// functions whose names aws-lc-sys prefixes with its version. Otherwise it's
+// the read method of rustls's Reader and the write method of its Writer,
+// mangled Rust symbols that async programs (tokio-rustls) inline away.
+// There may be several of each if more than one version is linked in.
+// Programs stripped of their symbol table can't be traced.
 type RustInfo struct {
-	Reads  []uint64 // file offsets of <rustls Reader as Read>::read
-	Writes []uint64 // file offsets of <rustls Writer as Write>::write
+	Seals    []uint64 // file offsets of aws-lc's EVP_AEAD_CTX_seal
+	Scatters []uint64 // EVP_AEAD_CTX_seal_scatter, which it uses for TLS 1.2
+	Opens    []uint64 // and EVP_AEAD_CTX_open
+	Reads    []uint64 // file offsets of <rustls Reader as Read>::read
+	Writes   []uint64 // file offsets of <rustls Writer as Write>::write
 }
+
+// AtRecords reports whether the program's TLS is seen where its records
+// are encrypted and decrypted, rather than at rustls's Reader and Writer.
+func (ri *RustInfo) AtRecords() bool {
+	return len(ri.Seals) > 0 && len(ri.Opens) > 0
+}
+
+// awsLCAEAD matches aws-lc's AEAD functions as aws-lc-sys names them, e.g.
+// aws_lc_0_46_0_EVP_AEAD_CTX_open.
+var awsLCAEAD = regexp.MustCompile(`^aws_lc_[0-9_]+_EVP_AEAD_CTX_(seal|open|seal_scatter)$`)
 
 // The symbols, in Rust's v0 mangling (the default since Rust 1.9x) and the
 // legacy one, e.g.
@@ -410,25 +482,39 @@ func inspectRustls(f *elf.File) *RustInfo {
 		return nil
 	}
 	var ri RustInfo
+	hasRustls := false
 	for _, s := range syms {
-		if s.Section == elf.SHN_UNDEF || elf.ST_TYPE(s.Info) != elf.STT_FUNC || !strings.Contains(s.Name, "rustls") {
+		if s.Section == elf.SHN_UNDEF || elf.ST_TYPE(s.Info) != elf.STT_FUNC {
 			continue
 		}
 		var list *[]uint64
 		switch {
+		case strings.HasPrefix(s.Name, "aws_lc_") && awsLCAEAD.MatchString(s.Name):
+			switch {
+			case strings.HasSuffix(s.Name, "_seal"):
+				list = &ri.Seals
+			case strings.HasSuffix(s.Name, "_seal_scatter"):
+				list = &ri.Scatters
+			default:
+				list = &ri.Opens
+			}
+		case !strings.Contains(s.Name, "rustls"):
+			continue
 		case rustlsRead.MatchString(s.Name):
 			list = &ri.Reads
 		case rustlsWrite.MatchString(s.Name):
 			list = &ri.Writes
 		default:
+			hasRustls = true
 			continue
 		}
 		if off, err := fileOffset(f, s.Value); err == nil && !slices.Contains(*list, off) {
 			*list = append(*list, off)
 		}
 	}
-	if len(ri.Reads) == 0 && len(ri.Writes) == 0 {
-		return nil
+	hasRustls = hasRustls || len(ri.Reads) > 0 || len(ri.Writes) > 0
+	if !hasRustls || !ri.AtRecords() && len(ri.Reads) == 0 && len(ri.Writes) == 0 {
+		return nil // aws-lc without rustls is another library's to trace
 	}
 	return &ri
 }

@@ -60,7 +60,7 @@ file, then match what you see:
   docker run --rm -v "$PWD:/src" -w /src ubuntu:24.04 bash -c '
     apt-get update -qq && apt-get install -y -qq curl ca-certificates clang-18 llvm-18 libbpf-dev >/dev/null &&
     ln -s /usr/bin/clang-18 /usr/local/bin/clang && ln -s /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip &&
-    curl -fsSL https://go.dev/dl/go1.25.0.linux-$(dpkg --print-architecture).tar.gz | tar -C /usr/local -xz &&
+    curl -fsSL https://go.dev/dl/go1.26.9.linux-$(dpkg --print-architecture).tar.gz | tar -C /usr/local -xz &&
     export PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local && go generate ./... && go test ./...'
   ```
 
@@ -242,7 +242,7 @@ minutes per kernel:
 ```bash
 docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src ubuntu:24.04 bash -c '
   apt-get update -qq && apt-get install -y -qq qemu-system-x86 gnutls-bin libnss3-dev pkg-config curl python3 git gcc ca-certificates iproute2 >/dev/null &&
-  curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz &&
+  curl -fsSL https://go.dev/dl/go1.26.9.linux-amd64.tar.gz | tar -C /usr/local -xz &&
   export PATH=/usr/local/go/bin:/root/go/bin:$PATH GOTOOLCHAIN=local VIMTO_DISABLE_KVM=true &&
   CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0 &&
   for k in 5.10 5.15 6.1 6.6 6.12; do make integration-vm KERNEL=$k || echo "Linux $k failed"; done'
@@ -466,7 +466,29 @@ symbols.
 
 ### How it was found
 
-rustls's `Reader` and `Writer` (what `rustls::Stream` and clients like ureq
+With aws-lc-rs, rustls's default crypto provider, the plaintext is read where
+aws-lc encrypts and decrypts each record. A bpftrace session on a
+tokio-rustls client showed which of aws-lc's AEAD functions are called, with
+which associated data, and on which threads relative to the socket syscalls:
+
+```bash
+B=<program>; P=aws_lc_0_46_0_EVP_AEAD_CTX
+bpftrace -e "uprobe:$B:${P}_open { printf(\"%d open in_len=%d ad_len=%d\n\", tid, arg7, *(uint64*)(reg(\"sp\")+8)); }
+  uprobe:$B:${P}_seal { printf(\"%d seal in_len=%d\n\", tid, arg7); }
+  tracepoint:syscalls:sys_enter_recvfrom /comm == \"<name>\"/ { printf(\"%d recvfrom fd=%d\n\", tid, args.fd); }"
+```
+
+(On arm64 the ninth and tenth arguments are on the stack; on x86-64 from the
+seventh.) `open` decrypts every record (calling `open_gather` itself, so that
+one isn't probed); `seal` encrypts TLS 1.3 records and `seal_scatter` TLS
+1.2's. The associated data is the record header (5 bytes, TLS 1.3) or 13
+bytes (TLS 1.2). Each decrypt follows a receive on the same thread and each
+encrypt precedes a send, as with QUIC packets. Under load, a new
+connection's encryption context was often allocated where a closed
+connection's had been, which is why `conn_infos` keeps the socket's struct
+file and checks it.
+
+Without aws-lc, rustls's `Reader` and `Writer` (what `rustls::Stream` and clients like ureq
 read and write through) do no socket I/O themselves, and Rust programs keep
 their symbol table by default. `inspectRustls` in
 `internal/discover/inspect.go` matches the mangled names of
@@ -480,6 +502,17 @@ which gives each call its socket.
 
 ### How to tell it broke, and how to fix it
 
+- **A tokio program shows only its writes:** aws-lc's functions weren't found,
+  so snoopy fell back to `Writer::write`. List them and update `awsLCAEAD`
+  in `internal/discover/inspect.go`, and `TestAwsLCSymbols`:
+
+  ```bash
+  nm <program> | grep -E 'EVP_AEAD_CTX_(seal|open)'
+  ```
+
+- **One direction or one TLS version missing:** aws-lc-rs may call another
+  AEAD function for it. Rerun the bpftrace session above with all of
+  `EVP_AEAD_CTX_*`'s variants probed.
 - **Not attached:** list the names in a current build and update the
   patterns, and `TestRustlsSymbols`:
 
@@ -491,8 +524,10 @@ which gives each call its socket.
   `Reader::read`'s return paths, or put a tracefs return probe on it printing
   both return registers (`%ax` and `%dx` on x86-64, `%x0` and `%x1` on arm64)
   while reading a known amount.
-- **To test:** `SNOOPY_TEST_RUSTLS=1` runs `TestRustls`, which builds the
-  client in `internal/tracer/testdata/rustlsclient` with cargo.
+- **To test:** `SNOOPY_TEST_RUSTLS=1` runs `TestRustls` and
+  `TestRustlsAsync`, which build the clients in
+  `internal/tracer/testdata/rustlsclient` (ring) and `rustlsasync`
+  (aws-lc-rs, on tokio) with cargo.
 
 ## Go crypto/tls
 

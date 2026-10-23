@@ -105,16 +105,27 @@ thing it depends on ships.
 
 ### rustls
 
-- **Depends on:** the mangled names of `Reader::read` and `Writer::write`,
-  and Rust returning `io::Result<usize>` in two registers.
-- **Breaks when:** rustls moves those types to other modules, or rustc
-  changes how it returns that `Result`. Rust's ABI is explicitly unstable.
-- **How it shows:** renamed symbols mean nothing attaches, which is loud. A
-  changed return layout means wrong lengths or no data, which is quiet.
+- **Depends on:** with rustls's default provider, aws-lc-rs: aws-lc-sys
+  naming its C functions `aws_lc_<version>_EVP_AEAD_CTX_seal` and so on, and
+  aws-lc-rs calling `seal` for TLS 1.3, `seal_scatter` for TLS 1.2 and
+  `open` for both, without one of them calling another's exported symbol.
+  With ring: the mangled names of `Reader::read` and `Writer::write`, and
+  Rust returning `io::Result<usize>` in two registers.
+- **Breaks when:** aws-lc-sys changes its prefix, or aws-lc-rs moves to other
+  AEAD functions; rustls moves `Reader` and `Writer`, or rustc changes how it
+  returns that `Result`. Rust's ABI is explicitly unstable.
+- **How it shows:** renamed symbols mean nothing attaches, which is loud,
+  except that a program with rustls but no aws-lc functions found falls back
+  to the reader and writer, so under tokio only its writes show. Another
+  AEAD function for one TLS version loses that direction's data quietly, as
+  TLS 1.2's requests were before `seal_scatter` was probed. A changed return
+  layout means wrong lengths or no data, which is quiet.
 - **Already seen:** under tokio, `Reader::read` is inlined and writes are
-  vectored, so async programs were never covered.
-- **Guarded by:** `TestRustls`, only with `SNOOPY_TEST_RUSTLS=1`, and
-  `TestRustlsSymbols`.
+  vectored, so async programs weren't covered until records were read at
+  aws-lc. aws-lc-rs seals TLS 1.2 records with `seal_scatter`, not `seal`.
+- **Guarded by:** `TestRustls` and `TestRustlsAsync` (TLS 1.3 and 1.2), only
+  with `SNOOPY_TEST_RUSTLS=1`, and `TestRustlsSymbols` and
+  `TestAwsLCSymbols`.
 
 ### Go crypto/tls
 

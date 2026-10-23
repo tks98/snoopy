@@ -15,7 +15,7 @@ Wikipedia over HTTP/2, recorded with
 
 Download a binary for `linux_amd64` or `linux_arm64` from the
 [releases page](https://github.com/tks98/snoopy/releases), or build one with
-Go 1.25 or later, and copy it to where `sudo` finds it:
+Go 1.26 or later, and copy it to where `sudo` finds it:
 
 ```bash
 # a release binary
@@ -62,8 +62,8 @@ the output, JSON and pcap, containers, and troubleshooting.
 ## What it traces
 
 - **TLS libraries:** OpenSSL, BoringSSL, LibreSSL, GnuTLS, NSS, wolfSSL,
-  Mbed TLS, s2n-tls, rustls and Go's `crypto/tls`, stripped Go programs
-  included.
+  Mbed TLS, s2n-tls, rustls (async too) and Go's `crypto/tls`, stripped Go
+  programs included.
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
   symbols and is found by signature, and Firefox. Their HTTP/3 too.
 - **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded, and

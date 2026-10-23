@@ -82,7 +82,7 @@ func newHTTP1Conns(pool *bodyPool) *http1Conns {
 // It returns nil for connections it doesn't follow, whose data starts with
 // neither a message nor more of one.
 func (c *http1Conns) process(ev *tracer.Event) []http1Segment {
-	key := http2Key{ev.PID, ev.ConnID}
+	key := http2Key{ev.PID, connOf(ev)}
 	conn := c.conns[key]
 	if conn == nil {
 		if !startsHTTP1(ev.Data) {
