@@ -7,7 +7,7 @@ changing it. Two more documents cover the parts that depend on other
 programs' internals: [docs/release-risks.md](docs/release-risks.md), what new
 releases are likely to break, and [docs/maintenance.md](docs/maintenance.md),
 how those parts were found and how to fix them, with the tools and commands
-used.
+used. [AGENTS.md](AGENTS.md) is the short list for coding agents.
 
 ## Status
 
@@ -17,30 +17,33 @@ rustls, Chrome by signature (x86_64 and arm64), HTTP/3 for Chromium and
 Firefox, and compressed bodies (#10); docs on the fragile parts (#12);
 tcpdump-style output and filters (#13); and fixes for a first run: output
 limits, `--pid` following children, connections from before snoopy, the
-`/v2` module path (#14).
+`/v2` module path (#14), and install steps that make `sudo snoopy` work
+(#15).
+
+Released: v2.0.0, the first release, tagged on #14's merge. GoReleaser
+published linux amd64 and arm64 binaries, and `go install
+github.com/tks98/snoopy/v2@latest` installs it.
 
 | Check | Status |
 | --- | --- |
 | Lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date | Green in CI |
 | Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
 | Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #14 (24 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
-| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | 27 pass, rustls included (`SNOOPY_TEST_RUSTLS=1`) |
-| Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded |
+| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | 27 pass with #14; rustls skipped there, and last passed with #10 (`SNOOPY_TEST_RUSTLS=1`) |
+| Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded. With #14, again on the arm64 Chromium and Firefox snaps: `--pid` of Chromium's main process, connections opened before snoopy, and Firefox from a fresh start |
 
 ### To do
 
-1. **Delete the logs of CI run 38189398199**, if that hasn't happened
-   (https://github.com/tks98/snoopy/actions/runs/38189398199, then ⋯, then
-   "Delete all logs"). Its smoke test printed the runner's own TLS traffic,
-   including short-lived Azure SAS signatures and the job's `GITHUB_TOKEN`
-   basic-auth header. Both expire quickly, but they shouldn't stay public. The
-   smoke test now runs with `--quiet`.
-2. Tag the first release (`git tag v2.0.0 && git push --tags`). GoReleaser
-   publishes linux amd64 and arm64 binaries. No release has been made yet.
-3. Dependabot's #5, #6 and #7 are open. #6 bumps `golang.org/x/arch`, so check
-   it as [docs/maintenance.md](docs/maintenance.md#funcfind-and-golangorgxarch)
-   describes before merging it; it may also need a rebase, since #10 changed
-   go.mod.
+1. **Dependabot.** #11 bumps the Go dependencies to versions that need Go
+   1.26 (`golang.org/x/net` 0.59 and later), so it raises the `go` directive
+   and its lint job fails. It also bumps `golang.org/x/arch`, which needs the
+   check in [docs/maintenance.md](docs/maintenance.md#funcfind-and-golangorgxarch)
+   before merging. `x/net` itself is at 0.58.0, the last release for Go 1.25,
+   which has the fix for the advisory Dependabot raised. #5
+   (golangci-lint-action 9) and #7 (goreleaser-action 7) are open too.
+2. **Guard against browser releases.** The list in
+   [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it), the
+   weekly canary job against the latest Chrome, Electron and Firefox first.
 
 ## Working on it from a Mac
 
