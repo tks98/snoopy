@@ -13,7 +13,7 @@ const fnSocketNotice = 0xff
 // the thread's next socket syscall shows which socket it goes out on, so a
 // connection's first write can't have one when it's emitted.
 func (f Function) learnsSocketLater() bool {
-	return f == FuncRustlsWrite || f == FuncQUICSend || f == FuncNSSQUICSend
+	return f == FuncRustlsWrite || f == FuncQUICSend || f == FuncNSSQUICSend || f == FuncRecordSend
 }
 
 // socketWaiter holds back events that went out without a socket until the

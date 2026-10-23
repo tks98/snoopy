@@ -51,6 +51,10 @@ enum fn_id {
 	FN_QUIC_RECV,
 	FN_NSS_QUIC_SEND,
 	FN_NSS_QUIC_RECV,
+	// TLS records' plaintext, where a library encrypts and decrypts them
+	// (rustls through aws-lc), for programs without another place to see it.
+	FN_RECORD_SEND,
+	FN_RECORD_RECV,
 };
 
 // A header-only record that isn't a call: a connection whose earlier events
@@ -64,6 +68,7 @@ enum ret_kind {
 	RET_BOOL_EX, // 1 on success, byte count written through a size_t*
 	RET_RUST_RESULT, // Rust's io::Result<usize>: Ok (0) or Err, then the byte count
 	RET_SECSTATUS_U32, // NSS's SECSuccess (0), byte count written through an unsigned int*
+	RET_BOOL_EX_TLS13, // RET_BOOL_EX, a TLS 1.3 record's inner plaintext (see tls13_content_len)
 };
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
@@ -167,6 +172,10 @@ struct conn_info {
 	__u8 laddr[16];
 	__u8 raddr[16];
 	__u8 _pad[2];
+	// The socket's struct file, with BTF: the connection handle can be freed
+	// and its memory reused for another connection (an AEAD context often
+	// is), and the fd closed and reused for another socket.
+	__u64 file;
 };
 
 struct {
@@ -331,6 +340,7 @@ static __always_inline void resolve_socket(__s32 fd, struct conn_info *info)
 	struct file *file = socket_file(fd);
 	if (!file)
 		return;
+	info->file = (__u64)file;
 
 	struct socket *sock = BPF_CORE_READ(file, private_data);
 	struct sock *sk = BPF_CORE_READ(sock, sk);
@@ -375,8 +385,8 @@ static __always_inline bool track_conn(__u64 pid_tgid, __u64 conn, __s32 fd)
 	// its port and skc_num reads 0, yet buffered data can still be read.
 	// Keep what we learned while it was open.
 	struct conn_info *known = bpf_map_lookup_elem(&conn_infos, &key);
-	bool changed = !known || known->fd != fd;
-	if (known && known->fd == fd && known->family && (!info.family || !info.lport || !info.rport))
+	bool changed = !known || known->fd != fd || known->file != info.file;
+	if (!changed && known->family && (!info.family || !info.lport || !info.rport))
 		return false;
 	bpf_map_update_elem(&conn_infos, &key, &info, BPF_ANY);
 	return changed;
@@ -424,6 +434,13 @@ static __always_inline int output_last_chunk(const struct event_header *h, const
 	return -1;
 }
 
+// Reports whether what's known about a connection still holds: its fd is
+// still the same socket. Without BTF, there's no telling.
+static __always_inline bool conn_info_live(struct conn_info *info)
+{
+	return !have_btf || !info->file || (__u64)socket_file(info->fd) == info->file;
+}
+
 static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
 {
 	if (n <= 0)
@@ -447,7 +464,7 @@ static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64
 	key.tgid = pid_tgid >> 32;
 	key.conn = call->conn;
 	struct conn_info *info = bpf_map_lookup_elem(&conn_infos, &key);
-	if (info && (h.fd < 0 || h.fd == info->fd)) {
+	if (info && (h.fd < 0 || h.fd == info->fd) && conn_info_live(info)) {
 		h.fd = info->fd;
 		h.family = info->family;
 		h.lport = info->lport;
@@ -576,6 +593,29 @@ static __always_inline int enter_call(struct pt_regs *ctx, __u8 fn, __u8 ret, __
 	return enter_call_fd(ctx, fn, ret, conn, buf, len_ptr, -1);
 }
 
+// MAX_TLS13_PADDING bounds how much padding is looked through to find a TLS
+// 1.3 record's content type. Libraries don't pad by default.
+#define MAX_TLS13_PADDING 32
+#define TLS_APPLICATION_DATA 0x17
+
+// tls13_content_len returns the length of the application data in a TLS 1.3
+// record's decrypted plaintext of n bytes at buf, which is the content, its
+// real type and zero padding (RFC 8446, section 5.2). Records of other types
+// (handshake messages, alerts) give -1, so they aren't emitted.
+static __always_inline __s64 tls13_content_len(__u64 buf, __s64 n)
+{
+	for (int i = 1; i <= MAX_TLS13_PADDING; i++) {
+		if (i > n)
+			return -1;
+		__u8 b = 0;
+		if (bpf_probe_read_user(&b, 1, (void *)(buf + n - i)))
+			return -1;
+		if (b)
+			return b == TLS_APPLICATION_DATA ? n - i : -1;
+	}
+	return -1;
+}
+
 static __always_inline int exit_call(struct pt_regs *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -635,6 +675,8 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 		    bpf_probe_read_user(&len, sizeof(len), (void *)call.len_ptr))
 			return 0;
 		n = len;
+		if (call.ret == RET_BOOL_EX_TLS13)
+			n = tls13_content_len(call.buf, n);
 	}
 	}
 
@@ -1103,19 +1145,35 @@ static __always_inline __u64 func_arg(struct pt_regs *ctx, int i)
 	return v;
 }
 
-static __always_inline bool is_quic_aad(__u64 ad, __u64 ad_len)
+// What an AEAD call protects, told by its associated data: a QUIC packet
+// (its header), a TLS 1.3 record (its 5-byte header), or a TLS 1.2 record
+// (sequence number, type, version and length: 13 bytes).
+enum aad_kind {
+	AAD_NONE,
+	AAD_QUIC,
+	AAD_TLS13,
+	AAD_TLS12_DATA,	 // application data
+	AAD_TLS12_OTHER, // handshake messages, alerts
+};
+
+static __always_inline int classify_aad(__u64 ad, __u64 ad_len)
 {
 	__u8 b[13];
 	__builtin_memset(b, 0, sizeof(b));
 	if (!ad || ad_len < 2 || ad_len > 128)
-		return false;
+		return AAD_NONE;
 	if (bpf_probe_read_user(b, ad_len < sizeof(b) ? 2 : sizeof(b), (void *)ad))
-		return false;
+		return AAD_NONE;
 	if (ad_len == 5 && b[0] >= 0x14 && b[0] <= 0x18 && b[1] == 0x03)
-		return false; // TLS record header
+		return AAD_TLS13;
 	if (ad_len == 13 && b[9] == 0x03 && b[10] <= 0x04)
-		return false; // TLS 1.2 associated data
-	return true;
+		return b[8] == TLS_APPLICATION_DATA ? AAD_TLS12_DATA : AAD_TLS12_OTHER;
+	return AAD_QUIC;
+}
+
+static __always_inline bool is_quic_aad(__u64 ad, __u64 ad_len)
+{
+	return classify_aad(ad, ad_len) == AAD_QUIC;
 }
 
 static __always_inline bool is_quic_packet(struct pt_regs *ctx)
@@ -1152,27 +1210,56 @@ static __always_inline __s32 packet_fd(__u64 pid_tgid, struct io_thread *rt, __u
 	return rt->last_fd;
 }
 
+// BoringSSL's and aws-lc's AEAD functions:
+// int EVP_AEAD_CTX_seal(const EVP_AEAD_CTX *ctx, uint8_t *out, size_t *out_len,
+//     size_t max_out_len, const uint8_t *nonce, size_t nonce_len,
+//     const uint8_t *in, size_t in_len, const uint8_t *ad, size_t ad_len)
+// and EVP_AEAD_CTX_open alike, and
+// int EVP_AEAD_CTX_seal_scatter(const EVP_AEAD_CTX *ctx, uint8_t *out,
+//     uint8_t *out_tag, size_t *out_tag_len, size_t max_out_tag_len,
+//     const uint8_t *nonce, size_t nonce_len, const uint8_t *in, size_t in_len,
+//     const uint8_t *extra_in, size_t extra_in_len, const uint8_t *ad, size_t ad_len),
+// which aws-lc-rs uses for TLS 1.2. seal doesn't call the exported
+// seal_scatter, so the two don't see a record twice.
+
+// seal_enter emits n bytes of the plaintext being sealed, at buf. Sealing
+// is often in place, so it's copied at entry. What's sealed goes out with
+// the thread's next send, which tells the context's socket.
+static __always_inline int seal_enter(struct pt_regs *ctx, __u64 pid_tgid, __u8 fn, __u64 buf, __s64 n)
+{
+	__u64 conn = func_arg(ctx, 0);
+	struct io_thread *rt = io_thread(pid_tgid);
+	if (rt)
+		rt->want_conn = conn;
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	call.start_ns = bpf_ktime_get_ns();
+	call.conn = conn;
+	call.buf = buf;
+	call.fd = -1;
+	call.fn = fn;
+	emit(&call, pid_tgid, n);
+	return 0;
+}
+
+// open_enter records a call whose plaintext is emitted on return: open
+// returns 1 and writes the plaintext's length through out_len.
+static __always_inline int open_enter(struct pt_regs *ctx, __u64 pid_tgid, __u8 fn, __u8 ret)
+{
+	struct io_thread *rt = io_thread(pid_tgid);
+	__s32 fd = packet_fd(pid_tgid, rt, func_arg(ctx, 6), func_arg(ctx, 8), func_arg(ctx, 9));
+	return enter_call_fd(ctx, fn, ret, func_arg(ctx, 0), (void *)func_arg(ctx, 1), func_arg(ctx, 2), fd);
+}
+
+// In Chromium, only QUIC packets: its TLS records are seen at SSL_read and
+// SSL_write.
 SEC("uprobe/EVP_AEAD_CTX_seal")
 int quic_seal_enter(struct pt_regs *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid) || !is_quic_packet(ctx))
 		return 0;
-	__u64 conn = func_arg(ctx, 0);
-	struct io_thread *rt = io_thread(pid_tgid);
-	if (rt)
-		rt->want_conn = conn; // the packet goes out with the next send
-
-	// Packets are encrypted in place, so the plaintext is copied now.
-	struct active_call call;
-	__builtin_memset(&call, 0, sizeof(call));
-	call.start_ns = bpf_ktime_get_ns();
-	call.conn = conn;
-	call.buf = func_arg(ctx, 6);
-	call.fd = -1;
-	call.fn = FN_QUIC_SEND;
-	emit(&call, pid_tgid, (__s64)func_arg(ctx, 7));
-	return 0;
+	return seal_enter(ctx, pid_tgid, FN_QUIC_SEND, func_arg(ctx, 6), (__s64)func_arg(ctx, 7));
 }
 
 SEC("uprobe/EVP_AEAD_CTX_open")
@@ -1181,11 +1268,62 @@ int quic_open_enter(struct pt_regs *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid) || !is_quic_packet(ctx))
 		return 0;
-	struct io_thread *rt = io_thread(pid_tgid);
-	__s32 fd = packet_fd(pid_tgid, rt, func_arg(ctx, 6), func_arg(ctx, 8), func_arg(ctx, 9));
-	// Returns 1 and writes the plaintext's length through out_len.
-	return enter_call_fd(ctx, FN_QUIC_RECV, RET_BOOL_EX, func_arg(ctx, 0), (void *)func_arg(ctx, 1),
-			     func_arg(ctx, 2), fd);
+	return open_enter(ctx, pid_tgid, FN_QUIC_RECV, RET_BOOL_EX);
+}
+
+// In programs whose plaintext has no other place to be seen, like rustls
+// under tokio, where the reads are inlined: TLS records' application data
+// too. A TLS 1.3 record's real type is at the end of its plaintext.
+// record_seal_enter handles a seal of n bytes at in, with associated data
+// ad of ad_len bytes.
+static __always_inline int record_seal_enter(struct pt_regs *ctx, __u64 in, __s64 n, __u64 ad, __u64 ad_len)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	switch (classify_aad(ad, ad_len)) {
+	case AAD_QUIC:
+		return seal_enter(ctx, pid_tgid, FN_QUIC_SEND, in, n);
+	case AAD_TLS13:
+		n = tls13_content_len(in, n);
+		if (n > 0)
+			return seal_enter(ctx, pid_tgid, FN_RECORD_SEND, in, n);
+		break;
+	case AAD_TLS12_DATA:
+		return seal_enter(ctx, pid_tgid, FN_RECORD_SEND, in, n);
+	}
+	io_thread(pid_tgid); // so the thread's receives are seen from the handshake on
+	return 0;
+}
+
+SEC("uprobe/EVP_AEAD_CTX_seal")
+int aead_seal_enter(struct pt_regs *ctx)
+{
+	return record_seal_enter(ctx, func_arg(ctx, 6), (__s64)func_arg(ctx, 7), func_arg(ctx, 8), func_arg(ctx, 9));
+}
+
+SEC("uprobe/EVP_AEAD_CTX_seal_scatter")
+int aead_seal_scatter_enter(struct pt_regs *ctx)
+{
+	return record_seal_enter(ctx, func_arg(ctx, 7), (__s64)func_arg(ctx, 8), func_arg(ctx, 11), func_arg(ctx, 12));
+}
+
+SEC("uprobe/EVP_AEAD_CTX_open")
+int aead_open_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	switch (classify_aad(func_arg(ctx, 8), func_arg(ctx, 9))) {
+	case AAD_QUIC:
+		return open_enter(ctx, pid_tgid, FN_QUIC_RECV, RET_BOOL_EX);
+	case AAD_TLS13:
+		return open_enter(ctx, pid_tgid, FN_RECORD_RECV, RET_BOOL_EX_TLS13);
+	case AAD_TLS12_DATA:
+		return open_enter(ctx, pid_tgid, FN_RECORD_RECV, RET_BOOL_EX);
+	}
+	io_thread(pid_tgid);
+	return 0;
 }
 
 // NSS's freebl, whose AES-GCM Firefox's QUIC stack (neqo) calls directly;

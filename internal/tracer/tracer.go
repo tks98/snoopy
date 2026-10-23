@@ -334,22 +334,36 @@ func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]str
 	if ri == nil {
 		return nil, errors.New("missing rustls function information")
 	}
+	type probe struct {
+		name      string
+		offsets   []uint64
+		prog      *ebpf.Program
+		entryOnly bool
+	}
+	probes := []probe{
+		{"rustls::Reader::read", ri.Reads, t.objs.RustlsReadEnter, false},
+		{"rustls::Writer::write", ri.Writes, t.objs.RustlsWriteEnter, false},
+	}
+	if ri.AtRecords() {
+		// All of the program's TLS, so not also its Writer, whose data
+		// would show twice. Sealing emits at entry.
+		probes = []probe{
+			{"EVP_AEAD_CTX_seal", ri.Seals, t.objs.AeadSealEnter, true},
+			{"EVP_AEAD_CTX_seal_scatter", ri.Scatters, t.objs.AeadSealScatterEnter, true},
+			{"EVP_AEAD_CTX_open", ri.Opens, t.objs.AeadOpenEnter, false},
+		}
+	}
 	var attached []string
-	for _, p := range []struct {
-		name    string
-		offsets []uint64
-		prog    *ebpf.Program
-	}{
-		{"rustls::Reader::read", ri.Reads, t.objs.RustlsReadEnter},
-		{"rustls::Writer::write", ri.Writes, t.objs.RustlsWriteEnter},
-	} {
+	for _, p := range probes {
 		for _, off := range p.offsets {
 			opts := &link.UprobeOptions{Address: off}
-			ret, err := ex.Uretprobe("", t.objs.TlsReturn, opts)
-			if err != nil {
-				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
+			if !p.entryOnly {
+				ret, err := ex.Uretprobe("", t.objs.TlsReturn, opts)
+				if err != nil {
+					return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
+				}
+				t.addLink(ret)
 			}
-			t.addLink(ret)
 			entry, err := ex.Uprobe("", p.prog, opts)
 			if err != nil {
 				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)

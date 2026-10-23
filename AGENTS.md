@@ -32,7 +32,7 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
 
 - Integration tests skip the clients that aren't installed (`curl`,
   `python3`, `gnutls-cli`, the NSS, wolfSSL, Mbed TLS and s2n-tls dev
-  files). `SNOOPY_TEST_RUSTLS=1` adds the rustls test, which builds with
+  files). `SNOOPY_TEST_RUSTLS=1` adds the rustls tests, which build with
   cargo.
 - `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the signature-based
   finding against real browser binaries; see

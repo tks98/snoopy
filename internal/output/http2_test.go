@@ -246,3 +246,45 @@ func TestTextHTTP2(t *testing.T) {
 		t.Errorf("late connection:\n%s", text)
 	}
 }
+
+// TLS records captured where they're encrypted and decrypted have a
+// different encryption context, the event's ConnID, for each direction.
+// Their socket ties the directions together.
+func TestHTTP2RecordsShareTheirSocket(t *testing.T) {
+	client := newHTTP2Writer(true)
+	client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: client.block(":method", "GET", ":path", "/"), EndStream: true, EndHeaders: true})
+	server := newHTTP2Writer(false)
+	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: server.block(":status", "200"), EndHeaders: true})
+
+	for _, tc := range []struct {
+		name     string
+		fd       int32
+		decoded  bool
+		lostNote bool
+	}{
+		{"socket known", 5, true, false},
+		{"socket unknown", -1, false, true}, // each direction on its own: the response's looks like a late connection
+	} {
+		c := newHTTP2Conns(newBodyPool())
+		write := events(tracer.FuncRecordSend, client.buf.Bytes(), 1<<20)[0]
+		read := events(tracer.FuncRecordRecv, server.buf.Bytes(), 1<<20)[0]
+		write.ConnID, read.ConnID = 0xaaaa, 0xbbbb
+		write.FD, read.FD = tc.fd, tc.fd
+		if _, ok, _ := c.process(write); !ok {
+			t.Fatalf("%s: request not decoded", tc.name)
+		}
+		frames, ok, note := c.process(read)
+		var headers []hpack.HeaderField
+		for _, f := range frames {
+			if f.Type == "HEADERS" {
+				headers = f.Headers
+			}
+		}
+		if got := ok && len(headers) == 1 && headers[0].Value == "200"; got != tc.decoded {
+			t.Errorf("%s: response headers decoded: %v (%v)", tc.name, got, headers)
+		}
+		if got := strings.Contains(note, "started before snoopy"); got != tc.lostNote {
+			t.Errorf("%s: note %q", tc.name, note)
+		}
+	}
+}

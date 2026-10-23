@@ -83,7 +83,7 @@ func (p *Pcap) Print(ev *tracer.Event) error {
 	if ev.Size == 0 || ev.Function.IsQUIC() {
 		return nil
 	}
-	key := streamKey{pid: ev.PID, conn: ev.ConnID}
+	key := streamKey{pid: ev.PID, conn: connOf(ev)}
 	if hasAddresses(ev) {
 		key = streamKey{a: ev.Local, b: ev.Remote}
 		if ev.Remote.Compare(ev.Local) < 0 {
@@ -99,7 +99,7 @@ func (p *Pcap) Print(ev *tracer.Event) error {
 		p.streams[key] = s
 		p.handshake(s, ev.Time)
 	}
-	if s.owner != (owner{ev.PID, ev.ConnID}) {
+	if s.owner != (owner{ev.PID, connOf(ev)}) {
 		return nil // the other end of a connection we already write
 	}
 	s.lastSeen = ev.Time
@@ -132,14 +132,14 @@ func (p *Pcap) Close() error {
 
 func (p *Pcap) newStream(ev *tracer.Event) *tcpStream {
 	var id [12]byte
-	binary.LittleEndian.PutUint64(id[:], ev.ConnID)
+	binary.LittleEndian.PutUint64(id[:], connOf(ev))
 	binary.LittleEndian.PutUint32(id[8:], ev.PID)
 	h := fnv.New32a()
 	h.Write(id[:])
 	sum := h.Sum32()
 
 	s := &tcpStream{
-		owner:     owner{ev.PID, ev.ConnID},
+		owner:     owner{ev.PID, connOf(ev)},
 		local:     ev.Local,
 		remote:    ev.Remote,
 		localSeq:  sum,

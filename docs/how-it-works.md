@@ -16,7 +16,7 @@ What snoopy can trace, and how it does it.
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | |
 | Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
 | s2n-tls | `s2n_recv`, `s2n_send` | Not `s2n_sendv`. |
-| rustls | `Reader::read`, `Writer::write` | Synchronous use only; needs the program's symbols. |
+| rustls | aws-lc's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, or `Reader::read` and `Writer::write` | Async (tokio) too with rustls's default aws-lc-rs provider; needs the program's symbols. |
 | Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64, stripped binaries too. |
 
 All of them on x86_64 and arm64. Some details:
@@ -39,15 +39,19 @@ All of them on x86_64 and arm64. Some details:
   created.
 - **NSS** functions are used for all kinds of files, so only layered
   descriptors (the SSL layer) are captured.
-- **rustls** is found by its mangled names, in programs that use its reader
-  and writer directly, such as `ureq` or `rustls::Stream`; Cargo keeps the
-  symbols by default. Not async stacks built on tokio-rustls (`hyper`,
-  `reqwest`, `axum`): there the read path is inlined and writes are vectored.
+- **rustls** with its default crypto provider, aws-lc-rs, is seen where
+  aws-lc encrypts and decrypts each record, so async programs on tokio-rustls
+  (`hyper`, `reqwest`, `axum`, `tonic`) are covered as well as synchronous
+  ones. With the ring provider, snoopy falls back to rustls's reader and
+  writer, which works for programs that use them directly, such as `ureq` or
+  `rustls::Stream`, but not under tokio, where the read path is inlined.
+  Both are found by their symbols, which Cargo keeps by default.
 
 Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
-Not supported: rustls under tokio, Java, stripped TLS libraries other than
+Not supported: rustls under tokio with the ring provider, Java, stripped TLS
+libraries other than
 BoringSSL, QUIC/HTTP/3 outside Chromium and Firefox (curl's own HTTP/3, for
 example), programs that use OpenSSL only through its BIO layer (e.g.
 `openssl s_server -www`), and bodies compressed with a shared dictionary
@@ -105,6 +109,23 @@ held back until then (rustls's writes work the same way). User space
 reassembles each direction's streams per socket, across the encryption keys a
 connection goes through and the sockets it migrates to, and decodes the
 HTTP/3 frames and QPACK headers.
+
+## TLS records
+
+Where a program's plaintext has no read or write function to probe, snoopy
+reads it where each TLS record is encrypted and decrypted, as it does for
+QUIC packets. For rustls on aws-lc-rs, that's aws-lc's `EVP_AEAD_CTX_seal`
+(TLS 1.3), `EVP_AEAD_CTX_seal_scatter` (TLS 1.2) and `EVP_AEAD_CTX_open`.
+The associated data tells a record from a QUIC packet: a TLS 1.3 record's
+is its 5-byte header, a TLS 1.2 record's is 13 bytes with the content type
+in it. A TLS 1.3 record's real type is the last non-zero byte of its
+plaintext, after the content and before any padding; only application data
+is shown, so handshake messages and alerts are left out. The socket comes
+from the same per-thread bookkeeping as for QUIC, and both directions of a
+connection, which have separate encryption contexts, are tied together by
+their socket. An encryption context's memory is often reused for the next
+connection, so what's known about a context's socket is only trusted while
+its fd still refers to the same socket.
 
 ## The code
 

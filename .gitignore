@@ -3,3 +3,4 @@
 /dist/
 *.test
 internal/tracer/testdata/rustlsclient/target/
+internal/tracer/testdata/rustlsasync/target/

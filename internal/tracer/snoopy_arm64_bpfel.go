@@ -49,6 +49,8 @@ type snoopyConnInfo struct {
 	Laddr  [16]uint8
 	Raddr  [16]uint8
 	Pad    [2]uint8
+	_      [4]byte
+	File   uint64
 }
 
 type snoopyConnKey struct {
@@ -127,6 +129,9 @@ const (
 	snoopyProgPR_RecvEnter          = "PR_Recv_enter"
 	snoopyProgPR_SendEnter          = "PR_Send_enter"
 	snoopyProgPR_WriteEnter         = "PR_Write_enter"
+	snoopyProgAeadOpenEnter         = "aead_open_enter"
+	snoopyProgAeadSealEnter         = "aead_seal_enter"
+	snoopyProgAeadSealScatterEnter  = "aead_seal_scatter_enter"
 	snoopyProgAesAeadEnter          = "aes_aead_enter"
 	snoopyProgAesCreateEnter        = "aes_create_enter"
 	snoopyProgAesCreateReturn       = "aes_create_return"
@@ -206,6 +211,9 @@ type snoopyProgramSpecs struct {
 	PR_RecvEnter          *ebpf.ProgramSpec `ebpf:"PR_Recv_enter"`
 	PR_SendEnter          *ebpf.ProgramSpec `ebpf:"PR_Send_enter"`
 	PR_WriteEnter         *ebpf.ProgramSpec `ebpf:"PR_Write_enter"`
+	AeadOpenEnter         *ebpf.ProgramSpec `ebpf:"aead_open_enter"`
+	AeadSealEnter         *ebpf.ProgramSpec `ebpf:"aead_seal_enter"`
+	AeadSealScatterEnter  *ebpf.ProgramSpec `ebpf:"aead_seal_scatter_enter"`
 	AesAeadEnter          *ebpf.ProgramSpec `ebpf:"aes_aead_enter"`
 	AesCreateEnter        *ebpf.ProgramSpec `ebpf:"aes_create_enter"`
 	AesCreateReturn       *ebpf.ProgramSpec `ebpf:"aes_create_return"`
@@ -331,6 +339,9 @@ type snoopyPrograms struct {
 	PR_RecvEnter          *ebpf.Program `ebpf:"PR_Recv_enter"`
 	PR_SendEnter          *ebpf.Program `ebpf:"PR_Send_enter"`
 	PR_WriteEnter         *ebpf.Program `ebpf:"PR_Write_enter"`
+	AeadOpenEnter         *ebpf.Program `ebpf:"aead_open_enter"`
+	AeadSealEnter         *ebpf.Program `ebpf:"aead_seal_enter"`
+	AeadSealScatterEnter  *ebpf.Program `ebpf:"aead_seal_scatter_enter"`
 	AesAeadEnter          *ebpf.Program `ebpf:"aes_aead_enter"`
 	AesCreateEnter        *ebpf.Program `ebpf:"aes_create_enter"`
 	AesCreateReturn       *ebpf.Program `ebpf:"aes_create_return"`
@@ -364,6 +375,9 @@ func (p *snoopyPrograms) Close() error {
 		p.PR_RecvEnter,
 		p.PR_SendEnter,
 		p.PR_WriteEnter,
+		p.AeadOpenEnter,
+		p.AeadSealEnter,
+		p.AeadSealScatterEnter,
 		p.AesAeadEnter,
 		p.AesCreateEnter,
 		p.AesCreateReturn,

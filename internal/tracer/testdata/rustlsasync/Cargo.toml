@@ -1,0 +1,15 @@
+[package]
+name = "rustlsasync"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# rustls's default crypto provider, aws-lc-rs, under tokio: the plaintext is
+# seen where aws-lc encrypts and decrypts records.
+[dependencies]
+rustls = "0.23"
+tokio-rustls = "0.26"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+
+[profile.release]
+debug = false

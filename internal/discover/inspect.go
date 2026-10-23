@@ -76,7 +76,11 @@ func Inspect(path string) ([]Target, error) {
 	}
 
 	if ri := inspectRustls(f); ri != nil {
-		targets = append(targets, Target{Path: path, Library: Rustls, Rust: ri})
+		t := Target{Path: path, Library: Rustls, Rust: ri}
+		if ri.AtRecords() {
+			t.Note = "records through aws-lc"
+		}
+		targets = append(targets, t)
 	}
 
 	defined := definedFuncs(f)
@@ -434,15 +438,31 @@ func fileOffset(f *elf.File, addr uint64) (uint64, error) {
 	return 0, fmt.Errorf("address %#x is not in an executable segment", addr)
 }
 
-// RustInfo locates rustls's plaintext functions in a Rust program: the read
-// method of its Reader and the write method of its Writer, which are
-// mangled Rust symbols, possibly several of each if more than one rustls
-// version is linked in. Programs stripped of their symbol table can't be
-// traced.
+// RustInfo locates rustls's plaintext in a Rust program. With rustls's
+// default crypto provider, aws-lc-rs, that's where aws-lc encrypts and
+// decrypts each record: its EVP_AEAD_CTX_seal and EVP_AEAD_CTX_open, C
+// functions whose names aws-lc-sys prefixes with its version. Otherwise it's
+// the read method of rustls's Reader and the write method of its Writer,
+// mangled Rust symbols that async programs (tokio-rustls) inline away.
+// There may be several of each if more than one version is linked in.
+// Programs stripped of their symbol table can't be traced.
 type RustInfo struct {
-	Reads  []uint64 // file offsets of <rustls Reader as Read>::read
-	Writes []uint64 // file offsets of <rustls Writer as Write>::write
+	Seals    []uint64 // file offsets of aws-lc's EVP_AEAD_CTX_seal
+	Scatters []uint64 // EVP_AEAD_CTX_seal_scatter, which it uses for TLS 1.2
+	Opens    []uint64 // and EVP_AEAD_CTX_open
+	Reads    []uint64 // file offsets of <rustls Reader as Read>::read
+	Writes   []uint64 // file offsets of <rustls Writer as Write>::write
 }
+
+// AtRecords reports whether the program's TLS is seen where its records
+// are encrypted and decrypted, rather than at rustls's Reader and Writer.
+func (ri *RustInfo) AtRecords() bool {
+	return len(ri.Seals) > 0 && len(ri.Opens) > 0
+}
+
+// awsLCAEAD matches aws-lc's AEAD functions as aws-lc-sys names them, e.g.
+// aws_lc_0_46_0_EVP_AEAD_CTX_open.
+var awsLCAEAD = regexp.MustCompile(`^aws_lc_[0-9_]+_EVP_AEAD_CTX_(seal|open|seal_scatter)$`)
 
 // The symbols, in Rust's v0 mangling (the default since Rust 1.9x) and the
 // legacy one, e.g.
@@ -462,25 +482,39 @@ func inspectRustls(f *elf.File) *RustInfo {
 		return nil
 	}
 	var ri RustInfo
+	hasRustls := false
 	for _, s := range syms {
-		if s.Section == elf.SHN_UNDEF || elf.ST_TYPE(s.Info) != elf.STT_FUNC || !strings.Contains(s.Name, "rustls") {
+		if s.Section == elf.SHN_UNDEF || elf.ST_TYPE(s.Info) != elf.STT_FUNC {
 			continue
 		}
 		var list *[]uint64
 		switch {
+		case strings.HasPrefix(s.Name, "aws_lc_") && awsLCAEAD.MatchString(s.Name):
+			switch {
+			case strings.HasSuffix(s.Name, "_seal"):
+				list = &ri.Seals
+			case strings.HasSuffix(s.Name, "_seal_scatter"):
+				list = &ri.Scatters
+			default:
+				list = &ri.Opens
+			}
+		case !strings.Contains(s.Name, "rustls"):
+			continue
 		case rustlsRead.MatchString(s.Name):
 			list = &ri.Reads
 		case rustlsWrite.MatchString(s.Name):
 			list = &ri.Writes
 		default:
+			hasRustls = true
 			continue
 		}
 		if off, err := fileOffset(f, s.Value); err == nil && !slices.Contains(*list, off) {
 			*list = append(*list, off)
 		}
 	}
-	if len(ri.Reads) == 0 && len(ri.Writes) == 0 {
-		return nil
+	hasRustls = hasRustls || len(ri.Reads) > 0 || len(ri.Writes) > 0
+	if !hasRustls || !ri.AtRecords() && len(ri.Reads) == 0 && len(ri.Writes) == 0 {
+		return nil // aws-lc without rustls is another library's to trace
 	}
 	return &ri
 }

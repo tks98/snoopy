@@ -15,7 +15,16 @@ plaintext are far apart there. The same move covers both gaps:
   library functions that keep their names even in stripped binaries.
 
 The plan: generalize the AEAD capture path once, then attach it to four
-places. Everything below marked *verified* was checked on real binaries
+places.
+
+**Status:** Part 0 and Part 1a are done. Two things differ from the plan
+below: instead of a per-process switch, Rust programs' aws-lc functions get
+their own BPF programs (`aead_seal_enter`, `aead_seal_scatter_enter`,
+`aead_open_enter`) that keep TLS records, while Chromium's keep only QUIC
+packets; and aws-lc-rs seals TLS 1.2 records with `EVP_AEAD_CTX_seal_scatter`,
+which is probed too. Testing found one more thing to fix: encryption
+contexts' memory is reused by later connections, so a context's socket is
+now only trusted while its fd still refers to the same socket. Everything below marked *verified* was checked on real binaries
 while writing this; the rest is to confirm in the first step of each part.
 
 ## What was verified

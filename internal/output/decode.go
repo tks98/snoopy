@@ -40,6 +40,18 @@ func newDecoders() decoders {
 	return decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool)}
 }
 
+// connOf returns the connection an event belongs to, for following its
+// messages across calls. That's the TLS library's handle for it, except for
+// TLS records captured where they're encrypted and decrypted: each direction
+// has its own encryption context there, so both directions are tied
+// together by their socket, when it's known.
+func connOf(ev *tracer.Event) uint64 {
+	if ev.Function.IsRecord() && ev.FD >= 0 {
+		return 1<<63 | uint64(uint32(ev.FD))
+	}
+	return ev.ConnID
+}
+
 // decoded is what an event's data was found to hold.
 type decoded struct {
 	isQUIC  bool

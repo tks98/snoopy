@@ -36,6 +36,8 @@ const (
 	FuncQUICRecv
 	FuncNSSQUICSend
 	FuncNSSQUICRecv
+	FuncRecordSend
+	FuncRecordRecv
 )
 
 var functionNames = map[Function]string{
@@ -63,6 +65,8 @@ var functionNames = map[Function]string{
 	FuncQUICRecv:     "EVP_AEAD_CTX_open",
 	FuncNSSQUICSend:  "AES_AEAD (encrypt)",
 	FuncNSSQUICRecv:  "AES_AEAD (decrypt)",
+	FuncRecordSend:   "EVP_AEAD_CTX_seal (TLS)",
+	FuncRecordRecv:   "EVP_AEAD_CTX_open (TLS)",
 }
 
 func (f Function) String() string {
@@ -89,7 +93,7 @@ func (f Function) Library() discover.Library {
 		return discover.MbedTLS
 	case FuncS2NRecv, FuncS2NSend:
 		return discover.S2N
-	case FuncRustlsRead, FuncRustlsWrite:
+	case FuncRustlsRead, FuncRustlsWrite, FuncRecordSend, FuncRecordRecv:
 		return discover.Rustls
 	}
 	return 0
@@ -99,6 +103,14 @@ func (f Function) Library() discover.Library {
 // (HTTP/3), captured where the packet is encrypted or decrypted.
 func (f Function) IsQUIC() bool {
 	return f == FuncQUICSend || f == FuncQUICRecv || f == FuncNSSQUICSend || f == FuncNSSQUICRecv
+}
+
+// IsRecord reports whether the function's data is the plaintext of TLS
+// records, captured where they are encrypted or decrypted. Each direction of
+// a connection has its own encryption context, so the context, which is the
+// event's ConnID, differs between a connection's reads and writes.
+func (f Function) IsRecord() bool {
+	return f == FuncRecordSend || f == FuncRecordRecv
 }
 
 // Direction is whether data was received or sent.
@@ -120,7 +132,8 @@ func (d Direction) String() string {
 func (f Function) Direction() Direction {
 	switch f {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
-		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend:
+		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend,
+		FuncRecordSend:
 		return Write
 	}
 	return Read

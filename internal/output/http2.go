@@ -190,7 +190,7 @@ func newHTTP2Conns(pool *bodyPool) *http2Conns {
 // stopped. note, if not empty, says why it just stopped, or that the
 // connection started before snoopy.
 func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, note string) {
-	key := http2Key{ev.PID, ev.ConnID}
+	key := http2Key{ev.PID, connOf(ev)}
 	data := ev.Data
 	conn := c.conns[key]
 	if bytes.HasPrefix(data, []byte(http2Preface)) {

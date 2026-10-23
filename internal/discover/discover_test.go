@@ -351,6 +351,24 @@ func TestRustlsSymbols(t *testing.T) {
 	}
 }
 
+func TestAwsLCSymbols(t *testing.T) {
+	for name, want := range map[string]bool{
+		// From aws-lc-sys 0.46 (aws-lc-rs 1.18), with rustls 0.23.
+		"aws_lc_0_46_0_EVP_AEAD_CTX_open": true,
+		"aws_lc_0_46_0_EVP_AEAD_CTX_seal": true,
+		// Used for TLS 1.2; seal doesn't call it.
+		"aws_lc_0_46_0_EVP_AEAD_CTX_seal_scatter": true,
+		// Called by open: probing it too would show each record twice.
+		"aws_lc_0_46_0_EVP_AEAD_CTX_open_gather": false,
+		// BoringSSL's own, without the prefix, belong to its SSL_read.
+		"EVP_AEAD_CTX_open": false,
+	} {
+		if got := awsLCAEAD.MatchString(name); got != want {
+			t.Errorf("%s: %v", name, got)
+		}
+	}
+}
+
 // TestBoringSSLBinaries runs findBoringSSL on real binaries, which are too
 // large to keep here, e.g. Chrome, Brave or Edge from their .deb packages:
 //
