@@ -60,7 +60,7 @@ file, then match what you see:
   docker run --rm -v "$PWD:/src" -w /src ubuntu:24.04 bash -c '
     apt-get update -qq && apt-get install -y -qq curl ca-certificates clang-18 llvm-18 libbpf-dev >/dev/null &&
     ln -s /usr/bin/clang-18 /usr/local/bin/clang && ln -s /usr/bin/llvm-strip-18 /usr/local/bin/llvm-strip &&
-    curl -fsSL https://go.dev/dl/go1.25.0.linux-$(dpkg --print-architecture).tar.gz | tar -C /usr/local -xz &&
+    curl -fsSL https://go.dev/dl/go1.26.9.linux-$(dpkg --print-architecture).tar.gz | tar -C /usr/local -xz &&
     export PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local && go generate ./... && go test ./...'
   ```
 
@@ -242,7 +242,7 @@ minutes per kernel:
 ```bash
 docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src ubuntu:24.04 bash -c '
   apt-get update -qq && apt-get install -y -qq qemu-system-x86 gnutls-bin libnss3-dev pkg-config curl python3 git gcc ca-certificates iproute2 >/dev/null &&
-  curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz &&
+  curl -fsSL https://go.dev/dl/go1.26.9.linux-amd64.tar.gz | tar -C /usr/local -xz &&
   export PATH=/usr/local/go/bin:/root/go/bin:$PATH GOTOOLCHAIN=local VIMTO_DISABLE_KVM=true &&
   CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0 &&
   for k in 5.10 5.15 6.1 6.6 6.12; do make integration-vm KERNEL=$k || echo "Linux $k failed"; done'

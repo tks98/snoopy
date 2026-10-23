@@ -15,7 +15,7 @@ Wikipedia over HTTP/2, recorded with
 
 Download a binary for `linux_amd64` or `linux_arm64` from the
 [releases page](https://github.com/tks98/snoopy/releases), or build one with
-Go 1.25 or later, and copy it to where `sudo` finds it:
+Go 1.26 or later, and copy it to where `sudo` finds it:
 
 ```bash
 # a release binary

@@ -119,6 +119,25 @@ func TestPclntabMatchesSymtab(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer f.Close()
+			// Go 1.26 no longer records runtime.text in the pclntab header,
+			// so it comes from the moduledata.
+			syms, err := f.Symbols()
+			if err != nil {
+				t.Fatal(err)
+			}
+			i := slices.IndexFunc(syms, func(s elf.Symbol) bool { return s.Name == "runtime.text" })
+			if i < 0 {
+				t.Fatal("no runtime.text symbol")
+			}
+			text := syms[i].Value
+			pcln := f.Section(".gopclntab")
+			data, err := pcln.Data()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := moduledataTextStart(f, pcln.Addr, data); !ok || got != text {
+				t.Errorf("moduledata's text is %#x (found: %v), runtime.text %#x", got, ok, text)
+			}
 			for _, fn := range []string{goReadFunc, goWriteFunc} {
 				s1, e1, err := symtabBounds(f, fn)
 				if err != nil {

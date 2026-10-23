@@ -34,13 +34,11 @@ github.com/tks98/snoopy/v2@latest` installs it.
 
 ### To do
 
-1. **Dependabot.** #11 bumps the Go dependencies to versions that need Go
-   1.26 (`golang.org/x/net` 0.59 and later), so it raises the `go` directive
-   and its lint job fails. It also bumps `golang.org/x/arch`, which needs the
-   check in [docs/maintenance.md](docs/maintenance.md#funcfind-and-golangorgxarch)
-   before merging. `x/net` itself is at 0.58.0, the last release for Go 1.25,
-   which has the fix for the advisory Dependabot raised. #5
-   (golangci-lint-action 9) and #7 (goreleaser-action 7) are open too.
+1. **Dependabot.** #5 (golangci-lint-action 9) and #7 (goreleaser-action
+   7) are open. Go is at 1.26, with `golang.org/x/arch` 0.32 checked as
+   [docs/maintenance.md](docs/maintenance.md#funcfind-and-golangorgxarch)
+   describes: the arm64 finder gives the same answers on Debian's Chromium
+   155 and Firefox ESR 153 as with 0.30.
 2. **Guard against browser releases.** The list in
    [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it), the
    weekly canary job against the latest Chrome, Electron and Firefox first.
@@ -54,7 +52,7 @@ compile for darwin, and `go test ./...` fails on macOS. Work inside a Linux VM:
 - **OrbStack** or **Lima** (`brew install lima && limactl start
   template://ubuntu-24.04`) give you an Ubuntu 24.04 arm64 VM on Apple Silicon.
   That also tests the arm64 code natively. Ubuntu 24.04 matches CI.
-- In the VM, install Go 1.25+ and run:
+- In the VM, install Go 1.26+ and run:
 
   ```bash
   sudo apt-get install -y clang-18 llvm-18 curl python3 gnutls-bin libnss3-dev pkg-config qemu-system-x86 iproute2

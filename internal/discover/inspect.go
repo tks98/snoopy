@@ -254,6 +254,8 @@ func pclntabBounds(f *elf.File, name string) (start, end uint64, err error) {
 	textStart := text.Addr
 	if ts, ok := pclntabTextStart(data); ok {
 		textStart = ts
+	} else if ts, ok := moduledataTextStart(f, pcln.Addr, data); ok {
+		textStart = ts
 	}
 	table, err := gosym.NewTable(nil, gosym.NewLineTable(data, textStart))
 	if err != nil {
@@ -267,9 +269,10 @@ func pclntabBounds(f *elf.File, name string) (start, end uint64, err error) {
 }
 
 // pclntabTextStart returns the address of runtime.text recorded in a Go
-// 1.18+ pclntab header, which function offsets are relative to. It is not
-// the start of .text when the program was linked externally (cgo), where C
-// code comes first.
+// 1.18 to 1.25 pclntab header, which function offsets are relative to. It
+// is not the start of .text when the program was linked externally (cgo),
+// where C code comes first. Go 1.26 leaves the field zero, since it needed a
+// relocation; moduledataTextStart finds the address then.
 func pclntabTextStart(pclntab []byte) (uint64, bool) {
 	// magic uint32; pad1, pad2, minLC, ptrSize uint8; nfunc int; nfiles uint; textStart uintptr
 	if len(pclntab) < 8 {
@@ -285,7 +288,56 @@ func pclntabTextStart(pclntab []byte) (uint64, bool) {
 	if ptrSize != 8 || len(pclntab) < off+8 {
 		return 0, false
 	}
-	return binary.LittleEndian.Uint64(pclntab[off:]), true
+	ts := binary.LittleEndian.Uint64(pclntab[off:])
+	return ts, ts != 0
+}
+
+// moduledataTextStart finds runtime.text in the runtime's moduledata for
+// the main program: a struct in a data section whose first field points
+// to the pclntab header, and whose text field is 22 words in (after
+// pcHeader, six slices, findfunctab, minpc and maxpc), as it has been since
+// Go 1.16. The pointer to the function name table, the next field, must
+// agree with the header, and the address must be in executable code.
+func moduledataTextStart(f *elf.File, pclntabAddr uint64, pclntab []byte) (uint64, bool) {
+	const (
+		funcnameOffsetAt = 32     // in the pcHeader, for 8-byte pointers
+		textWord         = 22     // in the moduledata
+		size             = 24 * 8 // through etext
+	)
+	if len(pclntab) < funcnameOffsetAt+8 || pclntab[7] != 8 {
+		return 0, false
+	}
+	funcnametab := pclntabAddr + binary.LittleEndian.Uint64(pclntab[funcnameOffsetAt:])
+	// .noptrdata, or .go.module when the system linker linked the program.
+	for _, sec := range f.Sections {
+		if sec.Type != elf.SHT_PROGBITS || sec.Flags&(elf.SHF_ALLOC|elf.SHF_WRITE) != elf.SHF_ALLOC|elf.SHF_WRITE {
+			continue
+		}
+		data, err := sec.Data()
+		if err != nil {
+			continue
+		}
+		for off := 0; off+size <= len(data); off += 8 {
+			word := func(i int) uint64 { return binary.LittleEndian.Uint64(data[off+8*i:]) }
+			if word(0) != pclntabAddr || word(1) != funcnametab {
+				continue
+			}
+			text, etext := word(textWord), word(textWord+1)
+			if text < etext && inExecutableSection(f, text) {
+				return text, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func inExecutableSection(f *elf.File, addr uint64) bool {
+	for _, s := range f.Sections {
+		if s.Flags&elf.SHF_EXECINSTR != 0 && addr >= s.Addr && addr < s.Addr+s.Size {
+			return true
+		}
+	}
+	return false
 }
 
 // goBodyOffset verifies that code starts like a Go function that checks for
