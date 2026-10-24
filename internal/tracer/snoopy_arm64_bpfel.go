@@ -195,6 +195,8 @@ const (
 	snoopyVarFilterTgids            = "filter_tgids"
 	snoopyVarHaveBtf                = "have_btf"
 	snoopyVarMaxCapture             = "max_capture"
+	snoopyVarPidnsDev               = "pidns_dev"
+	snoopyVarPidnsIno               = "pidns_ino"
 	snoopyVarTargComm               = "targ_comm"
 	snoopyVarUnusedEventHeader      = "unused_event_header"
 )
@@ -313,6 +315,8 @@ type snoopyVariableSpecs struct {
 	FilterTgids       *ebpf.VariableSpec `ebpf:"filter_tgids"`
 	HaveBtf           *ebpf.VariableSpec `ebpf:"have_btf"`
 	MaxCapture        *ebpf.VariableSpec `ebpf:"max_capture"`
+	PidnsDev          *ebpf.VariableSpec `ebpf:"pidns_dev"`
+	PidnsIno          *ebpf.VariableSpec `ebpf:"pidns_ino"`
 	TargComm          *ebpf.VariableSpec `ebpf:"targ_comm"`
 	UnusedEventHeader *ebpf.VariableSpec `ebpf:"unused_event_header"`
 }
@@ -382,6 +386,8 @@ type snoopyVariables struct {
 	FilterTgids       *ebpf.Variable `ebpf:"filter_tgids"`
 	HaveBtf           *ebpf.Variable `ebpf:"have_btf"`
 	MaxCapture        *ebpf.Variable `ebpf:"max_capture"`
+	PidnsDev          *ebpf.Variable `ebpf:"pidns_dev"`
+	PidnsIno          *ebpf.Variable `ebpf:"pidns_ino"`
 	TargComm          *ebpf.Variable `ebpf:"targ_comm"`
 	UnusedEventHeader *ebpf.Variable `ebpf:"unused_event_header"`
 }
