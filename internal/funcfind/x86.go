@@ -18,20 +18,45 @@ var (
 // x86Align is the alignment of functions, as compilers pad them.
 const x86Align = 16
 
-// x86Refs finds lea reg, [rip+disp] instructions loading addr.
+// x86Refs finds the instructions loading addr into a register: lea reg,
+// [rip+disp] in position-independent code, and in a program that isn't
+// (Bun's), where addresses fit in 32 bits, mov r32, imm32.
 func (b *Binary) x86Refs(addr uint64) []uint64 {
 	var out []uint64
 	code := b.code()
+	abs := b.absolute && addr < 1<<32
 	for i := 0; i+7 <= len(code); i++ {
+		pc := b.textAddr + uint64(i)
 		// REX.W (+R) 8D /r with mod=00, r/m=101: RIP-relative.
 		if (code[i] == 0x48 || code[i] == 0x4c) && code[i+1] == 0x8d && code[i+2]&0xc7 == 0x05 {
-			pc := b.textAddr + uint64(i)
 			if pc+7+uint64(int64(int32(binary.LittleEndian.Uint32(code[i+3:])))) == addr {
 				out = append(out, pc)
 			}
 		}
+		// B8+rd id, or with REX.B (41) for r8d to r15d.
+		if abs && code[i]&0xf8 == 0xb8 && uint64(binary.LittleEndian.Uint32(code[i+1:])) == addr {
+			if i > 0 && code[i-1] == 0x41 {
+				pc--
+			}
+			out = append(out, pc)
+		}
 	}
 	return out
+}
+
+// x86LoadsAddr reports whether inst, at ip, loads addr into a register,
+// as an immediate too if abs (see Binary.absolute).
+func x86LoadsAddr(ip uint64, inst x86asm.Inst, addr uint64, abs bool) bool {
+	switch inst.Op {
+	case x86asm.LEA:
+		m, ok := inst.Args[1].(x86asm.Mem)
+		return ok && m.Base == x86asm.RIP && ip+uint64(inst.Len)+uint64(int64(int32(m.Disp))) == addr
+	case x86asm.MOV:
+		_, isReg := inst.Args[0].(x86asm.Reg)
+		imm, ok := inst.Args[1].(x86asm.Imm)
+		return abs && isReg && ok && uint64(uint32(imm)) == addr && addr < 1<<32
+	}
+	return false
 }
 
 // x86Callers counts the direct call sites (call rel32) of each address.
@@ -103,12 +128,9 @@ func (b *Binary) x86ConstArgsNear(fn *Func, addr uint64, n int) ([]int64, error)
 	var out []int64
 	after := -1
 	b.insts(fn, func(ip uint64, inst x86asm.Inst) bool {
-		if inst.Op == x86asm.LEA {
-			if m, ok := inst.Args[1].(x86asm.Mem); ok && m.Base == x86asm.RIP &&
-				ip+uint64(inst.Len)+uint64(int64(int32(m.Disp))) == addr {
-				after = 0
-				return true
-			}
+		if x86LoadsAddr(ip, inst, addr, b.absolute) {
+			after = 0
+			return true
 		}
 		if after < 0 {
 			return true

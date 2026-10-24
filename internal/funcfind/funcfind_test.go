@@ -248,3 +248,47 @@ func TestStackArgs(t *testing.T) {
 		}
 	}
 }
+
+// An executable that isn't position-independent (Bun's) loads addresses as
+// 32-bit immediates; a position-independent one's mov imm32 is a number.
+func TestAbsoluteRefs(t *testing.T) {
+	a := newAsm(textAddr)
+	a.label("report")
+	a.bytes(0x55, 0x48, 0x89, 0xe5) // push rbp; mov rbp, rsp
+	a.bytes(0xb9)
+	a.bytes(a.imm32(str)...) // mov ecx, str
+	a.bytes(0xba)
+	a.bytes(a.imm32(0x77)...) // mov edx, 0x77
+	a.call("helper")
+	a.bytes(0x5d, 0xc3)
+	a.align()
+	a.label("helper")
+	a.bytes(0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3)
+	a.align()
+	a.label("caller")
+	a.bytes(0x55, 0x48, 0x89, 0xe5)
+	a.call("report")
+	a.bytes(0x5d, 0xc3)
+	code := a.finish()
+	for _, absolute := range []bool{true, false} {
+		b := &Binary{text: code, textAddr: textAddr, absolute: absolute,
+			data: []segment{{dataAddr, []byte("\x00x/ssl/ssl_lib.cc\x00")}}}
+		refs := b.Refs(str)
+		if !absolute {
+			if len(refs) != 0 {
+				t.Errorf("position-independent: refs %#x", refs)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(refs, []uint64{a.labels["report"] + 4}) {
+			t.Fatalf("Refs: %#x", refs)
+		}
+		fn, ok := b.FuncAt(refs[0])
+		if !ok {
+			t.Fatal("no function")
+		}
+		if got, err := b.ConstArgsNear(fn, str, 2); err != nil || !reflect.DeepEqual(got, []int64{0x77}) {
+			t.Errorf("ConstArgsNear: %v %v", got, err)
+		}
+	}
+}
