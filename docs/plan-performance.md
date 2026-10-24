@@ -1,5 +1,9 @@
 # Plan: making snoopy cheaper
 
+Status: Steps 0 to 2 are done (#33, #34, #35), and
+[performance.md](performance.md) has the results. Steps 3 and 4 haven't
+been started.
+
 [performance.md](performance.md) measured what snoopy costs; this is the plan
 for bringing that down before adding features. Each step is measured with
 `docs/benchmark/run.sh` before and after, and only kept if it helps; the

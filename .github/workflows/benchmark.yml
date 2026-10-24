@@ -33,13 +33,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y wrk nginx
           sudo systemctl stop nginx
-          # bpftool is optional: it adds each BPF program's average time.
-          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic || true
-          # /usr/sbin/bpftool is a wrapper that looks for the running
-          # kernel's version, which on Azure kernels it doesn't find.
-          b=$(find /usr/lib -maxdepth 3 -name bpftool -type f 2>/dev/null | sort | tail -1)
-          echo "bpftool: ${b:-none found}"
-          if [ -n "$b" ]; then sudo ln -sf "$b" /usr/local/bin/bpftool; fi
+          # bpftool adds each BPF program's average time. The runners'
+          # tools packages have none, so libbpf's static build, checked.
+          case $(uname -m) in
+          x86_64) arch=amd64 sum=09150596f09356b0ff632dd7f9856e0ea86bf96b269e9bc94278d9a9432a268c ;;
+          aarch64) arch=arm64 sum=d68443d945c146080151eb215bebaa400294ab7ada22af4f5d0a940f5992b9d9 ;;
+          esac
+          f=bpftool-v7.7.0-$arch.tar.gz
+          curl -fsSLO "https://github.com/libbpf/bpftool/releases/download/v7.7.0/$f"
+          echo "$sum  $f" | sha256sum -c -
+          tar xzf "$f" && sudo install bpftool /usr/local/bin/bpftool && rm -f bpftool "$f"
+          bpftool version
       - name: Build snoopy
         run: CGO_ENABLED=0 go build -o snoopy . && sudo install snoopy /usr/local/bin/snoopy
       - name: Run
