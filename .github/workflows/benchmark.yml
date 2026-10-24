@@ -35,6 +35,10 @@ jobs:
           sudo systemctl stop nginx
           # bpftool is optional: it adds each BPF program's average time.
           sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic || true
+          # /usr/sbin/bpftool is a wrapper that looks for the running
+          # kernel's version, which on Azure kernels it doesn't find.
+          b=$(ls /usr/lib/linux-tools/*/bpftool 2>/dev/null | tail -1)
+          if [ -n "$b" ]; then sudo ln -sf "$b" /usr/local/bin/bpftool; fi
       - name: Build snoopy
         run: CGO_ENABLED=0 go build -o snoopy . && sudo install snoopy /usr/local/bin/snoopy
       - name: Run

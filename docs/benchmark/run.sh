@@ -38,7 +38,7 @@ else
 fi
 nserver=$(tr ',' '\n' <<< "$server_cpus" | wc -l)
 stats=false
-command -v bpftool >/dev/null && stats=true
+bpftool version >/dev/null 2>&1 && stats=true # Ubuntu's is a wrapper that can fail
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d)
 bpf_stats_was=$(sysctl -n kernel.bpf_stats_enabled 2>/dev/null || echo 0)
