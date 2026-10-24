@@ -190,9 +190,13 @@ func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 	}
 
 	// A decrypted packet's frames end exactly where it does, unless the
-	// capture was cut short; anything else isn't QUIC.
+	// capture was cut short, or a frame type is new (an extension snoopy
+	// doesn't know yet), after which the rest can't be parsed: what came
+	// before is kept, unless nothing did, which isn't QUIC.
 	frames, streamData, issued, err := parseQUICFrames(ev.Data)
-	if err != nil && !ev.Truncated() {
+	var unknown unknownFrameError
+	partial := errors.As(err, &unknown) && len(frames) > 0
+	if err != nil && !ev.Truncated() && !partial {
 		return nil, false
 	}
 	if cc != nil {
@@ -257,6 +261,14 @@ func quicVarint(b []byte) (uint64, int, bool) {
 }
 
 var errQUICShort = errors.New("frame cut off")
+
+// unknownFrameError is a frame type parseQUICFrames doesn't know, whose
+// length it can't tell, so the rest of the packet can't be parsed.
+type unknownFrameError uint64
+
+func (e unknownFrameError) Error() string {
+	return fmt.Sprintf("unknown frame type %#x; the rest of the packet isn't shown", uint64(e))
+}
 
 // parseQUICFrames parses a decrypted packet's frames (RFC 9000, section 19)
 // and returns a summary of each, the STREAM frames' data and the connection
@@ -445,7 +457,7 @@ func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, issue
 		case typ == 0x1f: // IMMEDIATE_ACK (same draft)
 			summaries = append(summaries, "IMMEDIATE_ACK")
 		default:
-			return summaries, streams, issued, fmt.Errorf("unknown frame type %#x", typ)
+			return summaries, streams, issued, unknownFrameError(typ)
 		}
 	}
 	return summaries, streams, issued, nil
