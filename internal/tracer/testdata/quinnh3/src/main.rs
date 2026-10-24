@@ -83,8 +83,15 @@ async fn server(port: u16) {
             };
             while let Ok(Some(resolver)) = h3.accept().await {
                 let Ok((req, mut stream)) = resolver.resolve_request().await else { break };
+                // Read the request to its end: dropping a stream that
+                // wasn't resets it, which curl takes as an error.
+                while let Ok(Some(_)) = stream.recv_data().await {}
                 let body = format!("served {} on {port}", req.uri().path());
-                let response = http::Response::builder().status(200).body(()).unwrap();
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("content-length", body.len())
+                    .body(())
+                    .unwrap();
                 if stream.send_response(response).await.is_ok() && stream.send_data(Bytes::from(body)).await.is_ok() {
                     let _ = stream.finish().await;
                 }

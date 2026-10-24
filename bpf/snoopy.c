@@ -63,6 +63,9 @@ enum fn_id {
 	FN_AWSLC_QUIC_RECV,
 	FN_RING_QUIC_SEND,
 	FN_RING_QUIC_RECV,
+	// QUIC packets through ngtcp2's crypto library (curl's HTTP/3).
+	FN_NGTCP2_SEND,
+	FN_NGTCP2_RECV,
 };
 
 // A header-only record that isn't a call: a connection whose earlier events
@@ -83,6 +86,7 @@ enum ret_kind {
 	RET_BOOL_EX_TLS13, // RET_BOOL_EX, a TLS 1.3 record's inner plaintext (see tls13_content_len)
 	RET_KNOWN_LEN, // nothing; the byte count, known at entry, is kept in len_ptr
 	RET_KNOWN_LEN_TLS13, // RET_KNOWN_LEN, a TLS 1.3 record's inner plaintext
+	RET_ZERO_KNOWN_LEN, // int: 0 on success; the byte count, known at entry, is kept in len_ptr
 };
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
@@ -710,6 +714,9 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 		// The discriminant's upper bits aren't defined if it's narrower than
 		// the register.
 		n = (__u8)PT_REGS_RC(ctx) == 0 ? (__s64)RUST_RESULT_VALUE(ctx) : 0;
+		break;
+	case RET_ZERO_KNOWN_LEN:
+		n = (int)PT_REGS_RC(ctx) == 0 ? (__s64)call.len_ptr : 0;
 		break;
 	case RET_KNOWN_LEN:
 	case RET_KNOWN_LEN_TLS13:
@@ -1597,6 +1604,44 @@ int ring_open_enter(struct pt_regs *ctx)
 	__s32 fd = packet_fd(pid_tgid, rt, in_out + src, ad, ad_len);
 	return enter_call_ad(ctx, fn, ret, func_arg(ctx, RING_ARG(0)), (void *)in_out, len - src, fd,
 			     fn == FN_RING_QUIC_RECV ? ad : 0, ad_len);
+}
+
+// ngtcp2's crypto library (libngtcp2_crypto_ossl and its siblings for other
+// TLS libraries), which ngtcp2 programs like curl give ngtcp2 as its packet
+// protection callbacks:
+// int ngtcp2_crypto_encrypt(uint8_t *dest, const ngtcp2_crypto_aead *aead,
+//     const ngtcp2_crypto_aead_ctx *aead_ctx, const uint8_t *plaintext,
+//     size_t plaintextlen, const uint8_t *nonce, size_t noncelen,
+//     const uint8_t *aad, size_t aadlen)
+// and ngtcp2_crypto_decrypt alike, with the ciphertext, which ends with the
+// tag, for the plaintext. struct ngtcp2_crypto_aead is the TLS library's
+// cipher and its tag size (max_overhead). Both return 0 on success.
+#define NGTCP2_AEAD_MAX_OVERHEAD 8
+
+SEC("uprobe/ngtcp2_crypto_encrypt")
+int ngtcp2_encrypt_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid) || !is_quic_aad(func_arg(ctx, 7), func_arg(ctx, 8)))
+		return 0;
+	return seal_enter(pid_tgid, FN_NGTCP2_SEND, func_arg(ctx, 2), func_arg(ctx, 3), (__s64)func_arg(ctx, 4),
+			  func_arg(ctx, 7), func_arg(ctx, 8));
+}
+
+SEC("uprobe/ngtcp2_crypto_decrypt")
+int ngtcp2_decrypt_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 ad = func_arg(ctx, 7), ad_len = func_arg(ctx, 8);
+	if (!should_trace(pid_tgid) || !is_quic_aad(ad, ad_len))
+		return 0;
+	__u64 tag = 0, in = func_arg(ctx, 3), len = func_arg(ctx, 4);
+	if (bpf_probe_read_user(&tag, sizeof(tag), (void *)(func_arg(ctx, 1) + NGTCP2_AEAD_MAX_OVERHEAD)) || tag > len)
+		return 0;
+	struct io_thread *rt = io_thread(pid_tgid);
+	__s32 fd = packet_fd(pid_tgid, rt, in, ad, ad_len);
+	return enter_call_ad(ctx, FN_NGTCP2_RECV, RET_ZERO_KNOWN_LEN, func_arg(ctx, 2), (void *)func_arg(ctx, 0),
+			     len - tag, fd, ad, ad_len);
 }
 
 // NSS's freebl, whose AES-GCM Firefox's QUIC stack (neqo) calls directly;

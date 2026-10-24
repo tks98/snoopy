@@ -29,9 +29,9 @@ github.com/tks98/snoopy/v2@latest` installs it.
 | Lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date | Green in CI |
 | Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
 | Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #14 (24 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
-| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | All 29 pass with ring support, rustls included (`SNOOPY_TEST_RUSTLS=1`) |
-| rustls tests on x86_64 (Lima, 6.8) | `TestRustls` and `TestRustlsAsync` pass with ring support, cross-built on arm64 since rustup doesn't run in the emulated VM |
-| BPF load on 5.10 to 6.12 | With ring support, every program loads in default, `--pid` and `--comm` modes (a QEMU load check; vimto's 5.10 runs fail on an overlayfs xattr) |
+| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | All 31 pass with ngtcp2 support, with `SNOOPY_TEST_RUSTLS=1` and `SNOOPY_TEST_CURL_HTTP3` pointing at a Fedora 44 chroot |
+| rustls, quinn and curl tests on x86_64 (Lima, 6.8) | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3` and `TestCurlHTTP3` pass with ngtcp2 support, cross-built on arm64 since rustup doesn't run in the emulated VM; copy them into the VM, since its shared folder can serve stale files |
+| BPF load on 5.10 to 6.12 | With ngtcp2 support, every program loads in default, `--pid` and `--comm` modes (a QEMU load check; vimto's 5.10 runs fail on an overlayfs xattr) |
 | Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded. With #14, again on the arm64 Chromium and Firefox snaps: `--pid` of Chromium's main process, connections opened before snoopy, and Firefox from a fresh start |
 
 ### To do
@@ -87,7 +87,8 @@ sudo ./snoopy --verbose    # try it
 The integration tests skip clients that aren't installed: curl, python3,
 gnutls-cli, and cc with libnss3-dev for the NSS client in
 `internal/tracer/testdata`. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
-client with cargo. `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
+and quinn clients with cargo, and `SNOOPY_TEST_CURL_HTTP3` runs curl's HTTP/3
+from a system that has it (see AGENTS.md). `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
 signature finding against real binaries (see
 [CONTRIBUTING.md](CONTRIBUTING.md)).
 
@@ -292,6 +293,16 @@ signature finding against real binaries (see
   thread's last receive, which goes wrong when a program reads a packet and
   decrypts it later (Chrome yields between batches, and buffers packets that
   arrive before their keys).
+- **QUIC in curl (ngtcp2):** at `ngtcp2_crypto_encrypt` and
+  `ngtcp2_crypto_decrypt`, public API exported by each of ngtcp2's crypto
+  libraries (`libngtcp2_crypto_ossl`, `_gnutls`, ...), found like the C TLS
+  libraries (`readSymbols`, `libPatterns`), as `FN_NGTCP2_SEND`/`_RECV`.
+  Encrypt is in place, so it emits at entry; decrypt writes elsewhere and
+  emits on returning 0, with the ciphertext's length less the cipher's tag
+  size, read from `ngtcp2_crypto_aead` (`RET_ZERO_KNOWN_LEN`). curl connects
+  its socket and does its I/O on one thread, so the usual QUIC bookkeeping
+  gives the socket. A chrooted process's `/proc/<pid>/maps` names files by
+  their host path, which `processFiles` strips its root from.
 - **QUIC in Firefox:** neqo (via the `nss_rs` crate) calls freebl's
   `AES_CreateContext` and `AES_AEAD` directly, through function pointers, not
   through PK11 or any exported function. `FREEBL_GetVector` is exported and
@@ -386,7 +397,7 @@ signature finding against real binaries (see
   its exec aren't picked up.
 - **Not supported:** rustls under tokio with providers other than aws-lc-rs
   and ring (`Reader::read` is inlined into tokio-rustls), Java, QUIC/HTTP/3
-  outside Chromium, Firefox and quinn, Firefox's QUIC with ChaCha20-Poly1305
+  outside Chromium, Firefox, quinn and ngtcp2, Firefox's QUIC with ChaCha20-Poly1305
   (freebl's `ChaCha20Poly1305_Seal`/`Open`, table entries 214/215, would be
   the place), apps using OpenSSL only via its BIO layer (`openssl s_server
   -www`), and bodies with shared-dictionary encodings (Chrome's `dcb`, `dcz`).

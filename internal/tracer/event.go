@@ -44,6 +44,8 @@ const (
 	FuncAwsLCQUICRecv
 	FuncRingQUICSend
 	FuncRingQUICRecv
+	FuncNGTCP2Send
+	FuncNGTCP2Recv
 )
 
 // FuncQUICPacketSent isn't a call but a notice: a QUIC packet was sent from
@@ -86,6 +88,8 @@ var functionNames = map[Function]string{
 	FuncAwsLCQUICRecv: "EVP_AEAD_CTX_open",
 	FuncRingQUICSend:  "ring::aead seal",
 	FuncRingQUICRecv:  "ring::aead open",
+	FuncNGTCP2Send:    "ngtcp2_crypto_encrypt",
+	FuncNGTCP2Recv:    "ngtcp2_crypto_decrypt",
 
 	FuncQUICPacketSent: "QUIC packet sent",
 }
@@ -114,6 +118,8 @@ func (f Function) Library() discover.Library {
 		return discover.MbedTLS
 	case FuncS2NRecv, FuncS2NSend:
 		return discover.S2N
+	case FuncNGTCP2Send, FuncNGTCP2Recv:
+		return discover.NGTCP2
 	case FuncRustlsRead, FuncRustlsWrite, FuncRecordSend, FuncRecordRecv, FuncRingSend, FuncRingRecv,
 		FuncAwsLCQUICSend, FuncAwsLCQUICRecv, FuncRingQUICSend, FuncRingQUICRecv:
 		return discover.Rustls
@@ -126,7 +132,7 @@ func (f Function) Library() discover.Library {
 func (f Function) IsQUIC() bool {
 	switch f {
 	case FuncQUICSend, FuncQUICRecv, FuncNSSQUICSend, FuncNSSQUICRecv,
-		FuncAwsLCQUICSend, FuncAwsLCQUICRecv, FuncRingQUICSend, FuncRingQUICRecv:
+		FuncAwsLCQUICSend, FuncAwsLCQUICRecv, FuncRingQUICSend, FuncRingQUICRecv, FuncNGTCP2Send, FuncNGTCP2Recv:
 		return true
 	}
 	return false
@@ -160,7 +166,7 @@ func (f Function) Direction() Direction {
 	switch f {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
 		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend,
-		FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend, FuncQUICPacketSent:
+		FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend, FuncQUICPacketSent, FuncNGTCP2Send:
 		return Write
 	}
 	return Read

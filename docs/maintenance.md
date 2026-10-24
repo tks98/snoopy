@@ -588,6 +588,38 @@ first's peer: so the peer is attached to the connection's IDs in user space
   `internal/tracer/testdata/quinnh3` with each provider and fetches from two
   servers at once over one socket.
 
+## HTTP/3 over ngtcp2 (curl)
+
+### How it was found
+
+Fedora 44's curl does HTTP/3 through ngtcp2 1.22 with its OpenSSL crypto
+library, `libngtcp2_crypto_ossl`, which exports the packet protection
+functions curl hands ngtcp2. A bpftrace session in a Fedora chroot showed
+that every packet goes through them, in both directions:
+
+```bash
+L=<root>/usr/lib64/libngtcp2_crypto_ossl.so.0
+# arm64; the ninth argument (aadlen) is on the stack there, and from the
+# seventh on x86-64
+bpftrace -e "uprobe:$L:ngtcp2_crypto_encrypt { printf(\"enc len=%d aad=%x\n\", arg4, arg7); }
+  uprobe:$L:ngtcp2_crypto_decrypt { printf(\"dec dest=%x len=%d\n\", arg0, arg4); }"
+```
+
+Encrypt works in place; decrypt writes the plaintext to `dest`, and its
+length is the ciphertext's less the tag (`ngtcp2_crypto_aead.max_overhead`).
+
+### How to tell it broke, and how to fix it
+
+- **Not attached:** check the library still exports both functions
+  (`nm -D --defined-only`), and that its file name still matches
+  `libngtcp2_crypto_*.so*` in `libPatterns`.
+- **Wrong lengths or garbage:** the arguments or `ngtcp2_crypto_aead` changed;
+  compare with `ngtcp2_crypto.h` and rerun the bpftrace session.
+- **To test:** `TestCurlHTTP3` with `SNOOPY_TEST_CURL_HTTP3` (see AGENTS.md).
+  A Fedora root filesystem can be made without Docker from its container
+  image, with `skopeo copy docker://registry.fedoraproject.org/fedora:latest
+  dir:<dir>` and its layers unpacked, then `dnf install curl` chrooted in it.
+
 ## Go crypto/tls
 
 ### How it was found

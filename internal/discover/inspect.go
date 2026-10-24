@@ -28,6 +28,9 @@ var readSymbols = []struct {
 	{WolfSSL, "wolfSSL_read"},
 	{MbedTLS, "mbedtls_ssl_read"},
 	{S2N, "s2n_recv"},
+	// The same in each of its builds for a TLS library
+	// (libngtcp2_crypto_ossl, _gnutls, _wolfssl, _boringssl, _quictls).
+	{NGTCP2, "ngtcp2_crypto_decrypt"},
 }
 
 const (
