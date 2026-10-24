@@ -1,0 +1,44 @@
+name: Benchmark
+
+# Runs docs/benchmark/run.sh on GitHub's x86-64 and arm64 runners, to see
+# what snoopy costs on machines other than a developer's VM, and to catch a
+# change that makes it slower. Its output goes in the job summary. Runners
+# are shared VMs, so compare numbers within a run, not across runs.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/benchmark.yml
+      - docs/benchmark/**
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Benchmark (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install wrk, nginx and bpftool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wrk nginx
+          sudo systemctl stop nginx
+          # bpftool is optional: it adds each BPF program's average time.
+          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic || true
+      - name: Build snoopy
+        run: CGO_ENABLED=0 go build -o snoopy . && sudo install snoopy /usr/local/bin/snoopy
+      - name: Run
+        # Only the servers' own traffic, to themselves, so nothing private.
+        run: |
+          sudo env "PATH=$PATH" docs/benchmark/run.sh 10 | tee benchmark.txt
+          { echo '```'; cat benchmark.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
