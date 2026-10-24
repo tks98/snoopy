@@ -1,0 +1,43 @@
+name: Release check
+
+# Builds what a release would, without publishing, when what decides it
+# changes: a broken GoReleaser config or Dockerfile otherwise only shows at
+# the next tag.
+on:
+  pull_request:
+    paths:
+      - .goreleaser.yaml
+      - Dockerfile
+      - .github/workflows/release.yml
+      - .github/workflows/release-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean
+      - name: The images run
+        run: |
+          docker images ghcr.io/tks98/snoopy
+          for img in $(docker images ghcr.io/tks98/snoopy --format '{{.Repository}}:{{.Tag}}'); do
+            docker run --rm --platform "linux/${img##*-}" "$img" --version
+          done

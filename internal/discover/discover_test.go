@@ -707,6 +707,45 @@ func TestWatcherPerProcess(t *testing.T) {
 	}
 }
 
+// In a container sharing the host's PID namespace, the host's libraries are
+// found through /proc/1/root: the regular files, not their dev symlinks.
+func TestHostLibraries(t *testing.T) {
+	host := t.TempDir()
+	dir := filepath.Join(host, "usr", "lib", "x86_64-linux-gnu")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "libssl.so.3"), []byte("elf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("libssl.so.3", filepath.Join(dir, "libssl.so")); err != nil {
+		t.Fatal(err)
+	}
+	proc := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proc, "1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(host, filepath.Join(proc, "1", "root")); err != nil {
+		t.Fatal(err)
+	}
+	got := hostLibraries(proc)
+	want := []string{filepath.Join(proc, "1", "root", "usr", "lib", "x86_64-linux-gnu", "libssl.so.3")}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	// Our own root is the host's: nothing more.
+	if err := os.Remove(filepath.Join(proc, "1", "root")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/", filepath.Join(proc, "1", "root")); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostLibraries(proc); len(got) != 0 {
+		t.Errorf("with the same root, got %q", got)
+	}
+}
+
 func TestRustInfoDescribe(t *testing.T) {
 	for _, c := range []struct {
 		ri          RustInfo
