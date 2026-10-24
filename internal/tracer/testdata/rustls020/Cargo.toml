@@ -1,0 +1,16 @@
+[package]
+name = "rustls020"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# rustls 0.20 under tokio, whose crypto is ring 0.16: the plaintext is seen
+# where ring encrypts and decrypts records, as with ring 0.17, but at
+# functions of other names and arguments.
+[dependencies]
+rustls = { version = "=0.20.9", features = ["dangerous_configuration"] }
+tokio-rustls = "0.23"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+
+[profile.release]
+debug = false

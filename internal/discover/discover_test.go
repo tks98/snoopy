@@ -387,6 +387,20 @@ func TestRingSymbols(t *testing.T) {
 			t.Errorf("%s: %v", name, got)
 		}
 	}
+	for name, want := range map[string]bool{
+		// From ring 0.16.20, with rustls 0.20.
+		"_RNvNtNtCs4QT3yroOiQf_4ring4aead7aes_gcm12aes_gcm_seal":                       true,
+		"_RNvNtNtCs4QT3yroOiQf_4ring4aead7aes_gcm12aes_gcm_open":                       true,
+		"_RNvNtNtCs4QT3yroOiQf_4ring4aead17chacha20_poly130522chacha20_poly1305_open":  true,
+		"_ZN4ring4aead17chacha20_poly130522chacha20_poly1305_seal17h0123456789abcdefE": true,
+		"_RNvNvNtCs4QT3yroOiQf_4ring4aead12open_within_11open_within":                  false,
+		"_RNvNtNtCs6Mth2B0oH5X_4ring4aead9algorithm12aes_gcm_seal":                     false, // 0.17's
+		"_RNvNtNtNtCs6Mth2B0oH5X_4ring4aead7aes_gcm4seal":                              false, // 0.17's inner seal
+	} {
+		if got := ring016AEAD.MatchString(name); got != want {
+			t.Errorf("ring 0.16: %s: %v", name, got)
+		}
+	}
 }
 
 // TestBoringSSLBinaries runs findBoringSSL on real binaries, which are too
