@@ -43,6 +43,6 @@ dockers_v2:
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.licenses: MIT
     annotations:
-      index,manifest:org.opencontainers.image.description: See what Linux programs send over TLS, with eBPF
-      index,manifest:org.opencontainers.image.source: https://github.com/tks98/snoopy
-      index,manifest:org.opencontainers.image.licenses: MIT
+      manifest:org.opencontainers.image.description: See what Linux programs send over TLS, with eBPF
+      manifest:org.opencontainers.image.source: https://github.com/tks98/snoopy
+      manifest:org.opencontainers.image.licenses: MIT
