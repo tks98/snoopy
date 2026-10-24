@@ -71,10 +71,11 @@ func snoopyArgs(targets []target, rest []string) []string {
 	return append(args, rest...)
 }
 
-// snoopyPod returns the pod that runs snoopy for target, on its node: it
-// shares the node's PID namespace and is privileged, which snoopy needs to
-// load its eBPF program and see other pods' processes.
-func snoopyPod(target *corev1.Pod, namespace, image string, args []string, deadline time.Duration) *corev1.Pod {
+// snoopyPod returns a pod that runs snoopy on node, for what it traces
+// there (say, "shop/pod checkout-7d9f"), named after name: it shares the
+// node's PID namespace and is privileged, which snoopy needs to load its
+// eBPF program and see other pods' processes.
+func snoopyPod(node, name, what, namespace, image string, args []string, deadline time.Duration) *corev1.Pod {
 	privileged := true
 	noToken := false
 	grace := int64(5)
@@ -82,7 +83,6 @@ func snoopyPod(target *corev1.Pod, namespace, image string, args []string, deadl
 	if tag := imageTag(image); tag == "" || tag == "latest" {
 		pull = corev1.PullAlways
 	}
-	name := target.Name
 	if len(name) > 40 {
 		name = name[:40]
 	}
@@ -94,10 +94,10 @@ func snoopyPod(target *corev1.Pod, namespace, image string, args []string, deadl
 				"app.kubernetes.io/name": "snoopy",
 				managedByLabel:           managedBy,
 			},
-			Annotations: map[string]string{targetKey: target.Namespace + "/" + target.Name},
+			Annotations: map[string]string{targetKey: what},
 		},
 		Spec: corev1.PodSpec{
-			NodeName:                      target.Spec.NodeName,
+			NodeName:                      node,
 			HostPID:                       true,
 			RestartPolicy:                 corev1.RestartPolicyNever,
 			AutomountServiceAccountToken:  &noToken,
