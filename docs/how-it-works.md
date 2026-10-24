@@ -8,7 +8,7 @@ What snoopy can trace, and how it does it.
 | Library | Functions probed | Notes |
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Also copies linked into a program that exports them, like Node.js. |
-| BoringSSL in Chrome, Brave, Edge and Electron apps | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. |
+| BoringSSL in Chrome, Brave, Edge, Electron apps, Bun and Envoy | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. Bun does its own socket I/O, so its events have no addresses; Envoy's HTTP/3 isn't traced. |
 | HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | Each QUIC packet, decrypted. |
 | HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
 | HTTP/3 over quinn (Rust) | the same functions as for rustls's records, below | With rustls's aws-lc-rs and ring providers. |

@@ -238,7 +238,8 @@ In order of how much each removes.
 
 1. **Done: a scheduled canary job.** Every Monday, `.github/workflows/canary.yml`
    downloads the latest Chrome stable and beta with Google's debug symbols,
-   the latest Electron (x86-64 and arm64) with its Breakpad symbols, and
+   the latest Electron (x86-64 and arm64) with its Breakpad symbols, Bun and
+   Envoy (checked for one clear answer, having no matching symbols), and
    Firefox (x86-64 and arm64) with Mozilla's, and runs `TestBoringSSLBinaries`
    and `TestFreeblBinaries` on them; and it runs `TestCurlHTTP3` against
    Fedora's latest curl on both architectures. A release that breaks one of

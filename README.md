@@ -66,7 +66,8 @@ the output, JSON and pcap, containers, and troubleshooting.
   and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
-  symbols and is found by signature, and Firefox. Their HTTP/3 too.
+  symbols and is found by signature, and Firefox. Their HTTP/3 too. Bun and
+  Envoy, whose BoringSSL is found the same way.
 - **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded, and
   bodies compressed with gzip, deflate, Brotli or zstd decompressed.
 - **Where:** running processes, those started while snoopy runs, and
