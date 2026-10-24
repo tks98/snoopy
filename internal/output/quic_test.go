@@ -360,3 +360,26 @@ func TestWarnStartedEarly(t *testing.T) {
 		t.Errorf("warnings %q", warnings)
 	}
 }
+
+// A frame type snoopy doesn't know (a new extension) ends what can be parsed
+// of a packet, but what came before it is kept; a packet that starts with
+// one isn't taken for QUIC.
+func TestQUICUnknownFrame(t *testing.T) {
+	c := newQUICConns(newBodyPool())
+	unknown := []byte{0x40, 0x99, 0x01, 0x02} // type 0x99, then bytes of unknown meaning
+	request := streamFrameBytes(0, 0, h3Frame(0x01, []byte{0x00, 0x00, 0xd1}), true)
+	items, ok := c.process(quicEvent(tracer.FuncQUICSend, cat(request, unknown)))
+	if !ok {
+		t.Fatal("the packet's known frames were dropped")
+	}
+	var got []string
+	for _, it := range items {
+		got = append(got, it.Frame+it.HTTP3)
+	}
+	if !slices.Contains(got, "HEADERS") || !slices.ContainsFunc(got, func(s string) bool { return strings.Contains(s, "unknown frame type 0x99") }) {
+		t.Errorf("got %q", got)
+	}
+	if _, ok := c.process(quicEvent(tracer.FuncQUICRecv, cat(unknown, request))); ok {
+		t.Error("a packet starting with an unknown frame type was taken for QUIC")
+	}
+}

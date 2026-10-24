@@ -80,8 +80,11 @@ thing it depends on ships.
   general length field, so an unknown frame can't be skipped.
 - **Breaks when:** a browser or server starts sending an extension frame
   snoopy doesn't know.
-- **How it shows:** the whole packet is rejected as not QUIC and shown as a
-  hex dump. Its stream data is lost, so HTTP/3 decoding gets gaps.
+- **How it shows:** the frames before the unknown one are kept, and the
+  packet's frame line ends with `(unknown frame type 0x...; the rest of the
+  packet isn't shown)`. Stream data after it is lost, so HTTP/3 decoding
+  can get gaps. A packet that starts with an unknown frame is rejected as
+  not QUIC and shown as a hex dump.
 - **Already seen:** not yet. `ACK_FREQUENCY`, `IMMEDIATE_ACK` and `DATAGRAM`
   are handled.
 - **Guarded by:** unit tests, for the frames snoopy knows.
@@ -248,7 +251,7 @@ In order of how much each removes.
 2. **Check `golang.org/x/arch` bumps before merging them.** Run those
    signature tests against real arm64 binaries, or switch `arm64.go` and
    `freebl.go` to reading decoded fields instead of printed text.
-3. **Make the QUIC parser keep what it parsed** before an unknown frame,
+3. **Done: the QUIC parser keeps what it parsed** before an unknown frame,
    instead of dropping the whole packet.
 4. **Done: warnings for the quiet failures.** snoopy warns about Firefox's
    QUIC connections from before it started; about a program whose UDP
