@@ -1,0 +1,90 @@
+name: Canary
+
+# Checks snoopy against the latest releases of what it can't pin: browsers,
+# whose TLS code is found by signature, and Fedora's curl, the HTTP/3 client
+# it supports outside browsers. A failure here means a new release broke
+# something, usually within a week of it; docs/maintenance.md says how to
+# fix each. See docs/release-risks.md for what else can break.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/canary.yml
+      - .github/canary/**
+
+permissions:
+  contents: read
+
+jobs:
+  boringssl:
+    name: BoringSSL in ${{ matrix.program }} ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { program: chrome, variant: stable }
+          - { program: chrome, variant: beta }
+          - { program: electron, variant: x64 }
+          - { program: electron, variant: arm64 }
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Download
+        id: fetch
+        run: echo "spec=$(.github/canary/fetch.sh ${{ matrix.program }} ${{ matrix.variant }} "$RUNNER_TEMP/program")" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: go test -count=1 -v -run TestBoringSSLBinaries ./internal/discover
+        env:
+          SNOOPY_BORINGSSL_TEST: ${{ steps.fetch.outputs.spec }}
+
+  freebl:
+    name: freebl in Firefox ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [linux64, linux64-aarch64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Download
+        id: fetch
+        run: echo "spec=$(.github/canary/fetch.sh firefox ${{ matrix.variant }} "$RUNNER_TEMP/firefox")" >> "$GITHUB_OUTPUT"
+      - run: go test -count=1 -v -run TestFreeblBinaries ./internal/discover
+        env:
+          SNOOPY_FREEBL_TEST: ${{ steps.fetch.outputs.spec }}
+
+  curl:
+    name: curl's HTTP/3 on Fedora (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Make a Fedora root filesystem
+        id: fedora
+        run: echo "root=$(sudo .github/canary/fetch.sh fedora "$RUNNER_TEMP/fedora")" >> "$GITHUB_OUTPUT"
+      # The test's HTTP/3 server is the quinn test program. Built here, the
+      # test's own cargo build, as root, has nothing left to do.
+      - name: Build the test server
+        run: cargo build --release --quiet --manifest-path internal/tracer/testdata/quinnh3/Cargo.toml --target-dir internal/tracer/testdata/quinnh3/target/aws-lc
+      - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      - name: Run (as root)
+        working-directory: internal/tracer
+        # curl only talks to the test's own server, so the output is safe to
+        # show (see AGENTS.md).
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "SNOOPY_TEST_CURL_HTTP3=${{ steps.fedora.outputs.root }}" ./tracer.test -test.v -test.run TestCurlHTTP3 -test.timeout 15m

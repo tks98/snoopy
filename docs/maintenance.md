@@ -64,6 +64,16 @@ file, then match what you see:
     export PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local && go generate ./... && go test ./...'
   ```
 
+### The canary
+
+`.github/workflows/canary.yml` runs weekly (and from the Actions tab, and on
+PRs that change it) against the latest browsers and Fedora's curl; its
+download script, `.github/canary/fetch.sh`, does what this section describes.
+When it fails, the job's name says which program, and the sections below say
+how to fix each. The script runs locally too, e.g.
+`spec=$(.github/canary/fetch.sh chrome beta /tmp/chrome)` and then
+`SNOOPY_BORINGSSL_TEST=$spec go test ./internal/discover -run TestBoringSSLBinaries -v`.
+
 ### Getting browsers and their symbols
 
 Symbols are what make a fix checkable: with them, a test compares snoopy's
@@ -71,7 +81,7 @@ answer with the real address instead of with a guess.
 
 | Program | Binary | Symbols |
 | --- | --- | --- |
-| Chrome (x86-64) | `https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_<version>-1_amd64.deb` (`-beta` for beta) | `https://edgedl.me.gvt1.com/chrome/linux/symbols/google-chrome-debug-info-linux64-<version>.zip`, an ELF `chrome.debug` |
+| Chrome (x86-64) | `https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_<version>-1_amd64.deb` (`-beta` for beta) | `https://edgedl.me.gvt1.com/chrome/linux/symbols/google-chrome-debug-info-linux64-<version>.zip`, an ELF `debug-info/chrome.debug` |
 | Current Chrome versions | `https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/stable/versions` (or `beta`) | |
 | Electron (x86-64, arm64) | `electron-v<version>-linux-<arch>.zip` on [Electron's releases](https://github.com/electron/electron/releases) | `electron-v<version>-linux-<arch>-symbols.zip` from the same release, a Breakpad `electron.sym` |
 | Firefox (x86-64) | `https://download.mozilla.org/?product=firefox-latest-ssl&os=linux64&lang=en-US` | Mozilla's symbol server (below), Breakpad |
