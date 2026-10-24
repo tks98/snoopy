@@ -1,5 +1,12 @@
 # Plan: `kubectl snoopy`
 
+Status: built (#42, #43, #44), except the krew-index submission, which is
+left for later; [kubernetes.md](kubernetes.md) has how to use it and how to
+submit it. Decided: the snoopy pod goes in the target's namespace by
+default. Found while building it: kind's nodes (and k3d's, and minikube's
+with Docker) have PID namespaces of their own, so snoopy had to number PIDs
+as its own namespace does (#43).
+
 A kubectl plugin that shows a pod's TLS traffic the way snoopy shows a
 process's, ending with it in the krew index:
 
@@ -115,11 +122,10 @@ fallback.
 5. The krew-index PR, and krew-release-bot. Then waiting on review.
 6. Later: several pods and `deploy/...`.
 
-## Open questions
+## Decided
 
-- Should the snoopy pod go in the target's namespace by default, or always
-  in a dedicated one (`snoopy`), created if missing? The second is
-  friendlier to PSA, but creates a namespace on someone's cluster.
-- Should the plugin carry snoopy's version, or pick the image by the
-  plugin's version only? Same version keeps flags in step; I'd keep them in
+- The snoopy pod goes in the target's namespace by default, and
+  `--debug-namespace` elsewhere; the plugin explains a Pod Security
+  rejection.
+- The plugin runs the image of its own version, so their flags stay in
   step.
