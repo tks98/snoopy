@@ -6,6 +6,7 @@ package discover
 import (
 	"bufio"
 	"bytes"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -241,25 +243,217 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 // Watcher finds targets in processes that start after Find ran. Each file is
 // inspected once, however many processes use it.
 type Watcher struct {
-	proc string
-	seen map[fileID]bool
+	proc  string
+	mu    sync.Mutex
+	seen  map[fileID]bool
+	roots map[fileID]bool // root filesystems whose library directories were looked in
 }
 
 // NewWatcher returns a Watcher that skips the files of known, which are
-// already attached to.
+// already attached to, and our own root's library directories, whose
+// libraries Find returned.
 func NewWatcher(known []Target) *Watcher {
-	w := &Watcher{proc: "/proc", seen: map[fileID]bool{}}
+	w := &Watcher{proc: "/proc", seen: map[fileID]bool{}, roots: map[fileID]bool{}}
 	for _, t := range known {
 		if id, err := idOf(t.Path); err == nil {
 			w.seen[id] = true
 		}
 	}
+	if id, err := dirID("/"); err == nil {
+		w.roots[id] = true
+	}
 	return w
+}
+
+// Known reports whether a process's executable and root filesystem were
+// looked at already, and it doesn't set where libraries are loaded from, so
+// that its executable and the TLS libraries it's about to load are attached
+// to if they can be.
+func (w *Watcher) Known(pid int) bool {
+	dir := filepath.Join(w.proc, strconv.Itoa(pid))
+	exe, errExe := idOf(filepath.Join(dir, "exe"))
+	root, errRoot := dirID(filepath.Join(dir, "root"))
+	if errExe != nil || errRoot != nil {
+		return true // gone, or not ours to see
+	}
+	if path, preload := loaderEnv(dir); len(path) > 0 || len(preload) > 0 {
+		return false // it may load libraries from anywhere
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.seen[exe] && w.roots[root]
+}
+
+// Root returns the targets among the TLS libraries in the usual library
+// directories of a process's root filesystem, the first time it's asked
+// about that root: a process in a container or chroot that has only just
+// started hasn't mapped its libraries yet, and may be done before the next
+// look at its mappings.
+func (w *Watcher) Root(pid int) []Target {
+	root := filepath.Join(w.proc, strconv.Itoa(pid), "root")
+	id, err := dirID(root)
+	if err != nil {
+		return nil
+	}
+	w.mu.Lock()
+	known := w.roots[id]
+	w.roots[id] = true
+	w.mu.Unlock()
+	if known {
+		return nil
+	}
+	var targets []Target
+	for _, dir := range libDirs {
+		for _, pat := range libPatterns {
+			matches, _ := filepath.Glob(filepath.Join(root, dir, pat))
+			for _, path := range matches {
+				targets = append(targets, w.inspect(path, "")...)
+			}
+		}
+	}
+	return targets
+}
+
+// maxNeeded bounds how many libraries Needed reads.
+const maxNeeded = 256
+
+// Needed returns the targets among the TLS libraries a process that has
+// only just started is about to load: its executable's DT_NEEDED libraries,
+// and theirs, found as the dynamic loader finds them, in LD_LIBRARY_PATH,
+// each file's RUNPATH or RPATH, and the usual library directories, all in
+// the process's root filesystem. Libraries loaded with dlopen aren't among
+// them (Root finds those in the usual directories).
+func (w *Watcher) Needed(pid int) []Target {
+	dir := filepath.Join(w.proc, strconv.Itoa(pid))
+	root := filepath.Join(dir, "root")
+	exe, err := os.Readlink(filepath.Join(dir, "exe"))
+	if err != nil {
+		return nil
+	}
+	if r, _ := os.Readlink(root); r != "" && r != "/" && strings.HasPrefix(exe, r+"/") {
+		exe = strings.TrimPrefix(exe, r) // a chroot's (see processFiles)
+	}
+	envPath, preload := loaderEnv(dir)
+
+	var targets []Target
+	visited := map[string]bool{}
+	queue := []string{exe} // paths in the process's root
+	for _, lib := range preload {
+		if !strings.Contains(lib, "/") {
+			lib = findLibrary(root, lib, append(envPath, libDirs...))
+		}
+		if lib != "" {
+			queue = append(queue, lib)
+		}
+	}
+	for len(queue) > 0 && len(visited) < maxNeeded {
+		path := queue[0]
+		queue = queue[1:]
+		if visited[path] {
+			continue
+		}
+		visited[path] = true
+		if path != exe && isTLSLibraryName(filepath.Base(path)) {
+			targets = append(targets, w.inspect(filepath.Join(root, path), "")...)
+		}
+		f, err := elf.Open(filepath.Join(root, path))
+		if err != nil {
+			continue
+		}
+		needed, _ := f.ImportedLibraries()
+		var search []string
+		for _, tag := range []elf.DynTag{elf.DT_RUNPATH, elf.DT_RPATH} {
+			if paths, _ := f.DynString(tag); len(paths) > 0 {
+				for _, p := range filepath.SplitList(paths[0]) {
+					search = append(search, strings.ReplaceAll(p, "$ORIGIN", filepath.Dir(path)))
+				}
+				break // RUNPATH, if present, overrides RPATH
+			}
+		}
+		f.Close()
+		search = append(append(envPath, search...), libDirs...)
+		for _, name := range needed {
+			if lib := findLibrary(root, name, search); lib != "" {
+				queue = append(queue, lib)
+			}
+		}
+	}
+	return targets
+}
+
+// loaderEnv returns the LD_LIBRARY_PATH directories and LD_PRELOAD
+// libraries in the environment of the process whose /proc directory is dir.
+func loaderEnv(dir string) (path, preload []string) {
+	environ, err := os.ReadFile(filepath.Join(dir, "environ"))
+	if err != nil {
+		return nil, nil
+	}
+	for _, kv := range strings.Split(string(environ), "\x00") {
+		if v, ok := strings.CutPrefix(kv, "LD_LIBRARY_PATH="); ok {
+			path = filepath.SplitList(v)
+		}
+		if v, ok := strings.CutPrefix(kv, "LD_PRELOAD="); ok {
+			preload = strings.FieldsFunc(v, func(r rune) bool { return r == ' ' || r == ':' })
+		}
+	}
+	return path, preload
+}
+
+// findLibrary returns where the first of dirs (which may be globs) in root
+// that has a library named name has it, as a path in root, or "".
+func findLibrary(root, name string, dirs []string) string {
+	for _, d := range dirs {
+		matches, _ := filepath.Glob(filepath.Join(root, d, name))
+		for _, m := range matches {
+			if fi, err := os.Stat(m); err == nil && fi.Mode().IsRegular() {
+				return strings.TrimPrefix(m, root)
+			}
+		}
+	}
+	return ""
+}
+
+// inspect returns the targets in a file, unless it was seen before, with
+// note added to theirs.
+func (w *Watcher) inspect(path, note string) []Target {
+	id, err := idOf(path)
+	if err != nil {
+		return nil
+	}
+	w.mu.Lock()
+	seen := w.seen[id]
+	w.mu.Unlock()
+	if seen {
+		return nil
+	}
+	found, err := Inspect(path)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		return nil // gone with the process, or not ours to see; maybe next time
+	}
+	w.mu.Lock()
+	w.seen[id] = true
+	w.mu.Unlock()
+	for i := range found {
+		found[i].Note = joinNotes(found[i].Note, note)
+	}
+	return found
+}
+
+func dirID(path string) (fileID, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileID{}, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || !fi.IsDir() {
+		return fileID{}, errors.New("not a directory")
+	}
+	return fileID{dev: uint64(st.Dev), ino: st.Ino}, nil
 }
 
 // Process returns the targets among a process's executable and mapped TLS
 // libraries that haven't been seen before. Errors (typically, the process
-// has exited) are ignored. It isn't safe for concurrent use.
+// has exited) are ignored.
 func (w *Watcher) Process(pid int) []Target {
 	files, err := processFiles(w.proc, pid)
 	if err != nil {
@@ -267,19 +461,7 @@ func (w *Watcher) Process(pid int) []Target {
 	}
 	var targets []Target
 	for _, c := range files {
-		id, err := idOf(c.path)
-		if err != nil || w.seen[id] {
-			continue
-		}
-		found, err := Inspect(c.path)
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
-			continue // gone with the process, or not ours to see; maybe next time
-		}
-		w.seen[id] = true
-		for i := range found {
-			found[i].Note = joinNotes(found[i].Note, c.note)
-		}
-		targets = append(targets, found...)
+		targets = append(targets, w.inspect(c.path, c.note)...)
 	}
 	return targets
 }

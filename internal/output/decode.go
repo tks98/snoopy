@@ -18,7 +18,14 @@ type Options struct {
 	// going: HTTP/2 settings, flow control and pings, QUIC acknowledgments,
 	// and the like.
 	Verbose bool
+	// Warn, if set, is told about what the output can't show, such as
+	// headers of connections that started before snoopy. It may be told the
+	// same thing more than once.
+	Warn func(msg string)
 }
+
+// startedEarly is what Warn is told when headers can't be decoded.
+const startedEarly = "some HTTP/2 or HTTP/3 connections started before snoopy, so their headers can't be decoded; connections opened from now on can be (restarting a program opens new ones)"
 
 // A Hider is a Printer that leaves some events out.
 type Hider interface {
@@ -33,11 +40,12 @@ type decoders struct {
 	h1   *http1Conns
 	h2   *http2Conns
 	quic *quicConns
+	warn func(string)
 }
 
-func newDecoders() decoders {
+func newDecoders(warn func(string)) decoders {
 	pool := newBodyPool()
-	return decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool)}
+	return decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool), warn: warn}
 }
 
 // connOf returns the connection an event belongs to, for following its
@@ -69,16 +77,39 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 		d.quic.sent(ev)
 		return decoded{notice: true}
 	}
+	var dc decoded
 	if ev.Function.IsQUIC() {
 		items, ok := d.quic.process(ev)
-		return decoded{isQUIC: true, notQUIC: !ok, quic: items}
+		dc = decoded{isQUIC: true, notQUIC: !ok, quic: items}
+	} else {
+		dc.http2, dc.isHTTP2, dc.note = d.h2.process(ev)
+		if !dc.isHTTP2 {
+			dc.http1 = d.h1.process(ev)
+		}
 	}
-	var dc decoded
-	dc.http2, dc.isHTTP2, dc.note = d.h2.process(ev)
-	if !dc.isHTTP2 {
-		dc.http1 = d.h1.process(ev)
+	if d.warn != nil && dc.startedEarly() {
+		d.warn(startedEarly)
 	}
 	return dc
+}
+
+// startedEarly reports whether the event's connection started before
+// snoopy, so that its headers couldn't be decoded.
+func (dc decoded) startedEarly() bool {
+	if strings.Contains(dc.note, "started before snoopy") {
+		return true
+	}
+	for _, f := range dc.http2 {
+		if f.HeadersLost {
+			return true
+		}
+	}
+	for _, it := range dc.quic {
+		if strings.Contains(it.Err, "started before snoopy") {
+			return true
+		}
+	}
+	return false
 }
 
 // housekeeping reports whether an event only carries what keeps its

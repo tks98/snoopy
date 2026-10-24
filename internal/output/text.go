@@ -45,7 +45,7 @@ func NewText(w io.Writer, opts Options) *Text {
 	return &Text{
 		w:      w,
 		opts:   opts,
-		dec:    newDecoders(),
+		dec:    newDecoders(opts.Warn),
 		dim:    s(color.Faint),
 		title:  s(color.Bold),
 		fn:     s(color.FgHiMagenta, color.Bold),

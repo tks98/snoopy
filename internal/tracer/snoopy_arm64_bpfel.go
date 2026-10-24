@@ -106,6 +106,12 @@ type snoopyQuicProc struct {
 	LastRecvFd int32
 }
 
+type snoopyQuicTraffic struct {
+	_         structs.HostLayout
+	Udp443    uint32
+	Untracked uint32
+}
+
 type snoopyRecvBuf struct {
 	_    structs.HostLayout
 	File uint64
@@ -139,6 +145,7 @@ const (
 	snoopyMapExecs                  = "execs"
 	snoopyMapIoThreads              = "io_threads"
 	snoopyMapQuicProcs              = "quic_procs"
+	snoopyMapQuicTraffic            = "quic_traffic"
 	snoopyMapRecvBufs               = "recv_bufs"
 	snoopyMapSealedPackets          = "sealed_packets"
 	snoopyMapTracedTgids            = "traced_tgids"
@@ -166,6 +173,7 @@ const (
 	snoopyProgNgtcp2EncryptEnter    = "ngtcp2_encrypt_enter"
 	snoopyProgQuicOpenEnter         = "quic_open_enter"
 	snoopyProgQuicSealEnter         = "quic_seal_enter"
+	snoopyProgRing016OpenEnter      = "ring016_open_enter"
 	snoopyProgRingOpenEnter         = "ring_open_enter"
 	snoopyProgRingSealEnter         = "ring_seal_enter"
 	snoopyProgRustlsReadEnter       = "rustls_read_enter"
@@ -255,6 +263,7 @@ type snoopyProgramSpecs struct {
 	Ngtcp2EncryptEnter    *ebpf.ProgramSpec `ebpf:"ngtcp2_encrypt_enter"`
 	QuicOpenEnter         *ebpf.ProgramSpec `ebpf:"quic_open_enter"`
 	QuicSealEnter         *ebpf.ProgramSpec `ebpf:"quic_seal_enter"`
+	Ring016OpenEnter      *ebpf.ProgramSpec `ebpf:"ring016_open_enter"`
 	RingOpenEnter         *ebpf.ProgramSpec `ebpf:"ring_open_enter"`
 	RingSealEnter         *ebpf.ProgramSpec `ebpf:"ring_seal_enter"`
 	RustlsReadEnter       *ebpf.ProgramSpec `ebpf:"rustls_read_enter"`
@@ -286,6 +295,7 @@ type snoopyMapSpecs struct {
 	Execs         *ebpf.MapSpec `ebpf:"execs"`
 	IoThreads     *ebpf.MapSpec `ebpf:"io_threads"`
 	QuicProcs     *ebpf.MapSpec `ebpf:"quic_procs"`
+	QuicTraffic   *ebpf.MapSpec `ebpf:"quic_traffic"`
 	RecvBufs      *ebpf.MapSpec `ebpf:"recv_bufs"`
 	SealedPackets *ebpf.MapSpec `ebpf:"sealed_packets"`
 	TracedTgids   *ebpf.MapSpec `ebpf:"traced_tgids"`
@@ -333,6 +343,7 @@ type snoopyMaps struct {
 	Execs         *ebpf.Map `ebpf:"execs"`
 	IoThreads     *ebpf.Map `ebpf:"io_threads"`
 	QuicProcs     *ebpf.Map `ebpf:"quic_procs"`
+	QuicTraffic   *ebpf.Map `ebpf:"quic_traffic"`
 	RecvBufs      *ebpf.Map `ebpf:"recv_bufs"`
 	SealedPackets *ebpf.Map `ebpf:"sealed_packets"`
 	TracedTgids   *ebpf.Map `ebpf:"traced_tgids"`
@@ -350,6 +361,7 @@ func (m *snoopyMaps) Close() error {
 		m.Execs,
 		m.IoThreads,
 		m.QuicProcs,
+		m.QuicTraffic,
 		m.RecvBufs,
 		m.SealedPackets,
 		m.TracedTgids,
@@ -396,6 +408,7 @@ type snoopyPrograms struct {
 	Ngtcp2EncryptEnter    *ebpf.Program `ebpf:"ngtcp2_encrypt_enter"`
 	QuicOpenEnter         *ebpf.Program `ebpf:"quic_open_enter"`
 	QuicSealEnter         *ebpf.Program `ebpf:"quic_seal_enter"`
+	Ring016OpenEnter      *ebpf.Program `ebpf:"ring016_open_enter"`
 	RingOpenEnter         *ebpf.Program `ebpf:"ring_open_enter"`
 	RingSealEnter         *ebpf.Program `ebpf:"ring_seal_enter"`
 	RustlsReadEnter       *ebpf.Program `ebpf:"rustls_read_enter"`
@@ -439,6 +452,7 @@ func (p *snoopyPrograms) Close() error {
 		p.Ngtcp2EncryptEnter,
 		p.QuicOpenEnter,
 		p.QuicSealEnter,
+		p.Ring016OpenEnter,
 		p.RingOpenEnter,
 		p.RingSealEnter,
 		p.RustlsReadEnter,

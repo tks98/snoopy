@@ -51,6 +51,9 @@ type GoInfo struct {
 	Write   GoFunc
 	Seals   []GoFunc
 	Opens   []GoFunc
+	// QUICMissing is set if the program has quic-go, but none of the AEADs
+	// it encrypts with were found.
+	QUICMissing bool
 }
 
 // goAEADs are the AEADs' methods, by type: AES-GCM since Go 1.24, and
@@ -60,6 +63,8 @@ var goAEADs = []string{
 	"vendor/golang.org/x/crypto/chacha20poly1305.(*chacha20poly1305)",
 	"golang.org/x/crypto/chacha20poly1305.(*chacha20poly1305)",
 }
+
+var errQUICGoAEADs = errors.New("quic-go is linked in, but Go's AEADs it encrypts with weren't found, so its HTTP/3 isn't traced")
 
 // quicGoFunc is in programs that use quic-go, which are the only ones whose
 // AEADs are probed: Go programs use AES-GCM for other things too, and every
@@ -87,25 +92,27 @@ func Inspect(path string) ([]Target, error) {
 
 	var targets []Target
 	gi, err := inspectGo(path, f)
+	if errors.Is(err, errQUICGoAEADs) {
+		// Nothing to attach to, but worth saying.
+		return []Target{{Path: path, Library: GoTLS, Problem: err}}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
 	if gi != nil {
 		t := Target{Path: path, Library: GoTLS, Go: gi}
-		if len(gi.Seals) > 0 {
+		switch {
+		case len(gi.Seals) > 0:
 			t.Note = "QUIC through quic-go"
+		case gi.QUICMissing:
+			t.Limits = errQUICGoAEADs.Error()
 		}
 		targets = append(targets, t)
 	}
 
 	if ri := inspectRustls(f); ri != nil {
 		t := Target{Path: path, Library: Rustls, Rust: ri}
-		switch {
-		case len(ri.Seals) > 0 && len(ri.Opens) > 0:
-			t.Note = "records through aws-lc"
-		case ri.AtRecords():
-			t.Note = "records through ring"
-		}
+		t.Note, t.Limits = ri.describe()
 		targets = append(targets, t)
 	}
 
@@ -192,10 +199,13 @@ func inspectGo(path string, f *elf.File) (*GoInfo, error) {
 			gi.Seals = append(gi.Seals, seal)
 			gi.Opens = append(gi.Opens, open)
 		}
+		gi.QUICMissing = len(gi.Seals) == 0
 	}
 
 	read, err := FindGoFunc(f, goReadFunc)
 	switch {
+	case errors.Is(err, errNoFunc) && gi.QUICMissing:
+		return nil, errQUICGoAEADs // nothing to attach to: say so here
 	case errors.Is(err, errNoFunc) && len(gi.Seals) == 0:
 		return nil, nil
 	case errors.Is(err, errNoFunc):
@@ -504,14 +514,35 @@ type RustInfo struct {
 	// of their open functions.
 	RingSeals []uint64
 	RingOpens []uint64
-	Reads     []uint64 // file offsets of <rustls Reader as Read>::read
-	Writes    []uint64 // file offsets of <rustls Writer as Write>::write
+	// ring 0.16's open functions, whose arguments differ. Its seal
+	// functions are among RingSeals.
+	Ring016Opens []uint64
+	Reads        []uint64 // file offsets of <rustls Reader as Read>::read
+	Writes       []uint64 // file offsets of <rustls Writer as Write>::write
+	// Tokio is set if the program has tokio, under which the Reader's
+	// read is inlined away.
+	Tokio bool
 }
 
 // AtRecords reports whether the program's TLS is seen where its records
 // are encrypted and decrypted, rather than at rustls's Reader and Writer.
 func (ri *RustInfo) AtRecords() bool {
-	return len(ri.Seals) > 0 && len(ri.Opens) > 0 || len(ri.RingSeals) > 0 && len(ri.RingOpens) > 0
+	return len(ri.Seals) > 0 && len(ri.Opens) > 0 ||
+		len(ri.RingSeals) > 0 && len(ri.RingOpens)+len(ri.Ring016Opens) > 0
+}
+
+// describe returns a note on where a program's TLS is read, and what of it
+// can't be, if anything.
+func (ri *RustInfo) describe() (note, limits string) {
+	switch {
+	case len(ri.Seals) > 0 && len(ri.Opens) > 0:
+		return "records through aws-lc", ""
+	case ri.AtRecords():
+		return "records through ring", ""
+	case ri.Tokio:
+		return "", "rustls's crypto provider here is neither aws-lc-rs nor ring, and the program uses tokio, so only its writes are traced"
+	}
+	return "", ""
 }
 
 // awsLCAEAD matches aws-lc's AEAD functions as aws-lc-sys names them, e.g.
@@ -524,6 +555,13 @@ var awsLCAEAD = regexp.MustCompile(`^aws_lc_[0-9_]+_EVP_AEAD_CTX_(seal|open|seal
 //	_ZN4ring4aead9algorithm22chacha20_poly1305_open17h0123456789abcdefE
 var ringAEAD = regexp.MustCompile(`^_R.*4ring4aead9algorithm(12aes_gcm|22chacha20_poly1305)_(seal|open)$` +
 	`|^_ZN4ring4aead9algorithm(12aes_gcm|22chacha20_poly1305)_(seal|open)17h[0-9a-f]{16}E$`)
+
+// ring016AEAD matches ring 0.16's, which are in the ciphers' own modules:
+//
+//	_RNvNtNtCs4QT3yroOiQf_4ring4aead7aes_gcm12aes_gcm_seal
+//	_ZN4ring4aead17chacha20_poly130522chacha20_poly1305_open17h0123456789abcdefE
+var ring016AEAD = regexp.MustCompile(`^_R.*4ring4aead(7aes_gcm12aes_gcm|17chacha20_poly130522chacha20_poly1305)_(seal|open)$` +
+	`|^_ZN4ring4aead(7aes_gcm12aes_gcm|17chacha20_poly130522chacha20_poly1305)_(seal|open)17h[0-9a-f]{16}E$`)
 
 // The symbols, in Rust's v0 mangling (the default since Rust 1.9x) and the
 // legacy one, e.g.
@@ -548,6 +586,7 @@ func inspectRustls(f *elf.File) *RustInfo {
 		if s.Section == elf.SHN_UNDEF || elf.ST_TYPE(s.Info) != elf.STT_FUNC {
 			continue
 		}
+		ri.Tokio = ri.Tokio || strings.Contains(s.Name, "5tokio") // in both manglings
 		var list *[]uint64
 		switch {
 		case strings.HasPrefix(s.Name, "aws_lc_") && awsLCAEAD.MatchString(s.Name):
@@ -563,6 +602,11 @@ func inspectRustls(f *elf.File) *RustInfo {
 			list = &ri.RingSeals
 			if strings.Contains(s.Name, "_open") {
 				list = &ri.RingOpens
+			}
+		case strings.Contains(s.Name, "4ring4aead") && ring016AEAD.MatchString(s.Name):
+			list = &ri.RingSeals
+			if strings.Contains(s.Name, "_open") {
+				list = &ri.Ring016Opens
 			}
 		case !strings.Contains(s.Name, "rustls"):
 			continue

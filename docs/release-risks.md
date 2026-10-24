@@ -110,7 +110,8 @@ thing it depends on ships.
   aws-lc-rs calling `seal` for TLS 1.3, `seal_scatter` for TLS 1.2 and
   `open` for both, without one of them calling another's exported symbol.
   With ring: the mangled names of `ring::aead::algorithm::aes_gcm_seal` and
-  the like, ring calling them through function pointers (so they aren't
+  the like (ring 0.17; `ring::aead::aes_gcm::aes_gcm_seal` and the like in
+  0.16, whose open takes its arguments in another order), ring calling them through function pointers (so they aren't
   inlined), and their arguments' places, which depend on Rust returning
   their `Result<Tag, Unspecified>` through a hidden pointer. With other
   providers: the mangled names of `Reader::read` and `Writer::write`, and
@@ -248,8 +249,11 @@ In order of how much each removes.
    `freebl.go` to reading decoded fields instead of printed text.
 3. **Make the QUIC parser keep what it parsed** before an unknown frame,
    instead of dropping the whole packet.
-4. **Warn about the rest of the quiet failures.** snoopy now warns about
-   Firefox's QUIC connections from before it started. It could also say so
-   when a browser's connections keep showing stuck header blocks, or when it
-   attached to Firefox's freebl but captured nothing while Firefox used UDP
-   port 443.
+4. **Done: warnings for the quiet failures.** snoopy warns about Firefox's
+   QUIC connections from before it started; about a program whose UDP
+   traffic on port 443 had none of its QUIC packets captured, which is how a
+   browser's or library's changed QUIC path would show; about a tokio
+   program whose rustls provider isn't aws-lc-rs or ring, and a quic-go
+   program whose AEADs weren't found, when attaching; and about headers that
+   can't be decoded because their connection started before snoopy. The
+   maintenance guide's "Which part broke?" table lists them.

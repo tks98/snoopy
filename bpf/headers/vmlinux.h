@@ -109,6 +109,7 @@ struct sock {
 } __attribute__((preserve_access_index));
 
 struct socket {
+	short type; // SOCK_STREAM, SOCK_DGRAM, ...
 	struct sock *sk;
 } __attribute__((preserve_access_index));
 

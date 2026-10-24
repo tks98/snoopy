@@ -747,7 +747,7 @@ func TestNewProcess(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var attached []string
-	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil), nil, func(target discover.Target, funcs []string, err error) {
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil), nil, nil, func(target discover.Target, funcs []string, err error) {
 		mu.Lock()
 		defer mu.Unlock()
 		attached = append(attached, fmt.Sprintf("%s %s %v %v", target.Library, target.Path, funcs, err))
@@ -786,6 +786,64 @@ func TestNewProcess(t *testing.T) {
 	}
 }
 
+// The same, but answered at once: a short-lived program would be done
+// before its private libssl is attached to, so it's held until then
+// (WatchNewProcesses' hold), its libraries found from its LD_LIBRARY_PATH
+// before it has loaded them.
+func TestHoldNewProcess(t *testing.T) {
+	requireRoot(t)
+	curl := requireTool(t, "curl")
+	var libssl string
+	for _, target := range systemTargets(t, discover.OpenSSL) {
+		if strings.HasPrefix(filepath.Base(target.Path), "libssl.so") {
+			libssl = target.Path
+			break
+		}
+	}
+	if libssl == "" {
+		t.Skip("no system libssl")
+	}
+	libDir := t.TempDir()
+	lib, err := os.ReadFile(libssl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(libDir, filepath.Base(libssl)), lib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tr, err := New(Options{Comm: "curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+	hold := func(pid int) bool {
+		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		return err == nil && strings.TrimSpace(string(comm)) == "curl"
+	}
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil), nil, hold, func(discover.Target, []string, error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := runTracer(t, tr)
+	t.Cleanup(stop)
+
+	srv, _ := newServer(t)
+	// Under sh, so its parent isn't the tracer, as with snoopy: a parent
+	// tracing its own child would see the hold's stop as the child's.
+	cmd := exec.Command("sh", "-c", `"$0" -sk --http1.1 "$1"; :`, curl, srv.URL+"/held")
+	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+libDir)
+	if out, err := cmd.CombinedOutput(); err != nil || !bytes.Contains(out, []byte("served /held")) {
+		t.Fatalf("curl: %v: %s", err, out)
+	}
+	write := waitFor(t, events, "the request, through the private libssl", func(ev *Event) bool {
+		return ev.Function == FuncSSLWrite && contains("GET /held")(ev)
+	})
+	checkConnection(t, write, srv.Listener.Addr().String())
+}
+
 // TestRustls needs a Rust toolchain, and building the client takes a while,
 // so it only runs with SNOOPY_TEST_RUSTLS=1.
 // rustls under tokio, with its default crypto provider (aws-lc-rs) and with
@@ -799,22 +857,24 @@ func TestRustlsAsync(t *testing.T) {
 	cargo := requireTool(t, "cargo")
 	providers := []struct {
 		name       string
+		crate      string // in testdata
 		features   []string
 		send, recv Function
 	}{
-		{"aws-lc", nil, FuncRecordSend, FuncRecordRecv},
-		{"ring", []string{"--no-default-features", "--features", "ring"}, FuncRingSend, FuncRingRecv},
+		{"aws-lc", "rustlsasync", nil, FuncRecordSend, FuncRecordRecv},
+		{"ring", "rustlsasync", []string{"--no-default-features", "--features", "ring"}, FuncRingSend, FuncRingRecv},
+		{"ring-0.16", "rustls020", nil, FuncRingSend, FuncRingRecv}, // with rustls 0.20
 	}
 	clients := map[string]string{}
 	var targets []discover.Target
 	for _, p := range providers {
-		dir := "testdata/rustlsasync/target/" + p.name
-		args := append([]string{"build", "--release", "--quiet", "--manifest-path", "testdata/rustlsasync/Cargo.toml",
+		dir := "testdata/" + p.crate + "/target/" + p.name
+		args := append([]string{"build", "--release", "--quiet", "--manifest-path", "testdata/" + p.crate + "/Cargo.toml",
 			"--target-dir", dir}, p.features...)
 		if out, err := exec.Command(cargo, args...).CombinedOutput(); err != nil {
 			t.Fatalf("build rustls client with %s: %v: %s", p.name, err, out)
 		}
-		client, err := filepath.Abs(dir + "/release/rustlsasync")
+		client, err := filepath.Abs(dir + "/release/" + p.crate)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -828,7 +888,7 @@ func TestRustlsAsync(t *testing.T) {
 		clients[p.name] = client
 		targets = append(targets, found...)
 	}
-	events := startTracer(t, Options{Comm: "rustlsasync"}, targets)
+	events := startTracer(t, Options{Comm: "rustls"}, targets) // rustlsasync and rustls020
 	srv, port := newServer(t)
 	server := srv.Listener.Addr().String()
 
@@ -846,7 +906,7 @@ func TestRustlsAsync(t *testing.T) {
 			path := "/async-" + name
 			out, err := exec.Command(clients[p.name], append([]string{port, path}, v.options...)...).CombinedOutput()
 			if err != nil || !bytes.Contains(out, []byte("served "+path)) {
-				t.Fatalf("rustlsasync %s: %v: %s", name, err, out)
+				t.Fatalf("%s %s: %v: %s", p.crate, name, err, out)
 			}
 			// The connection's first write goes out before its socket is
 			// known; it is held back until the socket notice fills it in.
@@ -1034,6 +1094,46 @@ func TestQuicGoHTTP3(t *testing.T) {
 	}
 	if reads[0].FD != reads[1].FD {
 		t.Errorf("the client used two sockets: fds %d and %d", reads[0].FD, reads[1].FD)
+	}
+}
+
+// UDP traffic on port 443, HTTP/3's, is counted per process, for main to
+// warn when none of a program's QUIC packets were captured.
+func TestQUICTraffic(t *testing.T) {
+	requireRoot(t)
+	python := requireTool(t, "python3")
+	tr, err := New(Options{Comm: "python3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.ResolvesAddresses() {
+		t.Skip("needs BTF")
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tr.Close() })
+	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+	if err != nil {
+		t.Skipf("listen on UDP port 443: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	script := `import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("127.0.0.1", 443))
+for _ in range(40):
+    s.send(b"\xc0 not really QUIC")
+`
+	cmd := exec.Command(python, "-c", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("python: %v: %s", err, out)
+	}
+	traffic, err := tr.QUICTraffic()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := traffic[uint32(cmd.Process.Pid)]; got.UDP443 < 32 || got.Untracked != 0 {
+		t.Errorf("python's traffic: %+v", got)
 	}
 }
 

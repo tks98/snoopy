@@ -219,7 +219,7 @@ func TestTextAndJSONEncodedBody(t *testing.T) {
 	half := len(msg) - len(gz)/2
 
 	var text, js bytes.Buffer
-	tp, jp := NewText(&text, Options{}), NewJSON(&js)
+	tp, jp := NewText(&text, Options{}), NewJSON(&js, Options{})
 	for _, data := range [][]byte{msg[:half], msg[half:]} {
 		ev := event(tracer.FuncSSLRead, string(data))
 		if err := tp.Print(ev); err != nil {
