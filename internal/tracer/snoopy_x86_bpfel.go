@@ -106,6 +106,12 @@ type snoopyQuicProc struct {
 	LastRecvFd int32
 }
 
+type snoopyQuicTraffic struct {
+	_         structs.HostLayout
+	Udp443    uint32
+	Untracked uint32
+}
+
 type snoopyRecvBuf struct {
 	_    structs.HostLayout
 	File uint64
@@ -139,6 +145,7 @@ const (
 	snoopyMapExecs                  = "execs"
 	snoopyMapIoThreads              = "io_threads"
 	snoopyMapQuicProcs              = "quic_procs"
+	snoopyMapQuicTraffic            = "quic_traffic"
 	snoopyMapRecvBufs               = "recv_bufs"
 	snoopyMapSealedPackets          = "sealed_packets"
 	snoopyMapTracedTgids            = "traced_tgids"
@@ -286,6 +293,7 @@ type snoopyMapSpecs struct {
 	Execs         *ebpf.MapSpec `ebpf:"execs"`
 	IoThreads     *ebpf.MapSpec `ebpf:"io_threads"`
 	QuicProcs     *ebpf.MapSpec `ebpf:"quic_procs"`
+	QuicTraffic   *ebpf.MapSpec `ebpf:"quic_traffic"`
 	RecvBufs      *ebpf.MapSpec `ebpf:"recv_bufs"`
 	SealedPackets *ebpf.MapSpec `ebpf:"sealed_packets"`
 	TracedTgids   *ebpf.MapSpec `ebpf:"traced_tgids"`
@@ -333,6 +341,7 @@ type snoopyMaps struct {
 	Execs         *ebpf.Map `ebpf:"execs"`
 	IoThreads     *ebpf.Map `ebpf:"io_threads"`
 	QuicProcs     *ebpf.Map `ebpf:"quic_procs"`
+	QuicTraffic   *ebpf.Map `ebpf:"quic_traffic"`
 	RecvBufs      *ebpf.Map `ebpf:"recv_bufs"`
 	SealedPackets *ebpf.Map `ebpf:"sealed_packets"`
 	TracedTgids   *ebpf.Map `ebpf:"traced_tgids"`
@@ -350,6 +359,7 @@ func (m *snoopyMaps) Close() error {
 		m.Execs,
 		m.IoThreads,
 		m.QuicProcs,
+		m.QuicTraffic,
 		m.RecvBufs,
 		m.SealedPackets,
 		m.TracedTgids,

@@ -316,6 +316,14 @@ signature finding against real binaries (see
   unconnected socket and separate goroutines like quinn, so the same
   `quic_procs`, packet-sent notices and connection IDs give sockets and
   peers.
+- **Warnings for quiet failures:** `quic_traffic` counts, per traced
+  process, datagrams on UDP sockets connected to port 443 (`note_udp443`,
+  only the datagram syscalls, up to 64) and untraceable Firefox packets;
+  `watchCounters` in `main.go` warns about a process with enough of the
+  first and no QUIC events for a whole tick. `RustInfo.describe` and
+  `GoInfo.QUICMissing` give attach-time warnings (`Target.Limits`, or a
+  `Problem` when nothing can be attached), and `Options.Warn` is told when
+  headers can't be decoded because the connection started before snoopy.
 - **QUIC in Firefox:** neqo (via the `nss_rs` crate) calls freebl's
   `AES_CreateContext` and `AES_AEAD` directly, through function pointers, not
   through PK11 or any exported function. `FREEBL_GetVector` is exported and

@@ -211,7 +211,7 @@ func TestTextBodyLimits(t *testing.T) {
 
 func TestJSON(t *testing.T) {
 	var buf bytes.Buffer
-	j := NewJSON(&buf)
+	j := NewJSON(&buf, Options{})
 	j.Print(event(tracer.FuncSSLWrite, "<html>"))
 	bin := event(tracer.FuncGoRead, "\xff\x00")
 	bin.FD = -1

@@ -38,7 +38,7 @@ func NewBrief(w io.Writer, opts Options) *Brief {
 	return &Brief{
 		w:     w,
 		opts:  opts,
-		dec:   newDecoders(),
+		dec:   newDecoders(opts.Warn),
 		dim:   s(color.Faint),
 		title: s(color.Bold),
 		write: s(color.FgCyan),

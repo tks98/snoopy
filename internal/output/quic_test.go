@@ -3,6 +3,7 @@ package output
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/netip"
 	"slices"
 	"strings"
@@ -333,5 +334,29 @@ func TestQUICConnectionsOnOneSocket(t *testing.T) {
 	e := ev(tracer.FuncQUICRecv, short(id(7, 0xc)), none, streamFrameBytes(0, 0, bodies[0], true))
 	if got := http3OfEvent(t, c, e); !slices.Equal(got, []string{"DATA hello, one"}) || knownAddr(e.Remote) {
 		t.Errorf("unknown connection: %q, peer %s", got, e.Remote)
+	}
+}
+
+// Headers that can't be decoded, because their connection started before
+// snoopy, are warned about.
+func TestWarnStartedEarly(t *testing.T) {
+	var warnings []string
+	p := NewText(io.Discard, Options{Warn: func(msg string) { warnings = append(warnings, msg) }})
+	ok := streamFrameBytes(0, 0, h3Frame(0x01, []byte{0x00, 0x00, 0xd1}), true) // :method GET, static
+	if err := p.Print(quicEvent(tracer.FuncQUICSend, ok)); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warned about a header block that decoded: %q", warnings)
+	}
+	// A later request, on a connection whose start wasn't seen, refers to
+	// a dynamic table entry from before.
+	p = NewText(io.Discard, Options{Warn: func(msg string) { warnings = append(warnings, msg) }})
+	early := streamFrameBytes(48, 0, h3Frame(0x01, []byte{0x05, 0x00, 0x80}), true)
+	if err := p.Print(quicEvent(tracer.FuncQUICSend, early)); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "started before snoopy") {
+		t.Errorf("warnings %q", warnings)
 	}
 }
