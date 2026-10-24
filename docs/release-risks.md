@@ -216,13 +216,14 @@ thing it depends on ships.
 
 In order of how much each removes.
 
-1. **Add a scheduled canary job.** Weekly in CI, download the latest Chrome
-   stable and beta with Google's debug symbols, the latest Electron arm64
-   with its Breakpad symbols, and Firefox, then run `TestBoringSSLBinaries`
-   and `TestFreeblBinaries`. That turns the most likely breakage into a red
-   check within a week of a release. Everything it needs exists except the
-   workflow; [maintenance.md](maintenance.md#getting-browsers-and-their-symbols)
-   has the download URLs.
+1. **Done: a scheduled canary job.** Every Monday, `.github/workflows/canary.yml`
+   downloads the latest Chrome stable and beta with Google's debug symbols,
+   the latest Electron (x86-64 and arm64) with its Breakpad symbols, and
+   Firefox (x86-64 and arm64) with Mozilla's, and runs `TestBoringSSLBinaries`
+   and `TestFreeblBinaries` on them; and it runs `TestCurlHTTP3` against
+   Fedora's latest curl on both architectures. A release that breaks one of
+   them shows as a failed run within a week. When a release's symbols
+   aren't out yet, the job only checks that one answer is found, and warns.
 2. **Check `golang.org/x/arch` bumps before merging them.** Run those
    signature tests against real arm64 binaries, or switch `arm64.go` and
    `freebl.go` to reading decoded fields instead of printed text.
