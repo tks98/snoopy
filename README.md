@@ -72,7 +72,8 @@ the output, JSON and pcap, containers, and troubleshooting.
   bodies compressed with gzip, deflate, Brotli or zstd decompressed, and
   gRPC messages decoded as protobuf, without needing the schema.
 - **Where:** running processes, those started while snoopy runs, and
-  processes in containers.
+  processes in containers. On Kubernetes, `kubectl snoopy POD` traces a pod
+  from your machine ([docs/kubernetes.md](docs/kubernetes.md)).
 
 [docs/how-it-works.md](docs/how-it-works.md) has the details, and what isn't
 supported.
@@ -94,6 +95,7 @@ needs no compiler, kernel headers or BCC.
 
 - [Using snoopy](docs/usage.md): flags, output, JSON, pcap and Wireshark,
   containers, troubleshooting, and upgrading from 1.x.
+- [Kubernetes](docs/kubernetes.md): the `kubectl snoopy` plugin.
 - [How snoopy works](docs/how-it-works.md): supported libraries, and how the
   tracing works.
 - [Performance](docs/performance.md): what snoopy costs the programs it

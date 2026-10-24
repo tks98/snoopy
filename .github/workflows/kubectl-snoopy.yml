@@ -1,0 +1,60 @@
+name: kubectl snoopy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Plugin lint and test
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: cmd/kubectl-snoopy
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: cmd/kubectl-snoopy/go.mod
+          cache-dependency-path: cmd/kubectl-snoopy/go.sum
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Run gofmt on:"; echo "$unformatted"; exit 1
+          fi
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+          working-directory: cmd/kubectl-snoopy
+      - run: go test -race ./...
+      - name: Build for every platform krew installs it on
+        run: |
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -o /dev/null .
+            done
+          done
+
+  e2e:
+    # A kind cluster on the runner: snoopy's image built from this tree, a
+    # pod making HTTPS requests, and the plugin tracing it. Only counts are
+    # printed, never what was captured.
+    name: kind end-to-end
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install kind
+        run: |
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          sudo install kind /usr/local/bin/kind
+      - run: cmd/kubectl-snoopy/e2e.sh
