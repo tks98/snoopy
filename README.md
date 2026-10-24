@@ -68,8 +68,9 @@ the output, JSON and pcap, containers, and troubleshooting.
   programs included.
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
   symbols and is found by signature, and Firefox. Their HTTP/3 too.
-- **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded, and
-  bodies compressed with gzip, deflate, Brotli or zstd decompressed.
+- **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded,
+  bodies compressed with gzip, deflate, Brotli or zstd decompressed, and
+  gRPC messages decoded as protobuf, without needing the schema.
 - **Where:** running processes, those started while snoopy runs, and
   processes in containers.
 

@@ -154,6 +154,11 @@ func briefHTTP2(frames []http2Frame, verbose bool) string {
 			p = fmt.Sprintf("%s s%d %s", f.Type, f.Stream, briefFields(f.Headers))
 		case f.HeadersLost:
 			p = fmt.Sprintf("%s s%d (not decoded)", f.Type, f.Stream)
+		case f.Type == "DATA" && len(f.GRPC) > 0:
+			p = fmt.Sprintf("DATA s%d gRPC %d message", f.Stream, len(f.GRPC))
+			if len(f.GRPC) > 1 {
+				p += "s"
+			}
 		case f.Type == "DATA":
 			p = fmt.Sprintf("DATA s%d %d bytes%s", f.Stream, len(f.Data), bodyNote(f.Body))
 		case f.Stream != 0 && f.Type != "CONTINUATION":
@@ -201,6 +206,12 @@ func briefFields(fields []hpack.HeaderField) string {
 	if m := get(":method"); m != "" {
 		return m + " " + get(":authority") + get(":path")
 	}
+	// A gRPC call's status, in its trailers, or with the response's
+	// headers if it has no messages.
+	grpc := ""
+	if s := get("grpc-status"); s != "" {
+		grpc = strings.TrimSpace("grpc-status " + s + " " + grpcStatusName(s))
+	}
 	if s := get(":status"); s != "" {
 		parts := []string{s}
 		for _, name := range []string{"content-type", "content-encoding"} {
@@ -208,7 +219,13 @@ func briefFields(fields []hpack.HeaderField) string {
 				parts = append(parts, v)
 			}
 		}
+		if grpc != "" {
+			parts = append(parts, grpc)
+		}
 		return strings.Join(parts, ", ")
+	}
+	if grpc != "" {
+		return grpc
 	}
 	return fmt.Sprintf("%d fields", len(fields))
 }
