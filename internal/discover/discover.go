@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -243,20 +244,25 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 // Watcher finds targets in processes that start after Find ran. Each file is
 // inspected once, however many processes use it.
 type Watcher struct {
-	proc  string
-	mu    sync.Mutex
-	seen  map[fileID]bool
-	roots map[fileID]bool // root filesystems whose library directories were looked in
+	proc string
+	// perProcess makes it return every target a process can use, not only
+	// those in files it hadn't seen: probes attached per process are needed
+	// by each.
+	perProcess bool
+	mu         sync.Mutex
+	seen       map[fileID][]Target // what each file inspected has
+	roots      map[fileID]bool     // root filesystems whose library directories were looked in
 }
 
 // NewWatcher returns a Watcher that skips the files of known, which are
 // already attached to, and our own root's library directories, whose
-// libraries Find returned.
-func NewWatcher(known []Target) *Watcher {
-	w := &Watcher{proc: "/proc", seen: map[fileID]bool{}, roots: map[fileID]bool{}}
+// libraries Find returned. With perProcess, it returns targets for each
+// process, the files of known included.
+func NewWatcher(known []Target, perProcess bool) *Watcher {
+	w := &Watcher{proc: "/proc", perProcess: perProcess, seen: map[fileID][]Target{}, roots: map[fileID]bool{}}
 	for _, t := range known {
 		if id, err := idOf(t.Path); err == nil {
-			w.seen[id] = true
+			w.seen[id] = append(w.seen[id], t)
 		}
 	}
 	if id, err := dirID("/"); err == nil {
@@ -268,7 +274,7 @@ func NewWatcher(known []Target) *Watcher {
 // Known reports whether a process's executable and root filesystem were
 // looked at already, and it doesn't set where libraries are loaded from, so
 // that its executable and the TLS libraries it's about to load are attached
-// to if they can be.
+// to if they can be. Per process, none is known: each needs its own probes.
 func (w *Watcher) Known(pid int) bool {
 	dir := filepath.Join(w.proc, strconv.Itoa(pid))
 	exe, errExe := idOf(filepath.Join(dir, "exe"))
@@ -276,19 +282,24 @@ func (w *Watcher) Known(pid int) bool {
 	if errExe != nil || errRoot != nil {
 		return true // gone, or not ours to see
 	}
+	if w.perProcess {
+		return false
+	}
 	if path, preload := loaderEnv(dir); len(path) > 0 || len(preload) > 0 {
 		return false // it may load libraries from anywhere
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.seen[exe] && w.roots[root]
+	_, seen := w.seen[exe]
+	return seen && w.roots[root]
 }
 
 // Root returns the targets among the TLS libraries in the usual library
 // directories of a process's root filesystem, the first time it's asked
 // about that root: a process in a container or chroot that has only just
 // started hasn't mapped its libraries yet, and may be done before the next
-// look at its mappings.
+// look at its mappings. Per process, it returns them every time, so a
+// library the process loads later is already attached to for it.
 func (w *Watcher) Root(pid int) []Target {
 	root := filepath.Join(w.proc, strconv.Itoa(pid), "root")
 	id, err := dirID(root)
@@ -299,9 +310,10 @@ func (w *Watcher) Root(pid int) []Target {
 	known := w.roots[id]
 	w.roots[id] = true
 	w.mu.Unlock()
-	if known {
+	if known && !w.perProcess {
 		return nil
 	}
+	root = w.filesRoot(pid, root)
 	var targets []Target
 	for _, dir := range libDirs {
 		for _, pat := range libPatterns {
@@ -312,6 +324,23 @@ func (w *Watcher) Root(pid int) []Target {
 		}
 	}
 	return targets
+}
+
+// filesRoot returns the directory to reach a process's files under, given
+// root, its /proc/<pid>/root: "" if it shares snoopy's root and mount
+// namespace, so that its files have the paths it uses itself.
+func (w *Watcher) filesRoot(pid int, root string) string {
+	ns, err := os.Readlink(filepath.Join(w.proc, strconv.Itoa(pid), "ns", "mnt"))
+	own, errOwn := os.Readlink("/proc/self/ns/mnt")
+	if err != nil || errOwn != nil || ns != own {
+		return root
+	}
+	id, err := dirID(root)
+	ownID, errOwn := dirID("/")
+	if err != nil || errOwn != nil || id != ownID {
+		return root
+	}
+	return ""
 }
 
 // maxNeeded bounds how many libraries Needed reads.
@@ -333,6 +362,7 @@ func (w *Watcher) Needed(pid int) []Target {
 	if r, _ := os.Readlink(root); r != "" && r != "/" && strings.HasPrefix(exe, r+"/") {
 		exe = strings.TrimPrefix(exe, r) // a chroot's (see processFiles)
 	}
+	root = w.filesRoot(pid, root)
 	envPath, preload := loaderEnv(dir)
 
 	var targets []Target
@@ -413,26 +443,35 @@ func findLibrary(root, name string, dirs []string) string {
 	return ""
 }
 
-// inspect returns the targets in a file, unless it was seen before, with
-// note added to theirs.
+// inspect returns the targets in a file at path, with note added to theirs,
+// unless it was seen before; per process, those it had then.
 func (w *Watcher) inspect(path, note string) []Target {
 	id, err := idOf(path)
 	if err != nil {
 		return nil
 	}
 	w.mu.Lock()
-	seen := w.seen[id]
+	found, seen := w.seen[id]
 	w.mu.Unlock()
-	if seen {
+	if seen && !w.perProcess {
 		return nil
 	}
-	found, err := Inspect(path)
-	if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
-		return nil // gone with the process, or not ours to see; maybe next time
+	if seen {
+		// The same file, but reached by this process's path: another's may
+		// be gone with it.
+		found = slices.Clone(found)
+		for i := range found {
+			found[i].Path = path
+		}
+	} else {
+		found, err = Inspect(path)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+			return nil // gone with the process, or not ours to see; maybe next time
+		}
+		w.mu.Lock()
+		w.seen[id] = slices.Clone(found)
+		w.mu.Unlock()
 	}
-	w.mu.Lock()
-	w.seen[id] = true
-	w.mu.Unlock()
 	for i := range found {
 		found[i].Note = joinNotes(found[i].Note, note)
 	}
@@ -452,7 +491,7 @@ func dirID(path string) (fileID, error) {
 }
 
 // Process returns the targets among a process's executable and mapped TLS
-// libraries that haven't been seen before. Errors (typically, the process
+// libraries that haven't been seen before, or per process, all of them. Errors (typically, the process
 // has exited) are ignored.
 func (w *Watcher) Process(pid int) []Target {
 	files, err := processFiles(w.proc, pid)
@@ -464,6 +503,30 @@ func (w *Watcher) Process(pid int) []Target {
 		targets = append(targets, w.inspect(c.path, c.note)...)
 	}
 	return targets
+}
+
+// Selected returns the running processes that Options.PID and Options.Comm
+// select: the process and those it started, those whose name starts with
+// comm, or with both, those of the first whose name starts with comm.
+func Selected(pid int, comm string) []int {
+	var pids []int
+	if pid > 0 {
+		pids = descendants("/proc", pid)
+	} else {
+		entries, _ := os.ReadDir("/proc")
+		for _, e := range entries {
+			if n, err := strconv.Atoi(e.Name()); err == nil && n != os.Getpid() {
+				pids = append(pids, n)
+			}
+		}
+	}
+	if comm == "" {
+		return pids
+	}
+	return slices.DeleteFunc(pids, func(p int) bool {
+		name, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", p))
+		return err != nil || !strings.HasPrefix(string(name), comm)
+	})
 }
 
 // knownFiles returns the known programs that are installed, of those whose

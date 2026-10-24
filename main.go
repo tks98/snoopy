@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"os/signal"
 	"runtime/debug"
 	"slices"
@@ -276,7 +277,9 @@ func run(cfg config) error {
 	}
 	// Loading the BPF program comes first: without root, its error is the
 	// one to see.
-	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize})
+	// With a process filter, probes go on those processes only, so the
+	// rest don't pay for them; that needs the watcher, for new ones.
+	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize, PerProcess: !cfg.noScan})
 	if err != nil {
 		return err
 	}
@@ -300,16 +303,39 @@ func run(cfg config) error {
 	}
 
 	var attached []discover.Target
-	for _, target := range targets {
-		funcs, err := t.Attach(target)
-		if reportAttach(cfg, target, funcs, err, true) {
-			attached = append(attached, target)
+	watcher := discover.NewWatcher(targets, t.PerProcess())
+	if t.PerProcess() {
+		for _, target := range targets {
+			if slices.Contains(cfg.libs, target.Path) { // asked for: for every process
+				funcs, err := t.Attach(target, 0)
+				if reportAttach(cfg, target, funcs, err, true) {
+					attached = append(attached, target)
+				}
+			}
+		}
+		for _, pid := range discover.Selected(cfg.pid, cfg.comm) {
+			// What it has, then what it may load.
+			for _, target := range append(watcher.Process(pid), watcher.Root(pid)...) {
+				funcs, err := t.Attach(target, pid)
+				if reportAttach(cfg, target, funcs, err, true) {
+					attached = append(attached, target)
+				}
+			}
+		}
+	} else {
+		for _, target := range targets {
+			funcs, err := t.Attach(target, 0)
+			if reportAttach(cfg, target, funcs, err, true) {
+				attached = append(attached, target)
+			}
 		}
 	}
-	if len(attached) == 0 {
+	switch {
+	case len(attached) == 0 && t.PerProcess():
+		logf("no process to trace is running yet; attaching to them as they start")
+	case len(attached) == 0:
 		return errors.New("could not attach to any TLS library")
-	}
-	if !cfg.verbose {
+	case !cfg.verbose:
 		logf("attached to %s (--verbose lists every file)", attachSummary(attached))
 	}
 	if err := t.AttachSyscalls(); err != nil {
@@ -324,8 +350,22 @@ func run(cfg config) error {
 	}
 	// Also attach to what processes started from now on use.
 	if !cfg.noScan {
-		stopWatching, err := t.WatchNewProcesses(discover.NewWatcher(targets), acceptProcess(cfg, t), holdProcess(cfg),
-			func(target discover.Target, funcs []string, err error) { reportAttach(cfg, target, funcs, err, false) })
+		// Per process, every new process attaches to its files: they're
+		// reported the first time.
+		reported := map[string]bool{}
+		for _, target := range attached {
+			reported[reportKey(target)] = true
+		}
+		stopWatching, err := t.WatchNewProcesses(watcher, acceptProcess(cfg, t), holdProcess(cfg),
+			func(target discover.Target, funcs []string, err error) {
+				key := reportKey(target)
+				if t.PerProcess() && err == nil && reported[key] && !cfg.verbose {
+					return
+				}
+				if reportAttach(cfg, target, funcs, err, false) {
+					reported[key] = true
+				}
+			})
 		if err != nil {
 			logf("warning: programs started from now on are only traced if they use a library already attached to: %v", err)
 		} else {
@@ -404,6 +444,16 @@ func run(cfg config) error {
 		logf("warning: %d chunks were dropped because the ring buffer was full", lost)
 	}
 	return err
+}
+
+// reportKey identifies a target's file however it was reached, by name or
+// through a process's /proc directory.
+func reportKey(target discover.Target) string {
+	path := target.Name()
+	if real, err := filepath.EvalSymlinks(target.Path); err == nil {
+		path = real
+	}
+	return target.Library.String() + " " + path
 }
 
 // hidden returns how many events a printer left out so far.
