@@ -61,13 +61,13 @@ the output, JSON and pcap, containers, and troubleshooting.
 
 ## What it traces
 
-- **TLS libraries:** OpenSSL, BoringSSL, LibreSSL, GnuTLS, NSS, wolfSSL,
+- **TLS libraries:** OpenSSL, BoringSSL (also Bun's and Envoy's, found by
+  signature), LibreSSL, GnuTLS, NSS, wolfSSL,
   Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 (curl's HTTP/3)
   and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
-  symbols and is found by signature, and Firefox. Their HTTP/3 too. Bun and
-  Envoy, whose BoringSSL is found the same way.
+  symbols and is found by signature, and Firefox. Their HTTP/3 too.
 - **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded, and
   bodies compressed with gzip, deflate, Brotli or zstd decompressed.
 - **Where:** running processes, those started while snoopy runs, and
