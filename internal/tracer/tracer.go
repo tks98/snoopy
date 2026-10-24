@@ -81,7 +81,7 @@ type Tracer struct {
 
 // procLinks are the probes attached for one process.
 type procLinks struct {
-	start uint64 // when it started, so a reused PID isn't taken for it
+	start uint64                // when it started, so a reused PID isn't taken for it
 	files map[procFile][]string // the functions attached to in each
 	links []link.Link
 }
