@@ -131,12 +131,39 @@ struct files_struct {
 	struct fdtable *fdt;
 } __attribute__((preserve_access_index));
 
+struct ns_common {
+	unsigned int inum;
+} __attribute__((preserve_access_index));
+
+struct pid_namespace {
+	struct ns_common ns;
+} __attribute__((preserve_access_index));
+
+struct upid {
+	int nr;
+	struct pid_namespace *ns;
+} __attribute__((preserve_access_index));
+
+// numbers has level + 1 entries: the ID in each namespace from the
+// kernel's own (0) down to the one the process was made in.
+struct pid {
+	unsigned int level;
+	struct upid numbers[1];
+} __attribute__((preserve_access_index));
+
 struct task_struct {
 	struct files_struct *files;
 	struct task_struct *group_leader;
 	struct task_struct *real_parent;
+	struct pid *thread_pid;
 	__s32 tgid; // pid_t
 	char comm[16];
 } __attribute__((preserve_access_index));
+
+// UAPI, for bpf_get_ns_current_pid_tgid.
+struct bpf_pidns_info {
+	__u32 pid;
+	__u32 tgid;
+};
 
 #endif /* __VMLINUX_H__ */

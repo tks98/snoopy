@@ -67,8 +67,12 @@ func (b *Brief) Print(ev *tracer.Event) error {
 	if ev.Function.IsQUIC() {
 		proto = "QUIC"
 	}
+	process := fmt.Sprintf("%s[%d]", ev.Comm, ev.PID)
+	if ev.ContainerName != "" {
+		process = ev.ContainerName + " " + process
+	}
 	line := fmt.Sprintf("%s %s %s %s %d", b.dim(ev.Time.Format("15:04:05.000000")),
-		b.title(fmt.Sprintf("%s[%d]", ev.Comm, ev.PID)), paint(endpoints(ev)), proto, ev.Size)
+		b.title(process), paint(endpoints(ev)), proto, ev.Size)
 	if s := clip(b.summary(ev, dc)); s != "" {
 		line += ": " + s
 	}
