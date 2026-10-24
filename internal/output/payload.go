@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 	"regexp"
 	"strings"
 	"unicode"
@@ -13,12 +12,21 @@ import (
 
 // isText reports whether b reads as text: valid UTF-8 with few control
 // characters. A rune cut off at the end of a truncated capture is allowed.
+// It runs on every call's data, so ASCII, nearly all of HTTP, is checked a
+// byte at a time; only the rest is decoded as UTF-8.
 func isText(b []byte) bool {
 	if len(b) == 0 {
 		return true
 	}
 	bad := 0
 	for i := 0; i < len(b); {
+		if c := b[i]; c < utf8.RuneSelf {
+			if (c < ' ' || c == 0x7f) && c != '\n' && c != '\r' && c != '\t' && c != '\f' && c != '\v' {
+				bad++
+			}
+			i++
+			continue
+		}
 		r, size := utf8.DecodeRune(b[i:])
 		switch {
 		case r == utf8.RuneError && size <= 1:
@@ -27,7 +35,7 @@ func isText(b []byte) bool {
 				continue
 			}
 			bad++
-		case unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' && r != '\f' && r != '\v':
+		case unicode.IsControl(r):
 			bad++
 		}
 		i += size
@@ -35,23 +43,47 @@ func isText(b []byte) bool {
 	return bad*20 <= len(b) // at most 5%
 }
 
-// escapeText makes text safe to print on a terminal: control characters
-// other than newlines and tabs are shown as \xNN, carriage returns before a
-// newline are dropped.
+// escapeText returns b for printing: CRLF line endings as LF, and invalid
+// UTF-8 and control characters other than newlines and tabs as \xNN. Like
+// isText, it takes ASCII a byte at a time, and b as it is if nothing in it
+// needs changing.
 func escapeText(b []byte) string {
+	plain := true
+	for _, c := range b {
+		if c >= utf8.RuneSelf || (c < ' ' || c == 0x7f) && c != '\n' && c != '\t' {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		return string(b)
+	}
+	const hexDigits = "0123456789abcdef"
+	escape := func(sb *strings.Builder, c byte) {
+		sb.WriteString(`\x`)
+		sb.WriteByte(hexDigits[c>>4])
+		sb.WriteByte(hexDigits[c&0xf])
+	}
 	var sb strings.Builder
 	sb.Grow(len(b))
 	for i := 0; i < len(b); {
-		r, size := utf8.DecodeRune(b[i:])
-		switch {
-		case r == '\r' && i+1 < len(b) && b[i+1] == '\n':
-		case r == '\n' || r == '\t':
-			sb.WriteRune(r)
-		case r == utf8.RuneError && size <= 1, unicode.IsControl(r):
-			for _, c := range b[i : i+size] {
-				fmt.Fprintf(&sb, `\x%02x`, c)
+		if c := b[i]; c < utf8.RuneSelf {
+			switch {
+			case c == '\r' && i+1 < len(b) && b[i+1] == '\n':
+			case c == '\n' || c == '\t' || c >= ' ' && c != 0x7f:
+				sb.WriteByte(c)
+			default:
+				escape(&sb, c)
 			}
-		default:
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRune(b[i:])
+		if r == utf8.RuneError && size <= 1 || unicode.IsControl(r) {
+			for _, c := range b[i : i+size] {
+				escape(&sb, c)
+			}
+		} else {
 			sb.Write(b[i : i+size])
 		}
 		i += size

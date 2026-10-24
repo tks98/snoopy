@@ -66,14 +66,42 @@ type chunk struct {
 	data []byte
 }
 
+// decodeHeader decodes a record's rawHeader, which has to be headerSize
+// bytes or more, field by field: binary.Decode's reflection was a good part
+// of what snoopy spent under load. TestDecodeHeader checks they agree.
+func decodeHeader(b []byte) rawHeader {
+	e := binary.NativeEndian
+	h := rawHeader{
+		TimestampNs:   e.Uint64(b[0:]),
+		LatencyNs:     e.Uint64(b[8:]),
+		ConnID:        e.Uint64(b[16:]),
+		Pid:           e.Uint32(b[24:]),
+		Tid:           e.Uint32(b[28:]),
+		Size:          e.Uint32(b[32:]),
+		Captured:      e.Uint32(b[36:]),
+		ChunkOffset:   e.Uint32(b[40:]),
+		ChunkLen:      e.Uint32(b[44:]),
+		Fd:            int32(e.Uint32(b[48:])),
+		Family:        e.Uint16(b[52:]),
+		Lport:         e.Uint16(b[54:]),
+		Rport:         e.Uint16(b[56:]),
+		Fn:            b[58],
+		Flags:         b[59],
+		QuicHeaderLen: b[92],
+	}
+	copy(h.Laddr[:], b[60:76])
+	copy(h.Raddr[:], b[76:92])
+	copy(h.QuicHeader[:], b[93:140])
+	copy(h.Comm[:], b[140:156])
+	return h
+}
+
 func parseChunk(record []byte) (chunk, error) {
 	var c chunk
 	if len(record) < headerSize {
 		return c, fmt.Errorf("short record: %d bytes", len(record))
 	}
-	if _, err := binary.Decode(record, binary.NativeEndian, &c.rawHeader); err != nil {
-		return c, err
-	}
+	c.rawHeader = decodeHeader(record)
 	if int(c.ChunkLen) > len(record)-headerSize {
 		return c, fmt.Errorf("chunk length %d exceeds record", c.ChunkLen)
 	}

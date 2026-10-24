@@ -237,6 +237,15 @@ docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /sno
 On Kubernetes, that's a pod with `hostPID: true` and a privileged container,
 on the node to trace.
 
+## Overhead
+
+Each traced TLS call costs the calling program around 10 µs, and other
+programs using a library snoopy is attached to (the system's OpenSSL) about
+4 µs per call, because the probes are on the library's file, whatever
+`--comm` or `--pid` say. Text output keeps up with tens of thousands of calls
+a second; beyond that, snoopy drops data and warns. [performance.md](performance.md)
+has the measurements.
+
 ## Troubleshooting
 
 
