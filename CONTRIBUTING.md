@@ -18,7 +18,10 @@ The integration tests use whichever of `curl`, `python3`, `gnutls-cli` and the
 NSS, wolfSSL, Mbed TLS and s2n-tls development files (`libnss3-dev`,
 `libwolfssl-dev`, `libmbedtls-dev`; s2n-tls has to be built from source) are
 installed, and skip the rest. The rustls tests build two clients with
-`cargo`, which takes a while, so they only run with `SNOOPY_TEST_RUSTLS=1`. CI runs
+`cargo`, which takes a while, so they only run with `SNOOPY_TEST_RUSTLS=1`.
+`TestCurlHTTP3` needs a curl with HTTP/3, which Ubuntu's isn't: set
+`SNOOPY_TEST_CURL_HTTP3` to `/` on Fedora, or to a Fedora root filesystem
+(curl is run chrooted in it). CI runs
 them on x86_64 and arm64. To run them on an older kernel in a VM, use
 [vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
 Install vimto with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`; a build

@@ -276,6 +276,11 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 			{"s2n_recv", t.objs.S2nRecvEnter, false},
 			{"s2n_send", t.objs.S2nSendEnter, false},
 		}
+	case discover.NGTCP2:
+		probes = []cProbe{
+			{"ngtcp2_crypto_encrypt", t.objs.Ngtcp2EncryptEnter, true},
+			{"ngtcp2_crypto_decrypt", t.objs.Ngtcp2DecryptEnter, false},
+		}
 	case discover.GoTLS:
 		return t.attachGo(ex, target.Go)
 	case discover.Rustls:

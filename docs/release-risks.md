@@ -130,6 +130,10 @@ thing it depends on ships.
   vectored, so async programs weren't covered until records were read at
   aws-lc. aws-lc-rs seals TLS 1.2 records with `seal_scatter`, not `seal`.
 
+- **Guarded by:** `TestRustls` and `TestRustlsAsync` (TLS 1.3 and 1.2), only
+  with `SNOOPY_TEST_RUSTLS=1`, and `TestRustlsSymbols` and
+  `TestAwsLCSymbols`.
+
 ### HTTP/3 over quinn
 
 - **Depends on:** what rustls's records depend on (above), and quinn
@@ -143,9 +147,21 @@ thing it depends on ships.
   connections sharing a socket may be decoded mixed together, quietly.
 - **Guarded by:** `TestQuinnHTTP3` (`SNOOPY_TEST_RUSTLS=1`), two
   connections over one socket with each provider.
-- **Guarded by:** `TestRustls` and `TestRustlsAsync` (TLS 1.3 and 1.2), only
-  with `SNOOPY_TEST_RUSTLS=1`, and `TestRustlsSymbols` and
-  `TestAwsLCSymbols`.
+
+### HTTP/3 over ngtcp2 (curl)
+
+- **Depends on:** ngtcp2's crypto library exporting `ngtcp2_crypto_encrypt`
+  and `ngtcp2_crypto_decrypt` with their current arguments, which is public
+  API; `ngtcp2_crypto_aead` starting with the cipher and then its tag size;
+  and ngtcp2 encrypting packets through them rather than through the TLS
+  library directly.
+- **Breaks when:** ngtcp2 changes that API (a major version), or curl moves
+  to another QUIC stack (it also builds with quiche and OpenSSL's own QUIC,
+  which would need their own probes).
+- **How it shows:** renamed functions mean nothing attaches, which is loud;
+  a changed `ngtcp2_crypto_aead` means wrong lengths, quietly.
+- **Guarded by:** `TestCurlHTTP3`, only with `SNOOPY_TEST_CURL_HTTP3` set to
+  the root of a system with an HTTP/3 curl (Fedora's).
 
 ### Go crypto/tls
 
@@ -195,8 +211,6 @@ thing it depends on ships.
 - **freebl's function table.** Positions in it are NSS ABI and are only ever
   appended to.
 
-A gap rather than a release risk: curl's own HTTP/3, through ngtcp2, isn't
-captured at all.
 
 ## What to do about it
 

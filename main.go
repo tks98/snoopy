@@ -1,6 +1,6 @@
 // Command snoopy traces the plaintext of TLS connections using eBPF uprobes
-// on TLS libraries (OpenSSL, GnuTLS, NSS, wolfSSL, Mbed TLS, s2n-tls) and
-// Go's crypto/tls.
+// on TLS libraries (OpenSSL, GnuTLS, NSS, wolfSSL, Mbed TLS, s2n-tls,
+// rustls), ngtcp2's crypto library and Go's crypto/tls.
 package main
 
 import (

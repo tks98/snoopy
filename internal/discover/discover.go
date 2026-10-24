@@ -29,6 +29,7 @@ const (
 	MbedTLS
 	S2N
 	Rustls
+	NGTCP2 // its crypto library's packet protection, for QUIC (curl's HTTP/3)
 )
 
 func (l Library) String() string {
@@ -49,6 +50,8 @@ func (l Library) String() string {
 		return "s2n"
 	case Rustls:
 		return "rustls"
+	case NGTCP2:
+		return "ngtcp2"
 	}
 	return "unknown"
 }
@@ -90,7 +93,8 @@ func (t Target) Name() string {
 }
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
-var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libfreeblpriv3.so", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*"}
+var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libfreeblpriv3.so", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*",
+	"libngtcp2_crypto_*.so*"}
 
 // knownPrograms are where Chromium-based browsers, Electron apps and
 // Firefox's own NSS libraries are installed. Inspecting them at startup means
@@ -339,6 +343,15 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 	}
 	defer maps.Close()
 
+	// Files are reached through the process's root, but a chrooted
+	// process's maps and exe name them by their path from ours.
+	root, _ := os.Readlink(filepath.Join(dir, "root"))
+	inRoot := func(path string) string {
+		if root != "" && root != "/" && strings.HasPrefix(path, root+"/") {
+			return strings.TrimPrefix(path, root)
+		}
+		return path
+	}
 	libs := MappedLibraries(maps)
 	out := make([]candidate, 0, len(libs)+1)
 	for _, lib := range libs {
@@ -349,7 +362,7 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 				deleted: lib.Path,
 			})
 		} else {
-			out = append(out, candidate{path: filepath.Join(dir, "root", lib.Path)})
+			out = append(out, candidate{path: filepath.Join(dir, "root", inRoot(lib.Path))})
 		}
 	}
 
@@ -363,7 +376,7 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 			deleted: strings.TrimSuffix(exe, deletedSuffix),
 		})
 	default:
-		out = append(out, candidate{path: filepath.Join(dir, "root", exe)})
+		out = append(out, candidate{path: filepath.Join(dir, "root", inRoot(exe))})
 	}
 	return out, nil
 }

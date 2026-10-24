@@ -918,27 +918,7 @@ func TestQuinnHTTP3(t *testing.T) {
 
 	for _, p := range providers {
 		// Two servers, which the client reaches at once over one socket.
-		var ports []string
-		for range 2 {
-			port := freeUDPPort(t)
-			server := filepath.Join(t.TempDir(), "quinnsrv")
-			if err := os.Symlink(clients[p.name], server); err != nil {
-				t.Fatal(err)
-			}
-			srv := exec.Command(server, "server", port)
-			stdout, err := srv.StdoutPipe()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := srv.Start(); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
-			if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
-				t.Fatalf("quinn server with %s: %q, %v", p.name, line, err)
-			}
-			ports = append(ports, port)
-		}
+		ports := []string{quinnServer(t, clients[p.name]), quinnServer(t, clients[p.name])}
 
 		path := "/h3-" + p.name
 		out, err := exec.Command(clients[p.name], "client", strings.Join(ports, ","), path).CombinedOutput()
@@ -979,6 +959,95 @@ func TestQuinnHTTP3(t *testing.T) {
 		if reads[0].FD != reads[1].FD {
 			t.Errorf("the client used two sockets: fds %d and %d", reads[0].FD, reads[1].FD)
 		}
+	}
+}
+
+// quinnServer starts the quinn test program as an HTTP/3 server, under
+// another name than the client's, and returns its port on 127.0.0.1.
+func quinnServer(t *testing.T, program string) string {
+	t.Helper()
+	port := freeUDPPort(t)
+	server := filepath.Join(t.TempDir(), "quinnsrv")
+	if err := os.Symlink(program, server); err != nil {
+		t.Fatal(err)
+	}
+	srv := exec.Command(server, "server", port)
+	stdout, err := srv.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
+		t.Fatalf("quinn server: %q, %v", line, err)
+	}
+	return port
+}
+
+// curl's HTTP/3, through ngtcp2's crypto library. Ubuntu's curl has no
+// HTTP/3 and Fedora's does, so SNOOPY_TEST_CURL_HTTP3 is the root of a
+// system with one: / on Fedora, or a Fedora root filesystem, which curl is
+// run chrooted in. The server is the quinn test program, built with cargo.
+func TestCurlHTTP3(t *testing.T) {
+	requireRoot(t)
+	root := os.Getenv("SNOOPY_TEST_CURL_HTTP3")
+	if root == "" {
+		t.Skip("set SNOOPY_TEST_CURL_HTTP3 to the root of a system whose curl has HTTP/3 to run this test")
+	}
+	cargo := requireTool(t, "cargo")
+	build := exec.Command(cargo, "build", "--release", "--quiet", "--manifest-path", "testdata/quinnh3/Cargo.toml",
+		"--target-dir", "testdata/quinnh3/target/aws-lc")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build quinn server: %v: %s", err, out)
+	}
+	program, err := filepath.Abs("testdata/quinnh3/target/aws-lc/release/quinnh3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var libs []string
+	for _, pattern := range []string{"usr/lib64/libngtcp2_crypto_*.so.*", "usr/lib/*/libngtcp2_crypto_*.so.*"} {
+		found, _ := filepath.Glob(filepath.Join(root, pattern))
+		libs = append(libs, found...)
+	}
+	var targets []discover.Target
+	for _, lib := range libs {
+		found, err := discover.Inspect(lib)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets = append(targets, found...)
+	}
+	if len(targets) == 0 || targets[0].Library != discover.NGTCP2 {
+		t.Fatalf("no ngtcp2 crypto library under %s: %v", root, libs)
+	}
+	events := startTracer(t, Options{Comm: "curl"}, targets)
+	port := quinnServer(t, program)
+	server := "127.0.0.1:" + port
+
+	path := "/curl-h3"
+	args := []string{"-sk", "--http3-only", "https://" + server + path}
+	cmd := exec.Command("curl", args...)
+	if root != "/" {
+		cmd = exec.Command("chroot", append([]string{root, "curl"}, args...)...)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil || !bytes.Contains(out, []byte("served "+path+" on "+port)) {
+		t.Fatalf("curl --http3-only: %v: %s", err, out)
+	}
+	read := waitFor(t, events, "response", func(ev *Event) bool {
+		return ev.Function == FuncNGTCP2Recv && contains("served "+path)(ev)
+	})
+	write := waitFor(t, events, "request", func(ev *Event) bool {
+		return ev.Function == FuncNGTCP2Send && ev.PID == read.PID && len(ev.QUICHeader) > 0 &&
+			ev.QUICHeader[0]&0x80 == 0 // after the handshake
+	})
+	// curl connects its socket, so the kernel knows the peer.
+	checkConnection(t, read, server)
+	checkConnection(t, write, server)
+	if read.FD != write.FD {
+		t.Errorf("response on fd %d, request on fd %d", read.FD, write.FD)
 	}
 }
 

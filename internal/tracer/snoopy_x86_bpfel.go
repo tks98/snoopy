@@ -159,6 +159,8 @@ const (
 	snoopyProgGoTlsWriteEnter       = "go_tls_write_enter"
 	snoopyProgMbedtlsSslReadEnter   = "mbedtls_ssl_read_enter"
 	snoopyProgMbedtlsSslWriteEnter  = "mbedtls_ssl_write_enter"
+	snoopyProgNgtcp2DecryptEnter    = "ngtcp2_decrypt_enter"
+	snoopyProgNgtcp2EncryptEnter    = "ngtcp2_encrypt_enter"
 	snoopyProgQuicOpenEnter         = "quic_open_enter"
 	snoopyProgQuicSealEnter         = "quic_seal_enter"
 	snoopyProgRingOpenEnter         = "ring_open_enter"
@@ -243,6 +245,8 @@ type snoopyProgramSpecs struct {
 	GoTlsWriteEnter       *ebpf.ProgramSpec `ebpf:"go_tls_write_enter"`
 	MbedtlsSslReadEnter   *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_read_enter"`
 	MbedtlsSslWriteEnter  *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_write_enter"`
+	Ngtcp2DecryptEnter    *ebpf.ProgramSpec `ebpf:"ngtcp2_decrypt_enter"`
+	Ngtcp2EncryptEnter    *ebpf.ProgramSpec `ebpf:"ngtcp2_encrypt_enter"`
 	QuicOpenEnter         *ebpf.ProgramSpec `ebpf:"quic_open_enter"`
 	QuicSealEnter         *ebpf.ProgramSpec `ebpf:"quic_seal_enter"`
 	RingOpenEnter         *ebpf.ProgramSpec `ebpf:"ring_open_enter"`
@@ -379,6 +383,8 @@ type snoopyPrograms struct {
 	GoTlsWriteEnter       *ebpf.Program `ebpf:"go_tls_write_enter"`
 	MbedtlsSslReadEnter   *ebpf.Program `ebpf:"mbedtls_ssl_read_enter"`
 	MbedtlsSslWriteEnter  *ebpf.Program `ebpf:"mbedtls_ssl_write_enter"`
+	Ngtcp2DecryptEnter    *ebpf.Program `ebpf:"ngtcp2_decrypt_enter"`
+	Ngtcp2EncryptEnter    *ebpf.Program `ebpf:"ngtcp2_encrypt_enter"`
 	QuicOpenEnter         *ebpf.Program `ebpf:"quic_open_enter"`
 	QuicSealEnter         *ebpf.Program `ebpf:"quic_seal_enter"`
 	RingOpenEnter         *ebpf.Program `ebpf:"ring_open_enter"`
@@ -417,6 +423,8 @@ func (p *snoopyPrograms) Close() error {
 		p.GoTlsWriteEnter,
 		p.MbedtlsSslReadEnter,
 		p.MbedtlsSslWriteEnter,
+		p.Ngtcp2DecryptEnter,
+		p.Ngtcp2EncryptEnter,
 		p.QuicOpenEnter,
 		p.QuicSealEnter,
 		p.RingOpenEnter,

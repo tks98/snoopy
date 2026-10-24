@@ -582,3 +582,34 @@ func TestDescendants(t *testing.T) {
 		t.Error("isDescendant is wrong")
 	}
 }
+
+// A chrooted process's maps and exe name files by their path outside its
+// root, which processFiles reaches them through.
+func TestProcessFilesChroot(t *testing.T) {
+	proc := t.TempDir()
+	dir := filepath.Join(proc, "42")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	maps := "7f0000000000-7f0000001000 r-xp 00000000 08:01 123 /srv/fedora/usr/lib64/libssl.so.3\n"
+	if err := os.WriteFile(filepath.Join(dir, "maps"), []byte(maps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range map[string]string{"root": "/srv/fedora", "exe": "/srv/fedora/usr/bin/curl"} {
+		if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files, err := processFiles(proc, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range files {
+		got = append(got, f.path)
+	}
+	want := []string{filepath.Join(dir, "root/usr/lib64/libssl.so.3"), filepath.Join(dir, "root/usr/bin/curl")}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

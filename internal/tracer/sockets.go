@@ -19,7 +19,8 @@ const fnQUICPacketSent = 0xfe
 // connection's first write can't have one when it's emitted.
 func (f Function) learnsSocketLater() bool {
 	switch f {
-	case FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend, FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend:
+	case FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend, FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend,
+		FuncNGTCP2Send:
 		return true
 	}
 	return false
