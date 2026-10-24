@@ -98,8 +98,12 @@ snoopy on a busy machine.
 - At startup, the processes `--pid` or `--comm` select get their own links;
   new ones get theirs as they're found, which the hold from #25 makes
   reliable: they're held until attached.
-- A process that forks without exec keeps its parent's breakpoints, so
-  children come along; exec'd ones are found by the exec watcher.
+- A process that forks without exec keeps its parent's breakpoints only
+  until its first hit, when the kernel removes them as not its own, so new
+  processes of traced ones need reporting too (`sched_process_fork`), and
+  their first calls can be missed before they're held; exec'd ones are
+  found by the exec watcher. (Found while doing it; first I thought children
+  came along.)
 - Many processes (a browser's dozens) mean many links; worth checking the
   cost of creating them and the kernel's limits.
 - Without either option, everything is traced, so nothing changes.
