@@ -7,6 +7,8 @@
 #
 #   fetch.sh chrome stable|beta <dir>
 #   fetch.sh electron x64|arm64 <dir>
+#   fetch.sh bun x64|aarch64 <dir>
+#   fetch.sh envoy x86_64|aarch_64 <dir>
 #   fetch.sh firefox linux64|linux64-aarch64 <dir>
 #   fetch.sh fedora <dir>        (as root, with Docker)
 #
@@ -61,6 +63,28 @@ electron)
 	else
 		warn "no symbols for Electron $tag $variant; only checking that one answer is found"
 		echo "$PWD/electron"
+	fi
+	;;
+bun | envoy)
+	# Neither publishes symbols that match its release build, so only that
+	# one answer is found is checked.
+	repo=oven-sh/bun
+	[ "$what" = envoy ] && repo=envoyproxy/envoy
+	auth=()
+	if [ -n "${GH_TOKEN:-}" ]; then
+		auth=(-H "Authorization: Bearer $GH_TOKEN")
+	fi
+	tag=$(curl -fsS "${auth[@]}" "https://api.github.com/repos/$repo/releases/latest" |
+		python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])')
+	log "$what $tag $variant"
+	if [ "$what" = bun ]; then
+		curl -fsSL -o bun.zip "https://github.com/$repo/releases/download/$tag/bun-linux-$variant.zip"
+		unzip -q -j bun.zip "bun-linux-$variant/bun"
+		rm bun.zip
+		echo "$PWD/bun"
+	else
+		curl -fsSL -o envoy "https://github.com/$repo/releases/download/$tag/envoy-${tag#v}-linux-$variant"
+		echo "$PWD/envoy"
 	fi
 	;;
 firefox)

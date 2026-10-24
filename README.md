@@ -61,7 +61,8 @@ the output, JSON and pcap, containers, and troubleshooting.
 
 ## What it traces
 
-- **TLS libraries:** OpenSSL, BoringSSL, LibreSSL, GnuTLS, NSS, wolfSSL,
+- **TLS libraries:** OpenSSL, BoringSSL (also Bun's and Envoy's, found by
+  signature), LibreSSL, GnuTLS, NSS, wolfSSL,
   Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 (curl's HTTP/3)
   and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.

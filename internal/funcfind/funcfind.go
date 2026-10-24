@@ -39,6 +39,9 @@ type Binary struct {
 	data     []segment // allocated, non-executable sections; read by segments()
 	loads    []elf.ProgHeader
 	callers  map[uint64]int // direct call targets, built on first use
+	// absolute is set for an executable that isn't position-independent,
+	// whose code can load an address as a 32-bit immediate.
+	absolute bool
 }
 
 type segment struct {
@@ -64,7 +67,7 @@ func Open(f *elf.File) (*Binary, error) {
 	if text == nil {
 		return nil, errors.New("funcfind: no .text section")
 	}
-	b := &Binary{f: f, arm64: f.Machine == elf.EM_AARCH64, textAddr: text.Addr}
+	b := &Binary{f: f, arm64: f.Machine == elf.EM_AARCH64, textAddr: text.Addr, absolute: f.Type == elf.ET_EXEC}
 	for _, p := range f.Progs {
 		if p.Type == elf.PT_LOAD {
 			b.loads = append(b.loads, p.ProgHeader)

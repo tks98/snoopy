@@ -37,7 +37,7 @@ var Progress func(msg string)
 
 // boringSSLCacheVersion is part of cached results' names: bump it when
 // findBoringSSL would answer differently, so that older answers aren't used.
-const boringSSLCacheVersion = 3
+const boringSSLCacheVersion = 4
 
 // cachedFindBoringSSL is findBoringSSL with its results kept by build ID in
 // the user's cache directory, so a large program (Chrome is 300 MB) is

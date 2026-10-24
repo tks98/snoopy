@@ -677,3 +677,22 @@ func TestRustInfoDescribe(t *testing.T) {
 		}
 	}
 }
+
+// Programs with QUICHE keep its error codes' names; the test binary has the
+// one hasQUICStack looks for, as hasQUICStack's own literal, and sh hasn't.
+func TestHasQUICStack(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]bool{self: true, "/bin/sh": false} {
+		f, err := elf.Open(path)
+		if err != nil {
+			t.Skip(err)
+		}
+		if got := hasQUICStack(f); got != want {
+			t.Errorf("%s: %v", path, got)
+		}
+		f.Close()
+	}
+}

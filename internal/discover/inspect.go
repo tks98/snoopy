@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"bytes"
 	"debug/buildinfo"
 	"debug/elf"
 	"debug/gosym"
@@ -130,7 +131,7 @@ func Inspect(path string) ([]Target, error) {
 		switch {
 		case err == nil:
 			t := Target{Path: path, Library: OpenSSL, Offsets: offsets, Note: "BoringSSL found by signature"}
-			if offsets["EVP_AEAD_CTX_seal"] == 0 {
+			if offsets["EVP_AEAD_CTX_seal"] == 0 && hasQUICStack(f) {
 				t.Limits = "BoringSSL's QUIC packet encryption wasn't found in this build, so its HTTP/3 isn't traced"
 			}
 			targets = append(targets, t)
@@ -543,6 +544,23 @@ func (ri *RustInfo) describe() (note, limits string) {
 		return "", "rustls's crypto provider here is neither aws-lc-rs nor ring, and the program uses tokio, so only its writes are traced"
 	}
 	return "", ""
+}
+
+// hasQUICStack reports whether a program has QUICHE, the QUIC stack of
+// Chromium and Envoy, by an error code's name it keeps: a program with
+// BoringSSL but no QUIC (Bun) loses nothing by its AEAD functions not being
+// found, and isn't warned about.
+func hasQUICStack(f *elf.File) bool {
+	for _, s := range f.Sections {
+		if s.Type != elf.SHT_PROGBITS || s.Flags&elf.SHF_ALLOC == 0 || s.Flags&elf.SHF_EXECINSTR != 0 {
+			continue
+		}
+		data, err := s.Data()
+		if err == nil && bytes.Contains(data, []byte("QUIC_HANDSHAKE_FAILED")) {
+			return true
+		}
+	}
+	return false
 }
 
 // awsLCAEAD matches aws-lc's AEAD functions as aws-lc-sys names them, e.g.

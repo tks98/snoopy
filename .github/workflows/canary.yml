@@ -29,6 +29,10 @@ jobs:
           - { program: chrome, variant: beta }
           - { program: electron, variant: x64 }
           - { program: electron, variant: arm64 }
+          - { program: bun, variant: x64 }
+          - { program: bun, variant: aarch64 }
+          - { program: envoy, variant: x86_64 }
+          - { program: envoy, variant: aarch_64 }
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
