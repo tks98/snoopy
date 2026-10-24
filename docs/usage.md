@@ -102,6 +102,36 @@ like images, get a line saying their size and content type. Data that isn't
 HTTP is shown as text, or hex-dumped up to 256 bytes. `--full` shows all of
 it, binary data as hex dumps.
 
+gRPC calls, which are HTTP/2 with `content-type: application/grpc`, show
+their messages decoded as protobuf without the service's schema, the way
+`protoc --decode_raw` shows them: each field's number and value, nested
+messages indented, compressed messages decompressed. A trailer's
+`grpc-status` gets its name. Here grpc-go's health check service:
+
+```console
+23:32:41.373918 grpcdemo (pid 229940) crypto/tls.(*Conn).Write 127.0.0.1:45960 > 127.0.0.1:50061  139 bytes  fd 3, conn 0x55fb8e441c08
+HTTP/2 HEADERS stream=1 length=94 [END_HEADERS]
+:method: POST
+:path: /grpc.health.v1.Health/Check
+...
+HTTP/2 DATA stream=1 length=18 [END_STREAM]
+gRPC message, 13 bytes
+1: "snoopy-demo"
+
+23:32:41.374116 grpcdemo (pid 229940) crypto/tls.(*Conn).Read 127.0.0.1:50061 > 127.0.0.1:45960  102 bytes  fd 3, conn 0x55fb8e441c08
+HTTP/2 HEADERS stream=1 length=14 [END_HEADERS]
+:status: 200
+...
+HTTP/2 DATA stream=1 length=7
+gRPC message, 2 bytes
+1: 1
+HTTP/2 HEADERS stream=1 length=24 [END_STREAM,END_HEADERS]
+grpc-status: 0 (OK)
+grpc-message:
+```
+
+A message's first 40 lines are shown; `--full` shows all of them.
+
 Calls that carry nothing of the requests and responses, only what keeps the
 connection going (HTTP/2 `SETTINGS`, `WINDOW_UPDATE` and `PING`, QUIC
 packets with only acknowledgments and the like), are left out, and so are
@@ -175,7 +205,7 @@ Each line is one call to a TLS read or write function:
 | Field | Description |
 | --- | --- |
 | `time` | When the call returned. |
-| `function`, `library` | The traced function, e.g. `SSL_read`, `EVP_AEAD_CTX_open` or `AES_AEAD (decrypt)` (QUIC packets), `ring::aead open` (QUIC packets in Rust programs) `ngtcp2_crypto_decrypt` (in curl) or `cipher.AEAD.Open` (in Go programs using quic-go), or `EVP_AEAD_CTX_open (TLS)` and `ring::aead open (TLS)` (TLS records, for rustls), and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n`, `rustls`, `ngtcp2` or `go`. |
+| `function`, `library` | The traced function, e.g. `SSL_read`, `EVP_AEAD_CTX_open` or `AES_AEAD (decrypt)` (QUIC packets), `ring::aead open` (QUIC packets in Rust programs), `ngtcp2_crypto_decrypt` (in curl) or `cipher.AEAD.Open` (in Go programs using quic-go), or `EVP_AEAD_CTX_open (TLS)` and `ring::aead open (TLS)` (TLS records, for rustls), and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n`, `rustls`, `ngtcp2` or `go`. |
 | `direction` | `read` (received from the peer) or `write` (sent to it). |
 | `process_name`, `pid`, `tid` | The calling process and thread. |
 | `container_id` | The container the process runs in, if any. |
@@ -187,7 +217,7 @@ Each line is one call to a TLS read or write function:
 | `incomplete` | Set when part of the payload was dropped because the ring buffer was full. |
 | `read_error` | Set when the payload couldn't be read from the process's memory. |
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. |
-| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`) and `body` (see below). HPACK compresses headers against a table built up over the connection, so on a connection that started before snoopy, frames are followed from the first call that starts with one, and a header block has `headers_not_decoded` instead of `headers`. |
+| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`), `body` (see below), and on a gRPC stream's DATA frames the `grpc_messages` they completed (`bytes`, `compressed`, and `protobuf`, the decoded fields a line each as in the text output, or an `error`). HPACK compresses headers against a table built up over the connection, so on a connection that started before snoopy, frames are followed from the first call that starts with one, and a header block has `headers_not_decoded` instead of `headers`. |
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 | `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, `ring::aead seal`, `ring::aead open`, `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt`, `cipher.AEAD.Seal`, `cipher.AEAD.Open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
 | `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |

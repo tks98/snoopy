@@ -287,13 +287,52 @@ func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int)
 			b.WriteString(t.dim(line) + "\n")
 		}
 		for _, h := range f.Headers {
-			fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), escapeText([]byte(h.Value)))
+			value := escapeText([]byte(h.Value))
+			if name := grpcStatusName(h.Value); h.Name == "grpc-status" && name != "" {
+				value += " (" + name + ")"
+			}
+			fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), value)
 		}
 		switch {
+		case f.IsGRPC:
+			t.writeGRPC(b, f)
 		case f.Body.Encoding != "":
 			t.writeBodyPart(b, f.Data, f.Offset, f.Body, f.ContentType)
 		case len(f.Data) > 0:
 			t.writeBody(b, f.Data, f.ContentType, f.Offset, "")
+		}
+	}
+}
+
+// maxGRPCLines is how many lines of a gRPC message's fields are shown,
+// unless Options.Full is set.
+const maxGRPCLines = 40
+
+// writeGRPC prints the gRPC messages a DATA frame completed, as their
+// protobuf fields.
+func (t *Text) writeGRPC(b *strings.Builder, f http2Frame) {
+	if len(f.GRPC) == 0 && len(f.Data) > 0 {
+		b.WriteString(t.dim(fmt.Sprintf("[%d bytes of a gRPC message]", len(f.Data))) + "\n")
+	}
+	for _, m := range f.GRPC {
+		line := fmt.Sprintf("gRPC message, %d bytes", m.Length)
+		if m.Compressed {
+			line += ", compressed"
+		}
+		b.WriteString(t.title(line) + "\n")
+		if m.Err != "" {
+			b.WriteString(t.dim("["+m.Err+"]") + "\n")
+			continue
+		}
+		if len(m.Fields) == 0 {
+			b.WriteString(t.dim("(no fields)") + "\n")
+		}
+		for i, l := range m.Fields {
+			if i == maxGRPCLines && !t.opts.Full {
+				b.WriteString(t.dim(fmt.Sprintf("[%d more lines; --full shows them]", len(m.Fields)-i)) + "\n")
+				break
+			}
+			b.WriteString(escapeText([]byte(l)) + "\n")
 		}
 	}
 }

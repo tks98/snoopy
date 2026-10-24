@@ -109,7 +109,7 @@ signature finding against real binaries (see
 | `internal/discover/` | Finds targets: system libs, `/proc/*/maps`, deleted files, Go binaries, RET offsets, prologue check, rustls by mangled name, stripped BoringSSL (`boringssl.go`), freebl's function table (`freebl.go`) |
 | `internal/funcfind/` | Locates functions in stripped x86-64 and arm64 binaries by the strings and constants they use (`x86.go`, `arm64.go`) |
 | `internal/procinfo/` | Container ID from cgroups; `/proc` socket lookup (fallback when there's no BTF) |
-| `internal/output/` | Text, NDJSON and pcap writers; HTTP/1 message framing (`http1.go`), HTTP/2 with HPACK (`http2.go`), QUIC and HTTP/3 with QPACK (`quic.go`, `qpack.go`), body decompression (`body.go`) |
+| `internal/output/` | Text, NDJSON and pcap writers; HTTP/1 message framing (`http1.go`), HTTP/2 with HPACK (`http2.go`), gRPC messages and schema-less protobuf (`grpc.go`), QUIC and HTTP/3 with QPACK (`quic.go`, `qpack.go`), body decompression (`body.go`) |
 | `main.go` | CLI flags and wiring |
 | `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64) |
 | `.github/workflows/release.yml`, `.goreleaser.yaml` | Releases on `v*` tags |
@@ -201,7 +201,14 @@ signature finding against real binaries (see
   takes a lone 9-byte frame header, as Firefox reads them), and found again
   if the framing is lost. Missing bytes (truncated captures) are tolerated
   inside DATA payloads; anywhere else, decoding stops for that direction
-  with a note.
+  with a note. A connection snoopy hasn't seen whose first frame is a
+  SETTINGS that isn't an ACK is a server's start, not a late connection
+  (`http2ServerPreface`): servers send it before reading the client's
+  preface. gRPC streams (`application/grpc` content types) are reassembled
+  into messages per direction (`grpcStream`) and decoded as schema-less
+  protobuf (`decodeProtobuf`), each length-delimited field shown as a
+  string if it's printable, else as a nested message if it parses as one,
+  else as bytes.
 - **rustls with aws-lc-rs** (its default provider) is read at aws-lc's
   `EVP_AEAD_CTX_seal`, `seal_scatter` (TLS 1.2) and `open`, found by
   symbol (`awsLCAEAD`) and probed with `aead_*_enter`, which unlike

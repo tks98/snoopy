@@ -39,6 +39,13 @@ func (w *http2Writer) block(fields ...string) []byte {
 	return append([]byte(nil), w.hb.Bytes()...)
 }
 
+// afterFirstFrame returns b without its first frame: a server's side of a
+// connection seen from after its SETTINGS, as one that started before
+// snoopy would be.
+func afterFirstFrame(b []byte) []byte {
+	return b[9+int(b[0])<<16|int(b[1])<<8|int(b[2]):]
+}
+
 // events splits b into calls of the given sizes (the last size repeats).
 func events(fn tracer.Function, b []byte, sizes ...int) []*tracer.Event {
 	var out []*tracer.Event
@@ -235,7 +242,7 @@ func TestTextHTTP2(t *testing.T) {
 	server.fr.WriteData(3, true, []byte("hello"))
 	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 5, BlockFragment: server.block(":status", "404"), EndHeaders: true, EndStream: true})
 	p = NewText(&out, Options{})
-	for _, ev := range events(tracer.FuncSSLRead, server.buf.Bytes(), 40) {
+	for _, ev := range events(tracer.FuncSSLRead, afterFirstFrame(server.buf.Bytes()), 40) {
 		ev.ConnID = 0x2000
 		if err := p.Print(ev); err != nil {
 			t.Fatal(err)
@@ -267,7 +274,7 @@ func TestHTTP2RecordsShareTheirSocket(t *testing.T) {
 	} {
 		c := newHTTP2Conns(newBodyPool())
 		write := events(tracer.FuncRecordSend, client.buf.Bytes(), 1<<20)[0]
-		read := events(tracer.FuncRecordRecv, server.buf.Bytes(), 1<<20)[0]
+		read := events(tracer.FuncRecordRecv, afterFirstFrame(server.buf.Bytes()), 1<<20)[0]
 		write.ConnID, read.ConnID = 0xaaaa, 0xbbbb
 		write.FD, read.FD = tc.fd, tc.fd
 		if _, ok, _ := c.process(write); !ok {
@@ -285,6 +292,22 @@ func TestHTTP2RecordsShareTheirSocket(t *testing.T) {
 		}
 		if got := strings.Contains(note, "started before snoopy"); got != tc.lostNote {
 			t.Errorf("%s: note %q", tc.name, note)
+		}
+	}
+}
+
+// A server sends its SETTINGS before reading the client's preface, so its
+// side is often seen first; that's the connection starting, not one that
+// started before snoopy.
+func TestHTTP2ServerSettingsFirst(t *testing.T) {
+	c := newHTTP2Conns(newBodyPool())
+	server := newHTTP2Writer(false) // its SETTINGS
+	client := newHTTP2Writer(true)
+	client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: client.block(":method", "GET", ":path", "/"), EndStream: true, EndHeaders: true})
+	for _, ev := range []*tracer.Event{events(tracer.FuncSSLWrite, server.buf.Bytes(), 1<<20)[0], events(tracer.FuncSSLRead, client.buf.Bytes(), 1<<20)[0]} {
+		_, ok, note := c.process(ev)
+		if !ok || note != "" {
+			t.Errorf("%v: ok %v, note %q", ev.Function, ok, note)
 		}
 	}
 }

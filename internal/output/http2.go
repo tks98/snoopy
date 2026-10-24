@@ -33,6 +33,10 @@ type http2Frame struct {
 	// bytes came before this frame's.
 	ContentType string
 	Offset      int64
+	// For DATA on a gRPC stream: IsGRPC, and the messages this frame
+	// completed.
+	IsGRPC bool
+	GRPC   []grpcMessage
 }
 
 // bodyPart is what a piece of a message body decoded to.
@@ -147,6 +151,7 @@ type http2Dir struct {
 	broken         bool
 	bodies         map[uint32]*bodyDecoder // by stream, for encoded bodies
 	infos          map[uint32]*bodyInfo    // by stream
+	grpc           map[uint32]*grpcStream  // by stream, for gRPC calls
 }
 
 // dataFrame is the DATA frame being read, to find its body bytes: a padded
@@ -201,7 +206,10 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 		if !http2Aligned(data) {
 			return nil, false, ""
 		}
-		conn = c.start(key, true)
+		// A server's first frame is SETTINGS (RFC 9113, section 3.4), which
+		// it often sends before reading the client's preface: that's the
+		// connection starting too, not one that started before snoopy.
+		conn = c.start(key, !http2ServerPreface(data))
 	}
 	c.clock++
 	conn.lastUsed = c.clock
@@ -237,6 +245,12 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 	return append(frames, more...), true, note
 }
 
+// http2ServerPreface reports whether data starts with a SETTINGS frame that
+// isn't an acknowledgment, as a server's side of a connection does.
+func http2ServerPreface(data []byte) bool {
+	return len(data) >= 9 && data[3] == 0x4 && data[4]&0x1 == 0 && binary.BigEndian.Uint32(data[5:9])&0x7fffffff == 0
+}
+
 func (c *http2Conns) start(key http2Key, late bool) *http2Conn {
 	if old, ok := c.conns[key]; ok {
 		old.close()
@@ -262,6 +276,7 @@ func (c *http2Conns) start(key http2Key, late bool) *http2Conn {
 		}
 		d.bodies = map[uint32]*bodyDecoder{}
 		d.infos = map[uint32]*bodyInfo{}
+		d.grpc = map[uint32]*grpcStream{}
 	}
 	c.conns[key] = conn
 	return conn
@@ -386,6 +401,13 @@ func (d *http2Dir) dataPiece(f *http2Frame) {
 	info.seen += int64(len(body))
 	dec := d.bodies[stream]
 	last := d.data.off >= d.data.length && d.data.endStream
+	if gs := d.grpc[stream]; gs != nil {
+		f.IsGRPC = true
+		f.GRPC = append(f.GRPC, gs.add(body)...)
+		if last {
+			delete(d.grpc, stream)
+		}
+	}
 	if last {
 		delete(d.bodies, stream)
 		delete(d.infos, stream)
@@ -463,8 +485,15 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 	if stream := d.blockStream; stream != 0 {
 		if d.blockEndStream {
 			delete(d.infos, stream)
+			delete(d.grpc, stream) // trailers, or a call without messages
 		} else if typ := contentType(fields); typ != "" {
 			d.info(stream).contentType = typ
+			if isGRPC(typ) && d.grpc[stream] == nil {
+				if len(d.grpc) >= maxBodyInfos {
+					clear(d.grpc)
+				}
+				d.grpc[stream] = &grpcStream{encoding: grpcEncoding(fields)}
+			}
 		}
 		dec := d.bodies[stream]
 		if dec == nil { // not trailers

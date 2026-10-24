@@ -105,6 +105,15 @@ type jsonHTTP2Frame struct {
 	// started before snoopy.
 	HeadersNotDecoded bool      `json:"headers_not_decoded,omitempty"`
 	Body              *jsonBody `json:"body,omitempty"`
+	// The gRPC messages a DATA frame completed.
+	GRPC []jsonGRPCMessage `json:"grpc_messages,omitempty"`
+}
+
+type jsonGRPCMessage struct {
+	Bytes      int      `json:"bytes"`
+	Compressed bool     `json:"compressed,omitempty"`
+	Protobuf   []string `json:"protobuf,omitempty"` // as protoc --decode_raw shows it, a line per field
+	Error      string   `json:"error,omitempty"`
 }
 
 type jsonHeader struct {
@@ -185,6 +194,9 @@ func (j *JSON) Print(ev *tracer.Event) error {
 			DataBytes: len(f.Data), HeadersNotDecoded: f.HeadersLost, Body: newJSONBody(f.Body)}
 		for _, h := range f.Headers {
 			jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
+		}
+		for _, m := range f.GRPC {
+			jf.GRPC = append(jf.GRPC, jsonGRPCMessage{Bytes: m.Length, Compressed: m.Compressed, Protobuf: m.Fields, Error: m.Err})
 		}
 		out.HTTP2 = append(out.HTTP2, jf)
 	}
