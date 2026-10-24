@@ -157,14 +157,20 @@ are loaded after the `exec`. TLS calls a new program makes before then are
 missed, unless it uses a library snoopy was already attached to, such as the
 system `libssl`.
 
-With `--comm` or `--pid`, a new process they select whose program, root
-filesystem (a container's or chroot's) or library path snoopy hasn't seen
-before is held at its `exec` until snoopy has attached to it and to the TLS
-libraries it's about to load, for at most 2 s, so a short-lived one's
-first request isn't missed. It's held with ptrace, which its parent doesn't
-see: a shell doesn't report it as stopped. A process that's already being
-traced (by a debugger or strace) isn't held, nor is any without those
-options, since every program's first run would be.
+With `--comm` or `--pid`, snoopy attaches its probes to the processes they
+select rather than to the files, so other programs using the same library
+don't pay for them (see [Overhead](#overhead)). Each new process they select
+is held at its `exec`, or when it's forked, until snoopy has attached to it
+and to the TLS libraries it's about to load, for at most 2 s, so a
+short-lived one's first request isn't missed. It's held with ptrace, which
+its parent doesn't see: a shell doesn't report it as stopped. A process
+that's already being traced (by a debugger or strace) can't be held, so its
+first calls can be missed, and so can a forked one's, in the moment before
+it's held. Without kernel BTF the probes stay on the files, and only a new
+process whose program, root filesystem (a container's or chroot's) or
+library path snoopy hasn't seen before is held. Without `--comm` or `--pid`
+the probes are on the files and nothing is held, since every program's
+first run would be.
 
 `--pid` follows the processes the given one starts, which matters for
 browsers: Chrome does its networking in a separate process, so `--pid` of
@@ -239,10 +245,11 @@ on the node to trace.
 
 ## Overhead
 
-Each traced TLS call costs the calling program around 10 µs, and other
-programs using a library snoopy is attached to (the system's OpenSSL) about
-4 µs per call, because the probes are on the library's file, whatever
-`--comm` or `--pid` say. Text output keeps up with tens of thousands of calls
+Each traced TLS call costs the calling program a few microseconds. Without
+`--comm` or `--pid`, other programs using a library snoopy is attached to
+(the system's OpenSSL) pay for its probes too, a few microseconds per call,
+because they're on the library's file; with them, only the processes
+selected do. Text output keeps up with tens of thousands of calls
 a second; beyond that, snoopy drops data and warns. [performance.md](performance.md)
 has the measurements.
 

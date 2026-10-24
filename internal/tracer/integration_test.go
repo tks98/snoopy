@@ -31,6 +31,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
+
 	"github.com/tks98/snoopy/v2/internal/discover"
 )
 
@@ -104,7 +107,7 @@ func startTracer(t *testing.T, opts Options, targets []discover.Target) *eventLo
 	}
 	attached := 0
 	for _, target := range targets {
-		if _, err := tr.Attach(target); err != nil {
+		if _, err := tr.Attach(target, 0); err != nil {
 			t.Logf("attach %s %s: %v", target.Library, target.Path, err)
 			continue
 		}
@@ -747,7 +750,7 @@ func TestNewProcess(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var attached []string
-	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil), nil, nil, func(target discover.Target, funcs []string, err error) {
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil, false), nil, nil, func(target discover.Target, funcs []string, err error) {
 		mu.Lock()
 		defer mu.Unlock()
 		attached = append(attached, fmt.Sprintf("%s %s %v %v", target.Library, target.Path, funcs, err))
@@ -823,7 +826,7 @@ func TestHoldNewProcess(t *testing.T) {
 		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 		return err == nil && strings.TrimSpace(string(comm)) == "curl"
 	}
-	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil), nil, hold, func(discover.Target, []string, error) {})
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil, false), nil, hold, func(discover.Target, []string, error) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -842,6 +845,110 @@ func TestHoldNewProcess(t *testing.T) {
 		return ev.Function == FuncSSLWrite && contains("GET /held")(ev)
 	})
 	checkConnection(t, write, srv.Listener.Addr().String())
+}
+
+// startPerProcess starts a tracer with probes per process, for those whose
+// name starts with comm, attached to as they start, as snoopy --comm does.
+func startPerProcess(t *testing.T, comm string) (*Tracer, *eventLog) {
+	t.Helper()
+	tr, err := New(Options{Comm: comm, PerProcess: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.PerProcess() {
+		tr.Close()
+		t.Skip("no BTF, so probes are per file")
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+	named := func(pid int) bool {
+		name, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		return err == nil && strings.HasPrefix(string(name), comm)
+	}
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil, true), named, named, func(discover.Target, []string, error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := runTracer(t, tr)
+	t.Cleanup(stop)
+	return tr, events
+}
+
+// Per process, the probes are on the processes traced only: curl's calls
+// are seen, and openssl's, through the same libssl, never reach the BPF
+// program.
+func TestPerProcess(t *testing.T) {
+	requireRoot(t)
+	curl := requireTool(t, "curl")
+	openssl := requireTool(t, "openssl")
+	stats, err := ebpf.EnableStats(uint32(unix.BPF_STATS_RUN_TIME))
+	if err != nil {
+		t.Skipf("BPF statistics: %v", err)
+	}
+	defer stats.Close()
+	tr, events := startPerProcess(t, "curl")
+
+	srv, port := newServer(t)
+	cmd := exec.Command("sh", "-c", `"$0" -sk --http1.1 "$1"; :`, curl, srv.URL+"/per-process")
+	if out, err := cmd.CombinedOutput(); err != nil || !bytes.Contains(out, []byte("served /per-process")) {
+		t.Fatalf("curl: %v: %s", err, out)
+	}
+	waitFor(t, events, "curl's request", func(ev *Event) bool {
+		return ev.Function == FuncSSLWrite && contains("GET /per-process")(ev)
+	})
+
+	runs := func() uint64 {
+		var n uint64
+		for _, p := range []*ebpf.Program{tr.objs.SslReadEnter, tr.objs.SslReadExEnter, tr.objs.SslWriteEnter, tr.objs.SslWriteExEnter} {
+			if s, err := p.Stats(); err == nil {
+				n += s.RunCount
+			}
+		}
+		return n
+	}
+	before := runs()
+	cmd = exec.Command("sh", "-c", `printf 'GET /untraced HTTP/1.0\r\n\r\n' | "$0" s_client -quiet -connect "127.0.0.1:$1" 2>/dev/null; :`, openssl, port)
+	if out, err := cmd.CombinedOutput(); err != nil || !bytes.Contains(out, []byte("served /untraced")) {
+		t.Fatalf("openssl: %v: %s", err, out)
+	}
+	if after := runs(); after != before {
+		t.Errorf("openssl's calls ran the BPF program %d times", after-before)
+	}
+}
+
+// A process forked from a traced one, without executing a program, gets
+// probes of its own: its parent's are only for its parent.
+func TestPerProcessFork(t *testing.T) {
+	requireRoot(t)
+	python := requireTool(t, "python3")
+	_, events := startPerProcess(t, "python3")
+
+	srv, _ := newServer(t)
+	const script = `
+import os, ssl, sys, time, urllib.request
+ctx = ssl._create_unverified_context()
+urllib.request.urlopen(sys.argv[1] + "/parent", context=ctx).read()
+pid = os.fork()
+if pid == 0:
+    time.sleep(0.5) # its probes are attached once it's found
+    urllib.request.urlopen(sys.argv[1] + "/child", context=ctx).read()
+    os._exit(0)
+os.waitpid(pid, 0)
+`
+	cmd := exec.Command("sh", "-c", `"$0" -c "$1" "$2"; :`, python, script, srv.URL)
+	if out, err := cmd.CombinedOutput(); err != nil || len(out) > 0 {
+		t.Fatalf("python3: %v: %s", err, out)
+	}
+	parent := waitFor(t, events, "the parent's request", func(ev *Event) bool {
+		return ev.Function.Direction() == Write && contains("GET /parent")(ev)
+	})
+	child := waitFor(t, events, "the forked child's request", func(ev *Event) bool {
+		return ev.Function.Direction() == Write && contains("GET /child")(ev)
+	})
+	if child.PID == parent.PID {
+		t.Errorf("the child's request came from its parent's PID %d", parent.PID)
+	}
 }
 
 // TestRustls needs a Rust toolchain, and building the client takes a while,

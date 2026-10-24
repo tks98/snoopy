@@ -182,6 +182,7 @@ const (
 	snoopyProgS2nRecvEnter          = "s2n_recv_enter"
 	snoopyProgS2nSendEnter          = "s2n_send_enter"
 	snoopyProgSchedProcessExec      = "sched_process_exec"
+	snoopyProgSchedProcessFork      = "sched_process_fork"
 	snoopyProgSslReadEnter          = "ssl_read_enter"
 	snoopyProgSslReadExEnter        = "ssl_read_ex_enter"
 	snoopyProgSslWriteEnter         = "ssl_write_enter"
@@ -272,6 +273,7 @@ type snoopyProgramSpecs struct {
 	S2nRecvEnter          *ebpf.ProgramSpec `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.ProgramSpec `ebpf:"s2n_send_enter"`
 	SchedProcessExec      *ebpf.ProgramSpec `ebpf:"sched_process_exec"`
+	SchedProcessFork      *ebpf.ProgramSpec `ebpf:"sched_process_fork"`
 	SslReadEnter          *ebpf.ProgramSpec `ebpf:"ssl_read_enter"`
 	SslReadExEnter        *ebpf.ProgramSpec `ebpf:"ssl_read_ex_enter"`
 	SslWriteEnter         *ebpf.ProgramSpec `ebpf:"ssl_write_enter"`
@@ -420,6 +422,7 @@ type snoopyPrograms struct {
 	S2nRecvEnter          *ebpf.Program `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.Program `ebpf:"s2n_send_enter"`
 	SchedProcessExec      *ebpf.Program `ebpf:"sched_process_exec"`
+	SchedProcessFork      *ebpf.Program `ebpf:"sched_process_fork"`
 	SslReadEnter          *ebpf.Program `ebpf:"ssl_read_enter"`
 	SslReadExEnter        *ebpf.Program `ebpf:"ssl_read_ex_enter"`
 	SslWriteEnter         *ebpf.Program `ebpf:"ssl_write_enter"`
@@ -464,6 +467,7 @@ func (p *snoopyPrograms) Close() error {
 		p.S2nRecvEnter,
 		p.S2nSendEnter,
 		p.SchedProcessExec,
+		p.SchedProcessFork,
 		p.SslReadEnter,
 		p.SslReadExEnter,
 		p.SslWriteEnter,

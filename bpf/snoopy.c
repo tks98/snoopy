@@ -238,7 +238,8 @@ struct {
 } last_wakeup SEC(".maps");
 
 // PIDs of processes that executed a new program, so user space can attach
-// to TLS libraries and programs that start after it did.
+// to TLS libraries and programs that start after it did, and with probes
+// per process, of those forked from a traced one.
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 64 << 10);
@@ -1186,6 +1187,24 @@ int sched_process_exec(struct bpf_raw_tracepoint_args *ctx)
 {
 	__u32 pid = bpf_get_current_pid_tgid() >> 32;
 	bpf_ringbuf_output(&execs, &pid, sizeof(pid), 0);
+	return 0;
+}
+
+// sched:sched_process_fork(struct task_struct *parent, struct task_struct
+// *child), raised in the parent. With probes per process, a new process (not
+// a thread) of a traced one needs its own, so user space is told of it the
+// way it's told of execs. Needs BTF, which per-process probes need.
+SEC("raw_tracepoint/sched_process_fork")
+int sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
+{
+	if (!have_btf)
+		return 0;
+	struct task_struct *child = (struct task_struct *)ctx->args[1];
+	__u32 tgid = BPF_CORE_READ(child, tgid);
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (tgid == pid_tgid >> 32 || !should_trace(pid_tgid))
+		return 0;
+	bpf_ringbuf_output(&execs, &tgid, sizeof(tgid), 0);
 	return 0;
 }
 

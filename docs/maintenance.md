@@ -727,10 +727,20 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   what a call means: Firefox peeks at a byte of an idle connection with
   `PR_Recv(..., PR_MSG_PEEK)`, which snoopy took for data until it checked the
   flag, and which broke HTTP/2 decoding when the byte was read again.
-- **`--pid`:** uprobes aren't attached per process. The BPF program filters
-  on `traced_tgids`, and with BTF adds a process whose parent, or one of its
-  parents up to 8 levels, is in it (`is_traced_tgid`). Without BTF, user
-  space scans `/proc` for new children every second.
+- **`--pid` and `--comm`:** with BTF, uprobes are attached per process
+  (`Options.PerProcess`), with the kernel's PID filter, which puts the
+  breakpoints only into the selected processes' memory. A forked child keeps
+  its parent's breakpoints only until its first hit, when the kernel removes
+  them as not its own, so `sched_process_fork` reports new processes of
+  traced ones, and they get their own (held with ptrace, like execs, until
+  then). Links are kept per process (`procLinks`, with its start time against
+  PID reuse) and closed every 5 s once it has exited. A file attached to for
+  everyone (`--lib`) isn't attached to again per process, which would show
+  its calls twice. The BPF program still filters too: on `traced_tgids`,
+  with BTF adding a process whose parent, or one of its parents up to 8
+  levels, is in it (`is_traced_tgid`), and on the name. Without BTF the
+  probes are per file, and user space scans `/proc` for new children of
+  `--pid` every second.
 
 ## HTTP decoding and compressed bodies
 

@@ -3,7 +3,7 @@
 What snoopy costs the programs it traces, and the ones it doesn't. The short
 version: each TLS call snoopy traces costs the calling program around 10 µs,
 each call into a library snoopy is attached to costs every other program
-using it around 4 µs, and every socket syscall on the machine a fraction of
+using it around 4 µs, unless `--comm` or `--pid` is given, and every socket syscall on the machine a fraction of
 a microsecond. Whether that matters depends on how much a program does per
 call: these numbers come from servers doing nothing but answer, which is the
 worst case.
@@ -69,13 +69,16 @@ requests per second is the CPU time per request.
   slows down by 2% or so; one that does nothing but answer, as here, by more
   than half.
 - **Programs snoopy isn't tracing pay too, if they use a library it's
-  attached to**, such as the system's OpenSSL: about 4 µs per call (nginx
-  untraced: 20.2 µs per request). A uprobe is set on the library's file, so
-  every process using that file traps on it, and only then does snoopy's BPF
-  program see that it isn't one to trace. `--comm`, `--pid` and
-  `--container` decide what's captured, not who pays for the probes. Go and
-  Rust programs snoopy hasn't attached to pay nothing for this (Go untraced:
-  11.8 µs).
+  attached to**, such as the system's OpenSSL, unless `--comm` or `--pid`
+  is given: about 4 µs per call (nginx untraced: 20.2 µs per request). A
+  uprobe set on a library's file makes every process using that file trap
+  on it, and only then does snoopy's BPF program see that it isn't one to
+  trace. With `--comm` or `--pid` (and kernel BTF), snoopy 2.6 attaches
+  per process instead, so the others don't trap: nginx untraced, measured
+  that way, cost 12.6 µs per request against 12.0 without snoopy, the rest
+  being the syscall hook below. `--container` alone still attaches per
+  file. Go and Rust programs snoopy hasn't attached to pay nothing for this
+  (Go untraced: 11.8 µs).
 - **Every socket syscall on the machine** costs a fraction of a microsecond
   more while snoopy runs, which is how it learns which socket a call used:
   plain HTTP nginx, with no TLS, went from 6.8 µs to 7.6 µs per request.

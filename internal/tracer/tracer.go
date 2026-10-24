@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,13 @@ type Options struct {
 	// RingBufferSize is the size of the kernel-to-user buffer in bytes; a
 	// power of two. Zero means 16 MiB.
 	RingBufferSize int
+	// PerProcess, with PID or Comm, attaches probes to the processes those
+	// select rather than to files, with the kernel's PID filter: then other
+	// programs using the same library don't trap on them. Each new process
+	// needs its own, attached to by WatchNewProcesses (forks too), so its
+	// first calls can be missed. It needs BTF, to tell forks from threads;
+	// without, probes are per file.
+	PerProcess bool
 
 	// ignoreKernelBTF loads the program as if the kernel had no BTF (tests).
 	ignoreKernelBTF bool
@@ -58,14 +66,29 @@ type Options struct {
 
 // Tracer is a loaded eBPF program with its probes.
 type Tracer struct {
-	opts    Options
-	objs    snoopyObjects
-	mu      sync.Mutex // guards links: Attach may run while Run does
-	links   []link.Link
-	reader  *ringbuf.Reader
-	clock   func(monoNs uint64) time.Time
-	haveBTF bool
-	names   map[uint32]string // process names, when the kernel can't tell
+	opts       Options
+	objs       snoopyObjects
+	mu         sync.Mutex // guards links and procs: Attach may run while Run does
+	links      []link.Link
+	procs      map[int]*procLinks // per process, the links of each
+	everyone   map[procFile]bool  // per process, files attached to for every process
+	perProcess bool
+	reader     *ringbuf.Reader
+	clock      func(monoNs uint64) time.Time
+	haveBTF    bool
+	names      map[uint32]string // process names, when the kernel can't tell
+}
+
+// procLinks are the probes attached for one process.
+type procLinks struct {
+	start uint64 // when it started, so a reused PID isn't taken for it
+	files map[procFile][]string // the functions attached to in each
+	links []link.Link
+}
+
+type procFile struct {
+	dev, ino uint64
+	lib      discover.Library
 }
 
 // New loads the eBPF program into the kernel. Call Attach and AttachSyscalls
@@ -130,7 +153,9 @@ func New(opts Options) (*Tracer, error) {
 	}
 	spec.Maps["events"].MaxEntries = uint32(opts.RingBufferSize)
 
-	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{}}
+	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{},
+		procs: map[int]*procLinks{}, everyone: map[procFile]bool{}}
+	t.perProcess = opts.PerProcess && t.haveBTF && (opts.PID != 0 || opts.Comm != "")
 	if err := spec.LoadAndAssign(&t.objs, &loadOpts); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
@@ -172,6 +197,12 @@ func emptyBTFSpec() (*btf.Spec, error) {
 		return nil, err
 	}
 	return btf.LoadSpecFromReader(bytes.NewReader(raw))
+}
+
+// PerProcess reports whether probes are attached per process (see
+// Options.PerProcess).
+func (t *Tracer) PerProcess() bool {
+	return t.perProcess
 }
 
 // ResolvesAddresses reports whether socket addresses are read in the kernel.
@@ -225,8 +256,109 @@ type cProbe struct {
 }
 
 // Attach attaches probes to a target and returns the names of the functions
-// it attached to.
-func (t *Tracer) Attach(target discover.Target) ([]string, error) {
+// it attached to. Per process, they're for process pid only, unless it's
+// zero; attaching to a target of the process again does nothing and returns
+// the names it did the first time, and to one attached to for every process,
+// does nothing and returns none.
+func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
+	if !t.perProcess {
+		pid = 0
+	}
+	key, err := targetKey(target)
+	if err != nil {
+		return nil, err
+	}
+	if pid != 0 {
+		t.mu.Lock()
+		p := t.procLocked(pid)
+		var funcs []string
+		attached := p == nil || t.everyone[key] // or it's gone
+		if !attached {
+			funcs, attached = p.files[key]
+		}
+		t.mu.Unlock()
+		if attached {
+			return funcs, nil
+		}
+	}
+	funcs, err := t.attach(target, pid)
+	if len(funcs) > 0 {
+		t.mu.Lock()
+		if pid == 0 {
+			t.everyone[key] = true
+		} else if p := t.procs[pid]; p != nil {
+			p.files[key] = funcs
+		}
+		t.mu.Unlock()
+	}
+	return funcs, err
+}
+
+func targetKey(target discover.Target) (procFile, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(target.Path, &st); err != nil {
+		return procFile{}, &os.PathError{Op: "stat", Path: target.Path, Err: err}
+	}
+	return procFile{dev: uint64(st.Dev), ino: st.Ino, lib: target.Library}, nil
+}
+
+// procLocked returns the links of a process, new if it has none or the PID
+// was another's, or nil if it's gone. t.mu must be held.
+func (t *Tracer) procLocked(pid int) *procLinks {
+	start, ok := procStart(pid)
+	if !ok {
+		return nil
+	}
+	p := t.procs[pid]
+	if p != nil && p.start == start {
+		return p
+	}
+	if p != nil {
+		closeLinks(p.links)
+	}
+	p = &procLinks{start: start, files: map[procFile][]string{}}
+	t.procs[pid] = p
+	return p
+}
+
+// procStart returns when a process started, in clock ticks since boot
+// (field 22 of /proc/<pid>/stat), and whether it's there.
+func procStart(pid int) (uint64, bool) {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
+	}
+	i := bytes.LastIndexByte(stat, ')') // the command name may contain anything
+	if i < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	if len(fields) < 20 {
+		return 0, false
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	return start, err == nil
+}
+
+// DetachExited closes the probes of processes that have exited.
+func (t *Tracer) DetachExited() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for pid, p := range t.procs {
+		if start, ok := procStart(pid); !ok || start != p.start {
+			closeLinks(p.links)
+			delete(t.procs, pid)
+		}
+	}
+}
+
+func closeLinks(links []link.Link) {
+	for _, l := range links {
+		_ = l.Close()
+	}
+}
+
+func (t *Tracer) attach(target discover.Target, pid int) ([]string, error) {
 	ex, err := link.OpenExecutable(target.Path)
 	if err != nil {
 		return nil, err
@@ -284,18 +416,19 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 			{"ngtcp2_crypto_decrypt", t.objs.Ngtcp2DecryptEnter, false},
 		}
 	case discover.GoTLS:
-		return t.attachGo(ex, target.Go)
+		return t.attachGo(ex, target.Go, pid)
 	case discover.Rustls:
-		return t.attachRustls(ex, target.Rust)
+		return t.attachRustls(ex, target.Rust, pid)
 	default:
 		return nil, fmt.Errorf("unsupported library %v", target.Library)
 	}
 
 	var attached []string
 	for _, p := range probes {
-		// Not limited to Options.PID, whose descendants are traced too: the
-		// BPF program filters on traced_tgids.
-		opts := &link.UprobeOptions{}
+		// Not limited to Options.PID unless per process, since its
+		// descendants are traced too: the BPF program filters on
+		// traced_tgids.
+		opts := &link.UprobeOptions{PID: pid}
 		if target.Offsets != nil { // a stripped copy: functions found by signature
 			off, ok := target.Offsets[p.symbol]
 			if !ok {
@@ -316,7 +449,7 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 			if err != nil {
 				return attached, fmt.Errorf("%s: %w", p.symbol, err)
 			}
-			t.addLink(ret)
+			t.addLinkFor(pid, ret)
 		}
 
 		entry, err := ex.Uprobe(p.symbol, p.prog, opts)
@@ -326,7 +459,7 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 		if err != nil {
 			return attached, fmt.Errorf("%s: %w", p.symbol, err)
 		}
-		t.addLink(entry)
+		t.addLinkFor(pid, entry)
 		attached = append(attached, p.symbol)
 	}
 	if len(attached) == 0 {
@@ -338,7 +471,7 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 // attachRustls attaches to rustls's Reader::read and Writer::write, found by
 // their mangled names, at their file offsets, or to where its crypto
 // provider encrypts and decrypts records.
-func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]string, error) {
+func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo, pid int) ([]string, error) {
 	if ri == nil {
 		return nil, errors.New("missing rustls function information")
 	}
@@ -367,19 +500,19 @@ func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]str
 	var attached []string
 	for _, p := range probes {
 		for _, off := range p.offsets {
-			opts := &link.UprobeOptions{Address: off}
+			opts := &link.UprobeOptions{Address: off, PID: pid}
 			if !p.entryOnly {
 				ret, err := ex.Uretprobe("", t.objs.TlsReturn, opts)
 				if err != nil {
 					return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
 				}
-				t.addLink(ret)
+				t.addLinkFor(pid, ret)
 			}
 			entry, err := ex.Uprobe("", p.prog, opts)
 			if err != nil {
 				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
 			}
-			t.addLink(entry)
+			t.addLinkFor(pid, entry)
 		}
 		if len(p.offsets) > 0 {
 			attached = append(attached, p.name)
@@ -388,7 +521,7 @@ func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]str
 	return attached, nil
 }
 
-func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, error) {
+func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo, pid int) ([]string, error) {
 	if gi == nil {
 		return nil, errors.New("missing Go function information")
 	}
@@ -419,23 +552,23 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, e
 				break
 			}
 			l, err := ex.Uprobe("", fn.retProg, &link.UprobeOptions{
-				Address: fn.f.Offset, Offset: ret,
+				Address: fn.f.Offset, Offset: ret, PID: pid,
 			})
 			if err != nil {
 				return attached, fmt.Errorf("%s+%#x: %w", fn.name, ret, err)
 			}
-			t.addLink(l)
+			t.addLinkFor(pid, l)
 		}
 		// The entry probe goes after the stack check: when the stack has to
 		// grow, runtime.morestack restarts the function from the top, and a
 		// probe on the first instruction would see the call twice.
 		l, err := ex.Uprobe("", fn.prog, &link.UprobeOptions{
-			Address: fn.f.Offset, Offset: fn.f.Body,
+			Address: fn.f.Offset, Offset: fn.f.Body, PID: pid,
 		})
 		if err != nil {
 			return attached, fmt.Errorf("%s+%#x: %w", fn.name, fn.f.Body, err)
 		}
-		t.addLink(l)
+		t.addLinkFor(pid, l)
 		if !slices.Contains(attached, fn.name) {
 			attached = append(attached, fn.name)
 		}
@@ -467,7 +600,8 @@ var rescanDelays = []time.Duration{0, 50 * time.Millisecond, 500 * time.Millisec
 const maxHold = 2 * time.Second
 
 // WatchNewProcesses attaches, in the background, to the TLS libraries and
-// programs of processes that start from now on, as w finds them. accept, if
+// programs of processes that start from now on, as w finds them, and per
+// process (see Options.PerProcess), those forked from a traced one. accept, if
 // not nil, decides whether to look at a process at all; attached is called
 // with the result of every attempt to attach. TLS calls a process makes
 // before its files are inspected are missed, unless hold says to hold it:
@@ -482,6 +616,15 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 		return nil, fmt.Errorf("raw tracepoint sched_process_exec: %w", err)
 	}
 	t.addLink(l)
+	if t.perProcess {
+		// A process forked from a traced one has its parent's probes only
+		// until its first call, when the kernel finds they aren't for it.
+		l, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_fork", Program: t.objs.SchedProcessFork})
+		if err != nil {
+			return nil, fmt.Errorf("raw tracepoint sched_process_fork: %w", err)
+		}
+		t.addLink(l)
+	}
 	reader, err := ringbuf.NewReader(t.objs.Execs)
 	if err != nil {
 		return nil, fmt.Errorf("open exec ring buffer: %w", err)
@@ -550,28 +693,50 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 	}()
 	go func() { // inspect and attach, one process at a time
 		defer wg.Done()
-		// For a held process, what it's about to load too (root).
+		// For a held process, what it's about to load too (root), and per
+		// process, the libraries it may load later.
 		inspect := func(pid int, root bool) {
 			if accept != nil && !accept(pid) {
 				return
 			}
-			var targets []discover.Target
+			var targets, later []discover.Target
+			if root || t.perProcess {
+				later = w.Root(pid)
+			}
 			if root {
-				targets = append(w.Root(pid), w.Needed(pid)...)
+				targets = w.Needed(pid)
+			}
+			if !t.perProcess {
+				targets, later = append(later, targets...), nil
 			}
 			for _, target := range append(targets, w.Process(pid)...) {
 				if target.Problem != nil {
 					attached(target, nil, target.Problem)
 					continue
 				}
-				funcs, err := t.Attach(target)
+				funcs, err := t.Attach(target, pid)
 				attached(target, funcs, err)
 			}
+			// Per process, those it may load, after those it has: only
+			// failures are worth reporting.
+			for _, target := range later {
+				if target.Problem == nil {
+					if _, err := t.Attach(target, pid); err != nil {
+						attached(target, nil, err)
+					}
+				}
+			}
 		}
+		sweep := time.NewTicker(5 * time.Second)
+		defer sweep.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-sweep.C:
+				if t.perProcess {
+					t.DetachExited()
+				}
 			case pid := <-pids:
 				inspect(pid, false)
 			case p := <-held:
@@ -778,9 +943,21 @@ func (t *Tracer) counter(index uint32) (uint64, error) {
 
 // Close detaches all probes and unloads the program.
 func (t *Tracer) addLink(l link.Link) {
+	t.addLinkFor(0, l)
+}
+
+// addLinkFor keeps a link with those of process pid, or if it's zero, with
+// those that stay until Close.
+func (t *Tracer) addLinkFor(pid int, l link.Link) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if pid != 0 {
+		if p := t.procs[pid]; p != nil {
+			p.links = append(p.links, l)
+			return
+		}
+	}
 	t.links = append(t.links, l)
-	t.mu.Unlock()
 }
 
 func (t *Tracer) Close() error {
@@ -789,6 +966,9 @@ func (t *Tracer) Close() error {
 	var errs []error
 	for _, l := range t.links {
 		errs = append(errs, l.Close())
+	}
+	for _, p := range t.procs {
+		closeLinks(p.links)
 	}
 	errs = append(errs, t.reader.Close(), t.objs.Close())
 	return errors.Join(errs...)
