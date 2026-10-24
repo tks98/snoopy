@@ -13,6 +13,7 @@ What snoopy can trace, and how it does it.
 | HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
 | HTTP/3 over quinn (Rust) | the same functions as for rustls's records, below | With rustls's aws-lc-rs and ring providers. |
 | HTTP/3 over ngtcp2 (curl) | `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt` | In each of ngtcp2's crypto libraries (OpenSSL, GnuTLS, wolfSSL, BoringSSL, quictls). |
+| HTTP/3 over quic-go (Go) | Go's AES-GCM and ChaCha20-Poly1305 `Seal` and `Open` | Only in programs that use quic-go; stripped ones too. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` | Also the copy bundled with Firefox. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | |
@@ -41,7 +42,9 @@ All of them on x86_64 and arm64. Some details:
   created. Rust programs using quinn (reqwest's `http3`, h3) are captured
   where rustls's crypto provider encrypts and decrypts their packets, and
   curl's HTTP/3 (Fedora's curl has it; Ubuntu's doesn't) where ngtcp2's
-  crypto library does.
+  crypto library does. Go programs using quic-go (Caddy, Traefik, Go's
+  `http3` clients) are captured where Go's AEADs encrypt and decrypt their
+  packets.
 - **NSS** functions are used for all kinds of files, so only layered
   descriptors (the SSL layer) are captured.
 - **rustls** is seen where its crypto provider encrypts and decrypts each
@@ -59,7 +62,7 @@ Programs that do their own socket I/O around the TLS library, such as .NET's
 Not supported: rustls under tokio with providers other than aws-lc-rs and
 ring, Java, stripped TLS
 libraries other than
-BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn and ngtcp2 (Go's quic-go, for
+BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn, ngtcp2 and quic-go (quiche, for
 example), programs that use OpenSSL only through its BIO layer (e.g.
 `openssl s_server -www`), and bodies compressed with a shared dictionary
 (Chrome's `dcb` and `dcz`), which are shown as sent.

@@ -63,7 +63,7 @@ the output, JSON and pcap, containers, and troubleshooting.
 
 - **TLS libraries:** OpenSSL, BoringSSL, LibreSSL, GnuTLS, NSS, wolfSSL,
   Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 (curl's HTTP/3)
-  and Go's `crypto/tls`, stripped Go
+  and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
   symbols and is found by signature, and Firefox. Their HTTP/3 too.

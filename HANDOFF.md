@@ -30,9 +30,9 @@ github.com/tks98/snoopy/v2@latest` installs it.
 | Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
 | Latest Chrome, Electron and Firefox found by signature, and Fedora's curl over HTTP/3 | Weekly in CI (`canary.yml`) |
 | Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #14 (24 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
-| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | All 31 pass with ngtcp2 support, with `SNOOPY_TEST_RUSTLS=1` and `SNOOPY_TEST_CURL_HTTP3` pointing at a Fedora 44 chroot |
-| rustls, quinn and curl tests on x86_64 (Lima, 6.8) | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3` and `TestCurlHTTP3` pass with ngtcp2 support, cross-built on arm64 since rustup doesn't run in the emulated VM; copy them into the VM, since its shared folder can serve stale files |
-| BPF load on 5.10 to 6.12 | With ngtcp2 support, every program loads in default, `--pid` and `--comm` modes (a QEMU load check; vimto's 5.10 runs fail on an overlayfs xattr) |
+| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | All 32 pass with quic-go support, with `SNOOPY_TEST_RUSTLS=1` and `SNOOPY_TEST_CURL_HTTP3` pointing at a Fedora 44 chroot |
+| Rust, curl and Go tests on x86_64 (Lima, 6.8) | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, `TestCurlHTTP3`, `TestQuicGoHTTP3` and the Go TLS tests pass with quic-go support, cross-built on arm64 since rustup doesn't run in the emulated VM; copy them into the VM, since its shared folder can serve stale files |
+| BPF load on 5.10 to 6.12 | With quic-go support, every program loads in default, `--pid` and `--comm` modes (a QEMU load check; vimto's 5.10 runs fail on an overlayfs xattr) |
 | Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded. With #14, again on the arm64 Chromium and Firefox snaps: `--pid` of Chromium's main process, connections opened before snoopy, and Firefox from a fresh start |
 
 ### To do
@@ -304,6 +304,18 @@ signature finding against real binaries (see
   its socket and does its I/O on one thread, so the usual QUIC bookkeeping
   gives the socket. A chrooted process's `/proc/<pid>/maps` names files by
   their host path, which `processFiles` strips its root from.
+- **QUIC in Go (quic-go):** at Go's AEADs, `(*GCM).Seal`/`Open` and
+  ChaCha20-Poly1305's (`goAEADs` in `discover/inspect.go`), found like
+  `tls.Conn`'s methods, stripped binaries included, but only in programs
+  with quic-go (`quicGoFunc`): every Go TLS record goes through them, and
+  other code uses AES-GCM too. `go_quic_header` also wants a plausible QUIC
+  header. Their thirteen argument words spill to the stack on amd64
+  (`go_aead_args`). `Seal` emits at entry and notes the packet for
+  `sealed_packets`; `Open` is pushed for every call, so `(*tls.Conn).Read`'s
+  depth matching holds, and emits at its RETs. quic-go uses one
+  unconnected socket and separate goroutines like quinn, so the same
+  `quic_procs`, packet-sent notices and connection IDs give sockets and
+  peers.
 - **QUIC in Firefox:** neqo (via the `nss_rs` crate) calls freebl's
   `AES_CreateContext` and `AES_AEAD` directly, through function pointers, not
   through PK11 or any exported function. `FREEBL_GetVector` is exported and
@@ -398,7 +410,7 @@ signature finding against real binaries (see
   its exec aren't picked up.
 - **Not supported:** rustls under tokio with providers other than aws-lc-rs
   and ring (`Reader::read` is inlined into tokio-rustls), Java, QUIC/HTTP/3
-  outside Chromium, Firefox, quinn and ngtcp2, Firefox's QUIC with ChaCha20-Poly1305
+  outside Chromium, Firefox, quinn, ngtcp2 and quic-go, Firefox's QUIC with ChaCha20-Poly1305
   (freebl's `ChaCha20Poly1305_Seal`/`Open`, table entries 214/215, would be
   the place), apps using OpenSSL only via its BIO layer (`openssl s_server
   -www`), and bodies with shared-dictionary encodings (Chrome's `dcb`, `dcz`).

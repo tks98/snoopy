@@ -630,6 +630,40 @@ length is the ciphertext's less the tag (`ngtcp2_crypto_aead.max_overhead`).
   image, with `skopeo copy docker://registry.fedoraproject.org/fedora:latest
   dir:<dir>` and its layers unpacked, then `dnf install curl` chrooted in it.
 
+## HTTP/3 over quic-go
+
+### How it was found
+
+A bpftrace session on the quic-go test program counted calls to every AEAD
+method in it: `crypto/internal/fips140/aes/gcm.(*GCM).Seal` and `Open` ran
+exactly as often as quic-go's own `(*xorNonceAEAD).Seal` and `Open`, so
+every packet goes through them and they aren't inlined. Their arguments are
+Go's register ABI: on arm64 the receiver is in x0 and the four slices in x1
+to x12; on amd64 the nine registers run out after the nonce, so the
+plaintext and the associated data are on the stack at 8 and 32 bytes above
+the stack pointer:
+
+```bash
+B=<program>; F='"crypto/internal/fips140/aes/gcm.(*GCM).Seal"'
+# amd64
+bpftrace -e "uprobe:$B:$F { printf(\"pt=%d ad=%d\n\", *(uint64*)(reg(\"sp\")+16), *(uint64*)(reg(\"sp\")+40)); }"
+# arm64
+bpftrace -e "uprobe:$B:$F { printf(\"pt=%d ad=%d\n\", reg(\"r8\"), reg(\"r11\")); }"
+```
+
+### How to tell it broke, and how to fix it
+
+- **A quic-go program shows only its TLS connections:** the functions weren't
+  found. Check `go tool nm` for the names in `goAEADs` and `quicGoFunc`
+  (`internal/discover/inspect.go`); Go moved AES-GCM in 1.24, and a release
+  could again.
+- **Garbage or nothing:** the arguments moved. Rerun the bpftrace session
+  above and update `go_aead_args`.
+- **To test:** `TestQuicGoHTTP3` builds `internal/tracer/testdata/quicgo`,
+  its own module, so updating quic-go there doesn't touch snoopy's
+  dependencies (`go get github.com/quic-go/quic-go@latest` in that
+  directory).
+
 ## Go crypto/tls
 
 ### How it was found

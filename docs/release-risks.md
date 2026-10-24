@@ -163,6 +163,25 @@ thing it depends on ships.
 - **Guarded by:** `TestCurlHTTP3`, only with `SNOOPY_TEST_CURL_HTTP3` set to
   the root of a system with an HTTP/3 curl (Fedora's).
 
+### HTTP/3 over quic-go
+
+- **Depends on:** Go's AES-GCM being `crypto/internal/fips140/aes/gcm.(*GCM)`
+  (since Go 1.24) and ChaCha20-Poly1305 being x/crypto's, with `Seal` and
+  `Open` taking the receiver and four slices in Go's register ABI; quic-go
+  calling them for every packet, and having
+  `internal/handshake.(*updatableAEAD).Open`, which marks a program as
+  using it; and, as with quinn, packets encrypted in the buffer they're sent
+  from.
+- **Breaks when:** Go moves or renames the AEAD types (it did in 1.24), or
+  changes how many arguments go in registers; quic-go renames that function
+  or stops using the standard library's AEADs.
+- **How it shows:** renamed functions mean the program is attached to only
+  for its TLS connections, and its HTTP/3 doesn't show, quietly. Moved
+  arguments mean nothing or garbage.
+- **Guarded by:** `TestQuicGoHTTP3`, in CI, which builds the quic-go program
+  in `internal/tracer/testdata/quicgo` with the latest quic-go it was
+  updated to.
+
 ### Go crypto/tls
 
 - **Depends on:** offsets from `tls.Conn` down to the socket fd (8, 0, 16,

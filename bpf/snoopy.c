@@ -66,6 +66,9 @@ enum fn_id {
 	// QUIC packets through ngtcp2's crypto library (curl's HTTP/3).
 	FN_NGTCP2_SEND,
 	FN_NGTCP2_RECV,
+	// QUIC packets through Go's AEADs (quic-go).
+	FN_GO_QUIC_SEND,
+	FN_GO_QUIC_RECV,
 };
 
 // A header-only record that isn't a call: a connection whose earlier events
@@ -1760,11 +1763,15 @@ int tls_return(struct pt_regs *ctx)
 #define GO_ARG1(x) ((x)->ax)
 #define GO_ARG2(x) ((x)->bx)
 #define GO_RET1(x) ((x)->ax)
+#define GO_RET2(x) ((x)->bx)
+#define GO_RET4(x) ((x)->di)
 #define GO_G(x) ((x)->r14)
 #elif defined(__TARGET_ARCH_arm64)
 #define GO_ARG1(x) ((x)->user_regs.regs[0])
 #define GO_ARG2(x) ((x)->user_regs.regs[1])
 #define GO_RET1(x) ((x)->user_regs.regs[0])
+#define GO_RET2(x) ((x)->user_regs.regs[1])
+#define GO_RET4(x) ((x)->user_regs.regs[3])
 #define GO_G(x) ((x)->user_regs.regs[28])
 #endif
 
@@ -1849,6 +1856,128 @@ static __always_inline int go_exit(struct pt_regs *ctx)
 	struct active_call call = *active;
 	bpf_map_delete_elem(&active_calls, &key);
 	emit(&call, pid_tgid, (__s64)GO_RET1(ctx));
+	return 0;
+}
+
+// Go's AEADs, in programs that use quic-go, which encrypts and decrypts
+// each QUIC packet with them:
+// func (g *gcm.GCM) Seal(dst, nonce, plaintext, data []byte) []byte
+// func (g *gcm.GCM) Open(dst, nonce, ciphertext, data []byte) ([]byte, error)
+// (crypto/internal/fips140/aes/gcm) and ChaCha20-Poly1305's alike. The
+// receiver and four slices are thirteen words: on arm64 they're all in
+// registers; on amd64, which has nine, the third and fourth slices go on
+// the stack, above the return address. The entry probes go after the stack
+// check, where the stack pointer is still the entry's.
+struct go_aead_args {
+	__u64 text, text_len, ad, ad_len;
+};
+
+static __always_inline void go_aead_args(struct pt_regs *ctx, struct go_aead_args *a)
+{
+#if defined(__TARGET_ARCH_x86)
+	__u64 stack[5] = {};
+	bpf_probe_read_user(stack, sizeof(stack), (void *)(PT_REGS_SP(ctx) + 8));
+	a->text = stack[0];
+	a->text_len = stack[1];
+	a->ad = stack[3];
+	a->ad_len = stack[4];
+#elif defined(__TARGET_ARCH_arm64)
+	a->text = ctx->user_regs.regs[7];
+	a->text_len = ctx->user_regs.regs[8];
+	a->ad = ctx->user_regs.regs[10];
+	a->ad_len = ctx->user_regs.regs[11];
+#endif
+}
+
+// Go programs use AES-GCM for other things too, so the associated data has
+// to look like a QUIC packet's header (RFC 9000, section 17), not just be
+// unlike a TLS record's: the fixed bit set, and a long header's version 1
+// or 2.
+static __always_inline bool go_quic_header(__u64 ad, __u64 ad_len)
+{
+	__u8 h[5] = {};
+	if (classify_aad(ad, ad_len) != AAD_QUIC || ad_len < sizeof(h) ||
+	    bpf_probe_read_user(h, sizeof(h), (void *)ad) || !(h[0] & 0x40))
+		return false;
+	if (!(h[0] & 0x80))
+		return true;
+	__u32 version = (__u32)h[1] << 24 | (__u32)h[2] << 16 | (__u32)h[3] << 8 | h[4];
+	return version == 1 || version == 0x6b3343cf;
+}
+
+SEC("uprobe/go_aead_seal")
+int go_aead_seal_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct go_aead_args a = {};
+	go_aead_args(ctx, &a);
+	if (!go_quic_header(a.ad, a.ad_len))
+		return 0;
+	note_sealed(pid_tgid, a.ad, GO_ARG1(ctx)); // the packet starts with its header
+	return seal_enter(pid_tgid, FN_GO_QUIC_SEND, GO_ARG1(ctx), a.text, (__s64)a.text_len, a.ad, a.ad_len);
+}
+
+// Open's plaintext is its result, read at its RET instructions. It's called
+// for TLS records too, from inside (*tls.Conn).Read, whose call is matched
+// to its return by depth, so every call is recorded, and only QUIC packets
+// emitted (fn 0 isn't).
+SEC("uprobe/go_aead_open")
+int go_aead_open_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid >> 32;
+	dk.g = GO_G(ctx);
+	__u32 depth = get_depth(&dk);
+
+	struct go_aead_args a = {};
+	go_aead_args(ctx, &a);
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	call.start_ns = bpf_ktime_get_ns();
+	call.conn = GO_ARG1(ctx);
+	call.fd = -1;
+	if (go_quic_header(a.ad, a.ad_len)) {
+		call.fn = FN_GO_QUIC_RECV;
+		call.ad = a.ad;
+		call.ad_len = a.ad_len > 0xff ? 0xff : a.ad_len;
+		call.fd = packet_fd(pid_tgid, io_thread(pid_tgid), a.text, a.ad, a.ad_len);
+		if (call.fd >= 0)
+			track_conn(pid_tgid, call.conn, call.fd);
+	}
+	push_call(&dk, depth, &call);
+	return 0;
+}
+
+SEC("uprobe/go_aead_open_return")
+int go_aead_open_return(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid >> 32;
+	dk.g = GO_G(ctx);
+	__u32 depth = get_depth(&dk);
+	if (!depth)
+		return 0;
+	set_depth(&dk, depth - 1);
+
+	struct call_key key;
+	call_key_at(&key, &dk, depth - 1);
+	struct active_call *active = bpf_map_lookup_elem(&active_calls, &key);
+	if (!active)
+		return 0;
+	struct active_call call = *active;
+	bpf_map_delete_elem(&active_calls, &key);
+	if (!call.fn || GO_RET4(ctx)) // not a QUIC packet, or it didn't authenticate
+		return 0;
+	call.buf = GO_RET1(ctx);
+	emit(&call, pid_tgid, (__s64)GO_RET2(ctx));
 	return 0;
 }
 

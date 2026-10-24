@@ -43,12 +43,28 @@ var (
 	errWrongArc = errors.New("built for a different architecture")
 )
 
-// GoInfo describes where to probe a Go binary's crypto/tls.
+// GoInfo describes where to probe a Go binary's crypto/tls, and, in
+// programs that use quic-go, the AEADs that encrypt their QUIC packets.
 type GoInfo struct {
 	Version string // Go version the binary was built with
-	Read    GoFunc
+	Read    GoFunc // zero if the program has no crypto/tls connections
 	Write   GoFunc
+	Seals   []GoFunc
+	Opens   []GoFunc
 }
+
+// goAEADs are the AEADs' methods, by type: AES-GCM since Go 1.24, and
+// ChaCha20-Poly1305, which crypto/tls vendors and quic-go also imports.
+var goAEADs = []string{
+	"crypto/internal/fips140/aes/gcm.(*GCM)",
+	"vendor/golang.org/x/crypto/chacha20poly1305.(*chacha20poly1305)",
+	"golang.org/x/crypto/chacha20poly1305.(*chacha20poly1305)",
+}
+
+// quicGoFunc is in programs that use quic-go, which are the only ones whose
+// AEADs are probed: Go programs use AES-GCM for other things too, and every
+// TLS record goes through it.
+const quicGoFunc = "github.com/quic-go/quic-go/internal/handshake.(*updatableAEAD).Open"
 
 // GoFunc locates one Go function inside an executable.
 type GoFunc struct {
@@ -75,7 +91,11 @@ func Inspect(path string) ([]Target, error) {
 		return nil, err
 	}
 	if gi != nil {
-		targets = append(targets, Target{Path: path, Library: GoTLS, Go: gi})
+		t := Target{Path: path, Library: GoTLS, Go: gi}
+		if len(gi.Seals) > 0 {
+			t.Note = "QUIC through quic-go"
+		}
+		targets = append(targets, t)
 	}
 
 	if ri := inspectRustls(f); ri != nil {
@@ -155,16 +175,38 @@ func inspectGo(path string, f *elf.File) (*GoInfo, error) {
 		return nil, nil
 	}
 
+	gi := &GoInfo{Version: bi.GoVersion}
+	if _, _, err := goFuncBounds(f, quicGoFunc); err == nil {
+		for _, typ := range goAEADs {
+			seal, err := FindGoFunc(f, typ+".Seal")
+			if errors.Is(err, errNoFunc) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("%s.Seal: %w", typ, err)
+			}
+			open, err := FindGoFunc(f, typ+".Open")
+			if err != nil {
+				return nil, fmt.Errorf("%s.Open: %w", typ, err)
+			}
+			gi.Seals = append(gi.Seals, seal)
+			gi.Opens = append(gi.Opens, open)
+		}
+	}
+
 	read, err := FindGoFunc(f, goReadFunc)
-	if errors.Is(err, errNoFunc) {
+	switch {
+	case errors.Is(err, errNoFunc) && len(gi.Seals) == 0:
 		return nil, nil
-	}
-	if err != nil {
+	case errors.Is(err, errNoFunc):
+	case err != nil:
 		return nil, fmt.Errorf("%s: %w", goReadFunc, err)
-	}
-	write, err := FindGoFunc(f, goWriteFunc)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", goWriteFunc, err)
+	default:
+		write, err := FindGoFunc(f, goWriteFunc)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", goWriteFunc, err)
+		}
+		gi.Read, gi.Write = read, write
 	}
 
 	// The register-based calling convention snoopy relies on arrived in
@@ -173,7 +215,7 @@ func inspectGo(path string, f *elf.File) (*GoInfo, error) {
 	if minor > 0 && (minor < 17 || (f.Machine == elf.EM_AARCH64 && minor < 18)) {
 		return nil, fmt.Errorf("built with %s, which predates Go's register ABI", bi.GoVersion)
 	}
-	return &GoInfo{Version: bi.GoVersion, Read: read, Write: write}, nil
+	return gi, nil
 }
 
 // goMinorVersion turns "go1.22.3" into 22, or 0 if unknown.
