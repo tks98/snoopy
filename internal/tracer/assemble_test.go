@@ -68,6 +68,7 @@ func TestFunctionsMatchBPFEnum(t *testing.T) {
 		"FN_AWSLC_QUIC_SEND": FuncAwsLCQUICSend, "FN_AWSLC_QUIC_RECV": FuncAwsLCQUICRecv,
 		"FN_RING_QUIC_SEND": FuncRingQUICSend, "FN_RING_QUIC_RECV": FuncRingQUICRecv,
 		"FN_NGTCP2_SEND": FuncNGTCP2Send, "FN_NGTCP2_RECV": FuncNGTCP2Recv,
+		"FN_GO_QUIC_SEND": FuncGoQUICSend, "FN_GO_QUIC_RECV": FuncGoQUICRecv,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("C enum has %d functions, Go has %d", len(names), len(want))
@@ -102,7 +103,7 @@ func TestFunctionDirection(t *testing.T) {
 		FuncNSSQUICSend: Write, FuncNSSQUICRecv: Read, FuncRecordSend: Write, FuncRecordRecv: Read,
 		FuncRingSend: Write, FuncRingRecv: Read,
 		FuncAwsLCQUICSend: Write, FuncAwsLCQUICRecv: Read, FuncRingQUICSend: Write, FuncRingQUICRecv: Read,
-		FuncNGTCP2Send: Write, FuncNGTCP2Recv: Read,
+		FuncNGTCP2Send: Write, FuncNGTCP2Recv: Read, FuncGoQUICSend: Write, FuncGoQUICRecv: Read,
 	} {
 		if got := fn.Direction(); got != want {
 			t.Errorf("%s: direction %s, want %s", fn, got, want)

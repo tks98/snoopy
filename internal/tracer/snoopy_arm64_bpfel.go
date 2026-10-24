@@ -154,6 +154,9 @@ const (
 	snoopyProgAesCreateReturn       = "aes_create_return"
 	snoopyProgGnutlsRecordRecvEnter = "gnutls_record_recv_enter"
 	snoopyProgGnutlsRecordSendEnter = "gnutls_record_send_enter"
+	snoopyProgGoAeadOpenEnter       = "go_aead_open_enter"
+	snoopyProgGoAeadOpenReturn      = "go_aead_open_return"
+	snoopyProgGoAeadSealEnter       = "go_aead_seal_enter"
 	snoopyProgGoTlsReadEnter        = "go_tls_read_enter"
 	snoopyProgGoTlsReturn           = "go_tls_return"
 	snoopyProgGoTlsWriteEnter       = "go_tls_write_enter"
@@ -240,6 +243,9 @@ type snoopyProgramSpecs struct {
 	AesCreateReturn       *ebpf.ProgramSpec `ebpf:"aes_create_return"`
 	GnutlsRecordRecvEnter *ebpf.ProgramSpec `ebpf:"gnutls_record_recv_enter"`
 	GnutlsRecordSendEnter *ebpf.ProgramSpec `ebpf:"gnutls_record_send_enter"`
+	GoAeadOpenEnter       *ebpf.ProgramSpec `ebpf:"go_aead_open_enter"`
+	GoAeadOpenReturn      *ebpf.ProgramSpec `ebpf:"go_aead_open_return"`
+	GoAeadSealEnter       *ebpf.ProgramSpec `ebpf:"go_aead_seal_enter"`
 	GoTlsReadEnter        *ebpf.ProgramSpec `ebpf:"go_tls_read_enter"`
 	GoTlsReturn           *ebpf.ProgramSpec `ebpf:"go_tls_return"`
 	GoTlsWriteEnter       *ebpf.ProgramSpec `ebpf:"go_tls_write_enter"`
@@ -378,6 +384,9 @@ type snoopyPrograms struct {
 	AesCreateReturn       *ebpf.Program `ebpf:"aes_create_return"`
 	GnutlsRecordRecvEnter *ebpf.Program `ebpf:"gnutls_record_recv_enter"`
 	GnutlsRecordSendEnter *ebpf.Program `ebpf:"gnutls_record_send_enter"`
+	GoAeadOpenEnter       *ebpf.Program `ebpf:"go_aead_open_enter"`
+	GoAeadOpenReturn      *ebpf.Program `ebpf:"go_aead_open_return"`
+	GoAeadSealEnter       *ebpf.Program `ebpf:"go_aead_seal_enter"`
 	GoTlsReadEnter        *ebpf.Program `ebpf:"go_tls_read_enter"`
 	GoTlsReturn           *ebpf.Program `ebpf:"go_tls_return"`
 	GoTlsWriteEnter       *ebpf.Program `ebpf:"go_tls_write_enter"`
@@ -418,6 +427,9 @@ func (p *snoopyPrograms) Close() error {
 		p.AesCreateReturn,
 		p.GnutlsRecordRecvEnter,
 		p.GnutlsRecordSendEnter,
+		p.GoAeadOpenEnter,
+		p.GoAeadOpenReturn,
+		p.GoAeadSealEnter,
 		p.GoTlsReadEnter,
 		p.GoTlsReturn,
 		p.GoTlsWriteEnter,

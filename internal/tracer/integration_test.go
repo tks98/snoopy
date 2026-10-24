@@ -962,6 +962,81 @@ func TestQuinnHTTP3(t *testing.T) {
 	}
 }
 
+// HTTP/3 over quic-go: seen where Go's AEADs encrypt and decrypt each
+// packet. Like quinn, quic-go runs a client's connections over one socket
+// that isn't connected, so the client reaches two servers at once.
+func TestQuicGoHTTP3(t *testing.T) {
+	requireRoot(t)
+	goTool := requireTool(t, "go")
+	program := filepath.Join(t.TempDir(), "quicgo")
+	build := exec.Command(goTool, "build", "-o", program, ".")
+	build.Dir = "testdata/quicgo"
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build quic-go program: %v: %s", err, out)
+	}
+	targets, err := discover.Inspect(program)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Go == nil || len(targets[0].Go.Opens) == 0 {
+		t.Fatalf("Go's AEADs not found: %+v", targets)
+	}
+	events := startTracer(t, Options{Comm: "quicgo"}, targets)
+
+	var ports []string
+	for range 2 {
+		port := freeUDPPort(t)
+		server := filepath.Join(t.TempDir(), "qgserver") // not a "quicgo" prefix, which --comm would match
+		if err := os.Symlink(program, server); err != nil {
+			t.Fatal(err)
+		}
+		srv := exec.Command(server, "server", port)
+		stdout, err := srv.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := srv.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
+		if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
+			t.Fatalf("quic-go server: %q, %v", line, err)
+		}
+		ports = append(ports, port)
+	}
+
+	path := "/quic-go"
+	out, err := exec.Command(program, "client", strings.Join(ports, ","), path).CombinedOutput()
+	if err != nil || bytes.Count(out, []byte("200 OK served "+path)) != 2 {
+		t.Fatalf("quic-go client: %v: %s", err, out)
+	}
+	var reads []*Event
+	for _, port := range ports {
+		server := "127.0.0.1:" + port
+		read := waitFor(t, events, "response from "+port, func(ev *Event) bool {
+			return ev.Function == FuncGoQUICRecv && contains("served "+path+" on "+port)(ev)
+		})
+		// As with quinn (TestQuinnHTTP3), the peer is in a notice of where a
+		// packet went, whose header has the server's connection ID: 4 bytes,
+		// quic-go's default.
+		sent := waitFor(t, events, "packet sent to "+port, func(ev *Event) bool {
+			return ev.Function == FuncQUICPacketSent && ev.PID == read.PID && ev.Remote.String() == server &&
+				len(ev.QUICHeader) > 5 && ev.QUICHeader[0]&0x80 == 0
+		})
+		write := waitFor(t, events, "request to "+port, func(ev *Event) bool {
+			return ev.Function == FuncGoQUICSend && ev.PID == read.PID && len(ev.QUICHeader) > 5 &&
+				bytes.Equal(ev.QUICHeader[1:5], sent.QUICHeader[1:5])
+		})
+		if read.FD < 0 || read.FD != write.FD || sent.FD != write.FD {
+			t.Errorf("%s: response on fd %d, request on fd %d, sent on fd %d", port, read.FD, write.FD, sent.FD)
+		}
+		reads = append(reads, read)
+	}
+	if reads[0].FD != reads[1].FD {
+		t.Errorf("the client used two sockets: fds %d and %d", reads[0].FD, reads[1].FD)
+	}
+}
+
 // quinnServer starts the quinn test program as an HTTP/3 server, under
 // another name than the client's, and returns its port on 127.0.0.1.
 func quinnServer(t *testing.T, program string) string {

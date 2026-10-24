@@ -36,6 +36,8 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
   build with cargo. `SNOOPY_TEST_CURL_HTTP3` (with cargo too) adds curl's
   HTTP/3, given the root of a system whose curl has it: `/` on Fedora, or a
   Fedora root filesystem to chroot into, since Ubuntu's curl doesn't.
+  `TestQuicGoHTTP3` downloads quic-go with the Go toolchain, for the test
+  program in `internal/tracer/testdata/quicgo`, which is its own module.
 - `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the signature-based
   finding against real browser binaries; see
   [CONTRIBUTING.md](CONTRIBUTING.md).

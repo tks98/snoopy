@@ -17,11 +17,12 @@ plaintext are far apart there. The same move covers both gaps:
 The plan: generalize the AEAD capture path once, then attach it to four
 places.
 
-**Status:** Part 0, Part 1a, Part 1b and Part 2a are done, and HTTP/3 over
+**Status:** Part 0, Part 1a, Part 1b, Part 2a and Part 2b are done, and HTTP/3 over
 quinn, which wasn't planned: its packets go through the same functions. For
 2a, the tag's size is read from `ngtcp2_crypto_aead` rather than assumed,
-and the test runs by hand (`SNOOPY_TEST_CURL_HTTP3`) rather than in a
-scheduled job, for now.
+and the test runs in the weekly canary (`canary.yml`). For 2b, Go's AEADs
+are probed only in programs with quic-go, and their sockets and peers come
+from the machinery built for quinn rather than from `recv_bufs` alone.
 Connections sharing quinn's one socket are told apart by their connection
 IDs (see docs/how-it-works.md, "HTTP/3"). For 1b, ring's
 `aes_gcm_seal`/`_open` and `chacha20_poly1305_seal`/`_open` (the first

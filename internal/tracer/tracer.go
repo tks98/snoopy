@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -389,19 +390,33 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, e
 	if gi == nil {
 		return nil, errors.New("missing Go function information")
 	}
+	type goProbe struct {
+		name    string
+		f       discover.GoFunc
+		prog    *ebpf.Program
+		retProg *ebpf.Program // nil if it emits at entry
+	}
+	probes := []goProbe{
+		{"crypto/tls.(*Conn).Read", gi.Read, t.objs.GoTlsReadEnter, t.objs.GoTlsReturn},
+		{"crypto/tls.(*Conn).Write", gi.Write, t.objs.GoTlsWriteEnter, t.objs.GoTlsReturn},
+	}
+	if gi.Read.Offset == 0 { // a QUIC program without TLS connections
+		probes = nil
+	}
+	for i := range gi.Seals {
+		probes = append(probes,
+			goProbe{"cipher.AEAD.Seal (QUIC)", gi.Seals[i], t.objs.GoAeadSealEnter, nil},
+			goProbe{"cipher.AEAD.Open (QUIC)", gi.Opens[i], t.objs.GoAeadOpenEnter, t.objs.GoAeadOpenReturn})
+	}
 	var attached []string
-	for _, fn := range []struct {
-		name string
-		f    discover.GoFunc
-		prog *ebpf.Program
-	}{
-		{"crypto/tls.(*Conn).Read", gi.Read, t.objs.GoTlsReadEnter},
-		{"crypto/tls.(*Conn).Write", gi.Write, t.objs.GoTlsWriteEnter},
-	} {
+	for _, fn := range probes {
 		// Return probes go on each RET instruction rather than using a
 		// uretprobe, which would corrupt the goroutine's stack.
 		for _, ret := range fn.f.Returns {
-			l, err := ex.Uprobe("", t.objs.GoTlsReturn, &link.UprobeOptions{
+			if fn.retProg == nil {
+				break
+			}
+			l, err := ex.Uprobe("", fn.retProg, &link.UprobeOptions{
 				Address: fn.f.Offset, Offset: ret,
 			})
 			if err != nil {
@@ -419,7 +434,9 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo) ([]string, e
 			return attached, fmt.Errorf("%s+%#x: %w", fn.name, fn.f.Body, err)
 		}
 		t.addLink(l)
-		attached = append(attached, fn.name)
+		if !slices.Contains(attached, fn.name) {
+			attached = append(attached, fn.name)
+		}
 	}
 	return attached, nil
 }
