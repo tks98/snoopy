@@ -41,8 +41,13 @@ kubectl run client --image=curlimages/curl --restart=Never --command -- \
 kubectl wait --for=condition=Ready pod/client --timeout=120s >/dev/null
 
 echo "== tracing pod client"
-timeout 180 "$tmp/kubectl-snoopy" client --image "$image" --json --count 4 > "$tmp/out.json" 2> "$tmp/err" ||
-	{ cat "$tmp/err" >&2; fail "kubectl snoopy exited with $?"; }
+status=0
+timeout 180 "$tmp/kubectl-snoopy" client --image "$image" --json --count 4 > "$tmp/out.json" 2> "$tmp/err" || status=$?
+if [ "$status" -ne 0 ]; then
+	cat "$tmp/err" >&2
+	[ "$status" -eq 124 ] && fail "no 4 calls in 180 s"
+	fail "kubectl snoopy exited with $status"
+fi
 grep -v '^{' "$tmp/err" || true
 events=$(grep -c '^{' "$tmp/out.json" || true)
 named=$(grep -c '"container_name":"client/client"' "$tmp/out.json" || true)
