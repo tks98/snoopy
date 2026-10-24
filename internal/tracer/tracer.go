@@ -138,7 +138,10 @@ func New(opts Options) (*Tracer, error) {
 
 	var comm [16]byte
 	copy(comm[:], opts.Comm)
+	pidnsDev, pidnsIno := pidNamespace()
 	for name, value := range map[string]any{
+		"pidns_dev":    pidnsDev,
+		"pidns_ino":    pidnsIno,
 		"filter_tgids": opts.PID != 0,
 		"max_capture":  uint32(opts.MaxCapture),
 		// Without BTF the kernel only knows thread names, so the process
@@ -185,6 +188,21 @@ func (t *Tracer) TracePID(pid uint32) error {
 		return fmt.Errorf("trace pid %d: %w", pid, err)
 	}
 	return nil
+}
+
+// procPidInitIno is the inode of the kernel's own PID namespace, which is
+// fixed (PROC_PID_INIT_INO).
+const procPidInitIno = 0xEFFFFFFC
+
+// pidNamespace returns snoopy's PID namespace's device, as the kernel encodes
+// it, and inode, for the BPF program to number PIDs as user space does; or
+// zeros if it's the kernel's own, where the numbers are the same.
+func pidNamespace() (dev, ino uint64) {
+	var st unix.Stat_t
+	if err := unix.Stat("/proc/self/ns/pid", &st); err != nil || st.Ino == procPidInitIno {
+		return 0, 0
+	}
+	return uint64(unix.Major(st.Dev))<<20 | uint64(unix.Minor(st.Dev)), st.Ino
 }
 
 func emptyBTFSpec() (*btf.Spec, error) {

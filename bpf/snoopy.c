@@ -143,6 +143,13 @@ const volatile char targ_comm[TASK_COMM_LEN] = {};
 // Whether the kernel has BTF. Without it, the CO-RE reads of kernel structs
 // (socket addresses, process names) can't be relocated and are skipped.
 const volatile bool have_btf = false;
+// snoopy's own PID namespace (the device and inode of /proc/self/ns/pid),
+// unless it's the kernel's own, where both are 0. The PIDs user space is
+// given, and gives, are as that namespace numbers them: in a container that
+// shares a node's PID namespace, a kind node's say, they aren't the
+// kernel's.
+const volatile __u64 pidns_dev = 0;
+const volatile __u64 pidns_ino = 0;
 
 struct active_call {
 	__u64 start_ns;
@@ -285,6 +292,63 @@ static __always_inline void get_process_name(char *buf)
 	bpf_get_current_comm(buf, TASK_COMM_LEN);
 }
 
+// MAX_PID_LEVELS bounds how deep in nested PID namespaces ns_nr looks.
+#define MAX_PID_LEVELS 8
+
+// ns_nr returns a PID's number in snoopy's PID namespace, or 0 if it has
+// none there: the one at that namespace's level, which a process in a
+// namespace below it (a pod's container, under a kind node's) has too.
+// Needs BTF.
+static __always_inline __u32 ns_nr(struct pid *pid)
+{
+	if (!pid)
+		return 0;
+	unsigned int level = BPF_CORE_READ(pid, level);
+	for (unsigned int i = 0; i < MAX_PID_LEVELS; i++) {
+		if (i > level)
+			break;
+		struct upid up;
+		__builtin_memset(&up, 0, sizeof(up));
+		if (bpf_core_read(&up, sizeof(up), &pid->numbers[i]))
+			return 0;
+		if (up.ns && BPF_CORE_READ(up.ns, ns.inum) == pidns_ino)
+			return up.nr;
+	}
+	return 0;
+}
+
+// ns_tgid returns a task's TGID in snoopy's PID namespace, or 0 if it isn't
+// in it or below it. Needs BTF.
+static __always_inline __u32 ns_tgid(struct task_struct *task)
+{
+	if (!pidns_ino)
+		return BPF_CORE_READ(task, tgid);
+	return ns_nr(BPF_CORE_READ(task, group_leader, thread_pid));
+}
+
+// ns_pid_tgid returns the current thread's TGID and PID, as
+// bpf_get_current_pid_tgid does, but in snoopy's PID namespace, or 0 if the
+// thread isn't in it or below it. Only these go to user space; maps the
+// program alone uses are keyed by the kernel's own. Without BTF,
+// bpf_get_ns_current_pid_tgid only knows threads directly in the namespace.
+static __always_inline __u64 ns_pid_tgid(void)
+{
+	if (!pidns_ino)
+		return bpf_get_current_pid_tgid();
+	if (have_btf) {
+		struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+		__u32 tgid = ns_tgid(task), pid = ns_nr(BPF_CORE_READ(task, thread_pid));
+		if (!tgid || !pid)
+			return 0;
+		return (__u64)tgid << 32 | pid;
+	}
+	struct bpf_pidns_info ns;
+	__builtin_memset(&ns, 0, sizeof(ns));
+	if (bpf_get_ns_current_pid_tgid(pidns_dev, pidns_ino, &ns, sizeof(ns)))
+		return 0;
+	return (__u64)ns.tgid << 32 | ns.pid;
+}
+
 // MAX_ANCESTORS is how far up its parents a process is looked for in
 // traced_tgids.
 #define MAX_ANCESTORS 8
@@ -304,8 +368,8 @@ static __always_inline bool is_traced_tgid(__u32 tgid)
 		task = BPF_CORE_READ(task, real_parent);
 		if (!task)
 			return false;
-		__u32 parent = BPF_CORE_READ(task, tgid);
-		if (parent <= 1)
+		__u32 parent = ns_tgid(task);
+		if (parent <= 1) // init, or outside snoopy's PID namespace
 			return false;
 		if (bpf_map_lookup_elem(&traced_tgids, &parent)) {
 			__u8 one = 1;
@@ -318,8 +382,11 @@ static __always_inline bool is_traced_tgid(__u32 tgid)
 
 static __always_inline bool should_trace(__u64 pid_tgid)
 {
-	if (filter_tgids && !is_traced_tgid(pid_tgid >> 32))
-		return false;
+	if (filter_tgids) {
+		__u32 tgid = pidns_ino ? ns_pid_tgid() >> 32 : pid_tgid >> 32;
+		if (!tgid || !is_traced_tgid(tgid))
+			return false;
+	}
 
 	// --comm matches names that start with it.
 	if (filter_comm) {
@@ -512,14 +579,18 @@ static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64
 	if (n <= 0)
 		return;
 
+	__u64 ns = pidns_ino ? ns_pid_tgid() : pid_tgid;
+	if (!ns)
+		return; // outside snoopy's PID namespace, where it can't be told apart
+
 	struct event_header h;
 	__builtin_memset(&h, 0, sizeof(h));
 	__u64 now = bpf_ktime_get_ns();
 	h.timestamp_ns = now;
 	h.latency_ns = now - call->start_ns;
 	h.conn_id = call->conn;
-	h.pid = pid_tgid >> 32;
-	h.tid = (__u32)pid_tgid;
+	h.pid = ns >> 32;
+	h.tid = (__u32)ns;
 	h.size = n > 0xffffffff ? 0xffffffff : (__u32)n;
 	h.fn = call->fn;
 	get_process_name(h.comm);
@@ -859,10 +930,11 @@ static __always_inline void emit_socket_notice(__u64 pid_tgid, __u64 conn)
 		return;
 	}
 	__builtin_memset(&r->h, 0, sizeof(r->h));
+	__u64 ns = pidns_ino ? ns_pid_tgid() : pid_tgid;
 	r->h.timestamp_ns = bpf_ktime_get_ns();
 	r->h.conn_id = conn;
-	r->h.pid = pid_tgid >> 32;
-	r->h.tid = (__u32)pid_tgid;
+	r->h.pid = ns >> 32;
+	r->h.tid = (__u32)ns;
 	r->h.fn = FN_SOCKET_NOTICE;
 	r->h.fd = info->fd;
 	r->h.family = info->family;
@@ -1036,10 +1108,11 @@ static __always_inline void emit_packet_sent(__u64 pid_tgid, __u64 conn, __s32 f
 		return;
 	}
 	r->h.quic_header_len = sizeof(r->h.quic_header);
+	__u64 ns = pidns_ino ? ns_pid_tgid() : pid_tgid;
 	r->h.timestamp_ns = bpf_ktime_get_ns();
 	r->h.conn_id = conn;
-	r->h.pid = pid_tgid >> 32;
-	r->h.tid = (__u32)pid_tgid;
+	r->h.pid = ns >> 32;
+	r->h.tid = (__u32)ns;
 	r->h.fn = FN_QUIC_PACKET_SENT;
 	r->h.fd = fd;
 	r->h.family = family;
@@ -1114,7 +1187,9 @@ static __always_inline void note_udp443(__u64 pid_tgid, __s32 fd, long id)
 {
 	if (!have_btf || !IS_DATAGRAM_IO(id))
 		return;
-	__u32 tgid = pid_tgid >> 32;
+	__u32 tgid = (pidns_ino ? ns_pid_tgid() : pid_tgid) >> 32; // user space reads these
+	if (!tgid)
+		return;
 	struct quic_traffic *qt = bpf_map_lookup_elem(&quic_traffic, &tgid);
 	if (qt && qt->udp443 >= QUIC_TRAFFIC_MAX)
 		return;
@@ -1185,8 +1260,9 @@ static __always_inline void note_thread_fd(__u64 fd, long id, struct pt_regs *re
 SEC("raw_tracepoint/sched_process_exec")
 int sched_process_exec(struct bpf_raw_tracepoint_args *ctx)
 {
-	__u32 pid = bpf_get_current_pid_tgid() >> 32;
-	bpf_ringbuf_output(&execs, &pid, sizeof(pid), 0);
+	__u32 pid = ns_pid_tgid() >> 32;
+	if (pid)
+		bpf_ringbuf_output(&execs, &pid, sizeof(pid), 0);
 	return 0;
 }
 
@@ -1200,9 +1276,11 @@ int sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
 	if (!have_btf)
 		return 0;
 	struct task_struct *child = (struct task_struct *)ctx->args[1];
-	__u32 tgid = BPF_CORE_READ(child, tgid);
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	if (tgid == pid_tgid >> 32 || !should_trace(pid_tgid))
+	if (BPF_CORE_READ(child, tgid) == pid_tgid >> 32 || !should_trace(pid_tgid))
+		return 0; // a thread, or not traced
+	__u32 tgid = ns_tgid(child);
+	if (!tgid)
 		return 0;
 	bpf_ringbuf_output(&execs, &tgid, sizeof(tgid), 0);
 	return 0;
