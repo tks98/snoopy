@@ -357,6 +357,17 @@ func run(cfg config) error {
 				ev.Local, ev.Remote = local, remote
 			}
 		}
+		if ev.Function == tracer.FuncQUICPacketSent {
+			// Not shown or counted, only followed (see its doc).
+			for _, p := range printers {
+				if err := p.Print(ev); err != nil {
+					logf("error: write output: %v", err)
+					stop()
+					return
+				}
+			}
+			return
+		}
 		if !filter.match(ev) || cfg.count > 0 && calls >= cfg.count {
 			return
 		}

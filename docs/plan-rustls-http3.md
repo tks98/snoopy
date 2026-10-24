@@ -17,7 +17,13 @@ plaintext are far apart there. The same move covers both gaps:
 The plan: generalize the AEAD capture path once, then attach it to four
 places.
 
-**Status:** Part 0 and Part 1a are done. Two things differ from the plan
+**Status:** Part 0, Part 1a and Part 1b are done, and HTTP/3 over quinn,
+which wasn't planned: its packets go through the same functions.
+Connections sharing quinn's one socket are told apart by their connection
+IDs (see docs/how-it-works.md, "HTTP/3"). For 1b, ring's
+`aes_gcm_seal`/`_open` and `chacha20_poly1305_seal`/`_open` (the first
+option below) see every record; their arguments were checked with bpftrace
+on x86-64 and arm64. For 1a: Two things differ from the plan
 below: instead of a per-process switch, Rust programs' aws-lc functions get
 their own BPF programs (`aead_seal_enter`, `aead_seal_scatter_enter`,
 `aead_open_enter`) that keep TLS records, while Chromium's keep only QUIC

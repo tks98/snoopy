@@ -29,7 +29,9 @@ github.com/tks98/snoopy/v2@latest` installs it.
 | Lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date | Green in CI |
 | Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
 | Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #14 (24 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
-| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | 27 pass with #14; rustls skipped there, and last passed with #10 (`SNOOPY_TEST_RUSTLS=1`) |
+| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | All 29 pass with ring support, rustls included (`SNOOPY_TEST_RUSTLS=1`) |
+| rustls tests on x86_64 (Lima, 6.8) | `TestRustls` and `TestRustlsAsync` pass with ring support, cross-built on arm64 since rustup doesn't run in the emulated VM |
+| BPF load on 5.10 to 6.12 | With ring support, every program loads in default, `--pid` and `--comm` modes (a QEMU load check; vimto's 5.10 runs fail on an overlayfs xattr) |
 | Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded. With #14, again on the arm64 Chromium and Firefox snaps: `--pid` of Chromium's main process, connections opened before snoopy, and Firefox from a fresh start |
 
 ### To do
@@ -209,8 +211,30 @@ signature finding against real binaries (see
   socket. Contexts' memory gets reused by later connections, so
   `conn_infos` keeps the socket's struct file and `emit` only trusts it
   while the fd still refers to that socket (`conn_info_live`).
-- **rustls with ring** is found by mangled symbol names (v0 and legacy;
-  `inspectRustls`). Its Reader and Writer do no socket I/O, so
+- **rustls with ring** (0.17) is read the same way at ring's
+  `ring::aead::algorithm::aes_gcm_seal`/`_open` and
+  `chacha20_poly1305_seal`/`_open` (`ringAEAD`; `ring_*_enter`, emitting
+  `FN_RING_SEND`/`FN_RING_RECV`). They're Rust functions: their result is
+  returned through a hidden pointer, which x86-64 passes as the first
+  argument (`RING_ARG`), and `open`'s plaintext length is known at entry
+  (`RET_KNOWN_LEN`).
+- **QUIC in Rust programs (quinn)** is captured at the same functions as
+  rustls's records, as `FN_AWSLC_QUIC_*` and `FN_RING_QUIC_*`. quinn uses
+  one unconnected UDP socket for all its connections and spreads the work
+  over tokio's threads, so the per-thread bookkeeping doesn't hold. Instead:
+  QUIC events carry the packet's header (`quic_header`, up to 47 bytes);
+  `sealed_packets` remembers where each packet was encrypted, and a send
+  whose buffer starts there (`note_packet_send`) gives its connection's
+  socket and, with `FN_QUIC_PACKET_SENT`, its destination and header as
+  sent; `quic_procs` keeps such processes' last receive socket, for
+  packets decrypted on a thread that didn't receive them. In user space,
+  `output/quic_cid.go` follows connections by their connection IDs (long
+  headers, NEW_CONNECTION_ID frames) and gives their packets the peer from
+  the notices. Encryption contexts' memory is reused between connections
+  sharing the socket, so nothing per context is trusted for the peer.
+- **rustls's Reader and Writer**, when neither provider's functions are
+  found, are found by mangled symbol names (v0 and legacy;
+  `inspectRustls`). They do no socket I/O, so
   `io_threads` remembers, per thread that called them, the last receive's
   socket (a read's socket is the one just read from) and which Writer is
   waiting for the next send (which teaches `conn_infos` its socket). With
@@ -283,7 +307,8 @@ signature finding against real binaries (see
   `network.http.http3.alt-svc-mapping-for-testing` to `"example.com;h3=:443"`
   and `network.http.http3.force-use-alt-svc-mapping-for-testing`.
 - **HTTP/3 decoding** (`output/quic.go`, `qpack.go`) parses frames,
-  reassembles streams per (pid, socket fd, direction), falling back to the
+  reassembles streams per connection known by its connection IDs (see
+  above), otherwise per (pid, socket fd, direction), falling back to the
   AEAD context when the fd is unknown: a direction goes through several
   contexts (Initial, Handshake, 1-RTT, key updates). A new local address on
   the same fd means a new connection. A new socket whose first packet uses
@@ -359,10 +384,9 @@ signature finding against real binaries (see
   3 s after the exec. TLS calls made before a new library is attached are
   missed, and libraries a long-running process `dlopen`s more than 3 s after
   its exec aren't picked up.
-- **Not supported:** rustls under tokio with the ring provider (reqwest 0.12's
-  default: `Reader::read` is inlined into tokio-rustls; see
-  docs/plan-rustls-http3.md), Java, QUIC/HTTP/3
-  outside Chromium and Firefox, Firefox's QUIC with ChaCha20-Poly1305
+- **Not supported:** rustls under tokio with providers other than aws-lc-rs
+  and ring (`Reader::read` is inlined into tokio-rustls), Java, QUIC/HTTP/3
+  outside Chromium, Firefox and quinn, Firefox's QUIC with ChaCha20-Poly1305
   (freebl's `ChaCha20Poly1305_Seal`/`Open`, table entries 214/215, would be
   the place), apps using OpenSSL only via its BIO layer (`openssl s_server
   -www`), and bodies with shared-dictionary encodings (Chrome's `dcb`, `dcz`).

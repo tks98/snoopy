@@ -62,6 +62,9 @@ func (t *Text) Hidden() int { return t.hidden }
 
 func (t *Text) Print(ev *tracer.Event) error {
 	dc := t.dec.decode(ev)
+	if dc.notice {
+		return nil
+	}
 	if !t.opts.Verbose && dc.housekeeping() {
 		t.hidden++
 		return nil

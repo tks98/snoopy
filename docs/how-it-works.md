@@ -11,12 +11,13 @@ What snoopy can trace, and how it does it.
 | BoringSSL in Chrome, Brave, Edge and Electron apps | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. |
 | HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | Each QUIC packet, decrypted. |
 | HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
+| HTTP/3 over quinn (Rust) | the same functions as for rustls's records, below | With rustls's aws-lc-rs and ring providers. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` | Also the copy bundled with Firefox. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | |
 | Mbed TLS | `mbedtls_ssl_read`, `mbedtls_ssl_write` | 2.x and 3.x. |
 | s2n-tls | `s2n_recv`, `s2n_send` | Not `s2n_sendv`. |
-| rustls | aws-lc's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, or `Reader::read` and `Writer::write` | Async (tokio) too with rustls's default aws-lc-rs provider; needs the program's symbols. |
+| rustls | aws-lc's `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open`, ring's `aes_gcm_seal`, `aes_gcm_open` and ChaCha20-Poly1305's, or `Reader::read` and `Writer::write` | Async (tokio) too, with the aws-lc-rs and ring providers; needs the program's symbols. |
 | Go `crypto/tls` | `(*tls.Conn).Read`, `(*tls.Conn).Write` | Go 1.17+ on amd64, 1.18+ on arm64, stripped binaries too. |
 
 All of them on x86_64 and arm64. Some details:
@@ -36,23 +37,26 @@ All of them on x86_64 and arm64. Some details:
   AES-GCM directly, through its exported function table. A Firefox connection
   that negotiates ChaCha20-Poly1305 isn't captured, and neither are those set
   up before snoopy started, since a context's direction is learned when it's
-  created.
+  created. Rust programs using quinn (reqwest's `http3`, h3) are captured
+  where rustls's crypto provider encrypts and decrypts their packets.
 - **NSS** functions are used for all kinds of files, so only layered
   descriptors (the SSL layer) are captured.
-- **rustls** with its default crypto provider, aws-lc-rs, is seen where
-  aws-lc encrypts and decrypts each record, so async programs on tokio-rustls
-  (`hyper`, `reqwest`, `axum`, `tonic`) are covered as well as synchronous
-  ones. With the ring provider, snoopy falls back to rustls's reader and
-  writer, which works for programs that use them directly, such as `ureq` or
-  `rustls::Stream`, but not under tokio, where the read path is inlined.
-  Both are found by their symbols, which Cargo keeps by default.
+- **rustls** is seen where its crypto provider encrypts and decrypts each
+  record, with its default provider, aws-lc-rs, and with ring (0.17), so
+  async programs on tokio-rustls (`hyper`, `reqwest`, `axum`, `tonic`,
+  Deno) are covered as well as synchronous ones. With any other provider,
+  snoopy falls back to rustls's reader and writer, which works for programs
+  that use them directly, such as `ureq` or `rustls::Stream`, but not under
+  tokio, where the read path is inlined. All of them are found by their
+  symbols, which Cargo keeps by default.
 
 Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
-Not supported: rustls under tokio with the ring provider, Java, stripped TLS
+Not supported: rustls under tokio with providers other than aws-lc-rs and
+ring, Java, stripped TLS
 libraries other than
-BoringSSL, QUIC/HTTP/3 outside Chromium and Firefox (curl's own HTTP/3, for
+BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox and quinn (curl's own HTTP/3, for
 example), programs that use OpenSSL only through its BIO layer (e.g.
 `openssl s_server -www`), and bodies compressed with a shared dictionary
 (Chrome's `dcb` and `dcz`), which are shown as sent.
@@ -110,12 +114,29 @@ reassembles each direction's streams per socket, across the encryption keys a
 connection goes through and the sockets it migrates to, and decodes the
 HTTP/3 frames and QPACK headers.
 
+quinn runs all of a program's connections over one UDP socket that isn't
+connected, so neither the socket nor the thread tells a packet's connection
+or peer. Its packets' connection IDs do: each event carries its packet's
+header, and user space learns each connection's IDs from its handshake
+packets (whose long headers have both sides' IDs) and the NEW_CONNECTION_ID
+frames it sends and receives, then matches each packet by the ID in its
+header. quinn encrypts a packet where it's then sent from, so a send whose
+buffer starts at a packet the BPF program saw encrypted gives the packet's
+socket, and its destination is sent to user space with the packet's header,
+which tells whose peer it is. Connections whose handshake wasn't seen, or
+that use zero-length IDs, are followed by their socket as before.
+
 ## TLS records
 
 Where a program's plaintext has no read or write function to probe, snoopy
 reads it where each TLS record is encrypted and decrypted, as it does for
 QUIC packets. For rustls on aws-lc-rs, that's aws-lc's `EVP_AEAD_CTX_seal`
 (TLS 1.3), `EVP_AEAD_CTX_seal_scatter` (TLS 1.2) and `EVP_AEAD_CTX_open`.
+For rustls on ring, it's ring's `aes_gcm_seal` and `aes_gcm_open` and their
+ChaCha20-Poly1305 counterparts, Rust functions that ring calls through
+function pointers, so they aren't inlined. They encrypt and decrypt in
+place, and ring's `open` leaves checking the tag to its caller, so a forged
+record would show as whatever it decrypts to.
 The associated data tells a record from a QUIC packet: a TLS 1.3 record's
 is its 5-byte header, a TLS 1.2 record's is 13 bytes with the content type
 in it. A TLS 1.3 record's real type is the last non-zero byte of its

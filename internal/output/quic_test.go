@@ -141,7 +141,7 @@ func TestQUICFrameSummaries(t *testing.T) {
 	pkt := cat([]byte{0x01}, []byte{0x02, 0x40, 0x64, 0x00, 0x01, 0x03, 0x02, 0x01}, // PING, ACK 100 with one range
 		[]byte{0x06, 0x00, 0x03, 'a', 'b', 'c'}, // CRYPTO
 		[]byte{0x1e}, []byte{0x00, 0x00})        // HANDSHAKE_DONE, PADDING×2
-	frames, streams, err := parseQUICFrames(pkt)
+	frames, streams, _, err := parseQUICFrames(pkt)
 	if err != nil || len(streams) != 0 {
 		t.Fatal(err, streams)
 	}
@@ -259,5 +259,79 @@ func TestTextQUIC(t *testing.T) {
 		if n := strings.Count(text, "QUIC: ACK"); n != map[bool]int{false: 0, true: 2}[verbose] || p.Hidden() != map[bool]int{false: 1, true: 0}[verbose] {
 			t.Errorf("verbose %v: %d frame lines, %d hidden:\n%s", verbose, n, p.Hidden(), text)
 		}
+	}
+}
+
+// Connections sharing a socket, as quinn's do, are told apart by their
+// connection IDs, learned from their long headers and NEW_CONNECTION_ID
+// frames, and their packets get the peer the connection's packets were sent
+// to, which only the notices of packets sent say.
+func TestQUICConnectionsOnOneSocket(t *testing.T) {
+	c := newQUICConns(newBodyPool())
+	servers := []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:443"), netip.MustParseAddrPort("192.0.2.2:443")}
+	id := func(conn, side byte) []byte { return bytes.Repeat([]byte{conn<<4 | side}, 8) }
+	long := func(dcid, scid []byte) []byte {
+		return cat([]byte{0xc3, 0, 0, 0, 1, byte(len(dcid))}, dcid, []byte{byte(len(scid))}, scid)
+	}
+	short := func(dcid []byte) []byte { return cat([]byte{0x41}, dcid, []byte{0x07}) }
+	ev := func(fn tracer.Function, hdr []byte, remote netip.AddrPort, data []byte) *tracer.Event {
+		e := quicEvent(fn, data)
+		e.FD, e.QUICHeader, e.Remote = 5, hdr, remote
+		return e
+	}
+	crypto := []byte{0x06, 0x00, 0x01, 0xff}               // CRYPTO off=0 len=1
+	none := netip.AddrPortFrom(netip.IPv4Unspecified(), 0) // what a receive on such a socket has
+
+	// Each connection's handshake: the client's Initial to an ID it made up,
+	// and the server's reply from its own. The second connection's peer
+	// is only known once its first 1-RTT packet is sent.
+	for i := range byte(2) {
+		initial := long(id(i, 0xe), id(i, 0xc))
+		http3OfEvent(t, c, ev(tracer.FuncQUICSend, initial, none, crypto))
+		if i == 0 {
+			c.sent(ev(tracer.FuncQUICPacketSent, initial, servers[i], nil))
+		}
+		http3OfEvent(t, c, ev(tracer.FuncQUICRecv, long(id(i, 0xc), id(i, 0x5)), none, crypto))
+	}
+	c.sent(ev(tracer.FuncQUICPacketSent, short(id(1, 0x5)), servers[1], nil))
+	// The first connection issues another ID of its own.
+	issue := cat([]byte{0x18, 0x01, 0x00, 0x08}, id(0, 0xd), bytes.Repeat([]byte{0}, 16))
+	sendIssue := ev(tracer.FuncQUICSend, short(id(0, 0x5)), none, issue)
+	http3OfEvent(t, c, sendIssue)
+	if sendIssue.Remote != servers[0] {
+		t.Errorf("a send's peer: %s, want %s", sendIssue.Remote, servers[0])
+	}
+
+	// Both responses on stream 0, interleaved, the first one's last packet
+	// sent to its new ID.
+	bodies := [][]byte{h3Frame(0x00, []byte("hello, one")), h3Frame(0x00, []byte("hello, two"))}
+	dcids := [][]byte{id(0, 0xd), id(1, 0xc)}
+	want := []string{"DATA hell", "DATA hell", "DATA (continued) o, one", "DATA (continued) o, two"}
+	var got []string
+	for half := range 2 {
+		for i := range 2 {
+			b := bodies[i]
+			part, off := b[:6], 0
+			if half == 1 {
+				part, off = b[6:], 6
+			}
+			e := ev(tracer.FuncQUICRecv, short(id(byte(i), 0xc)), none, streamFrameBytes(0, uint64(off), part, half == 1))
+			if half == 1 {
+				e.QUICHeader = short(dcids[i])
+			}
+			got = append(got, http3OfEvent(t, c, e)...)
+			if e.Remote != servers[i] {
+				t.Errorf("connection %d: peer %s, want %s", i, e.Remote, servers[i])
+			}
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	// A packet whose ID isn't known is followed by its socket.
+	e := ev(tracer.FuncQUICRecv, short(id(7, 0xc)), none, streamFrameBytes(0, 0, bodies[0], true))
+	if got := http3OfEvent(t, c, e); !slices.Equal(got, []string{"DATA hello, one"}) || knownAddr(e.Remote) {
+		t.Errorf("unknown connection: %q, peer %s", got, e.Remote)
 	}
 }

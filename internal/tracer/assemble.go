@@ -12,25 +12,27 @@ import (
 // record is a header followed by ChunkLen bytes of payload (and possibly
 // unused space).
 type rawHeader struct {
-	TimestampNs uint64
-	LatencyNs   uint64
-	ConnID      uint64
-	Pid         uint32
-	Tid         uint32
-	Size        uint32
-	Captured    uint32
-	ChunkOffset uint32
-	ChunkLen    uint32
-	Fd          int32
-	Family      uint16
-	Lport       uint16
-	Rport       uint16
-	Fn          uint8
-	Flags       uint8
-	Laddr       [16]byte
-	Raddr       [16]byte
-	Comm        [16]byte
-	_           [4]byte
+	TimestampNs   uint64
+	LatencyNs     uint64
+	ConnID        uint64
+	Pid           uint32
+	Tid           uint32
+	Size          uint32
+	Captured      uint32
+	ChunkOffset   uint32
+	ChunkLen      uint32
+	Fd            int32
+	Family        uint16
+	Lport         uint16
+	Rport         uint16
+	Fn            uint8
+	Flags         uint8
+	Laddr         [16]byte
+	Raddr         [16]byte
+	QuicHeaderLen uint8
+	QuicHeader    [47]byte
+	Comm          [16]byte
+	_             [4]byte
 }
 
 // Address families as reported in rawHeader.Family.
@@ -161,18 +163,23 @@ func (a *assembler) newEvent(c chunk) *Event {
 		comm = comm[:i]
 	}
 	local, remote := c.addresses()
+	var quicHeader []byte
+	if n := min(int(c.QuicHeaderLen), len(c.QuicHeader)); n > 0 {
+		quicHeader = bytes.Clone(c.QuicHeader[:n])
+	}
 	return &Event{
-		Local:    local,
-		Remote:   remote,
-		Time:     a.clock(c.TimestampNs),
-		Latency:  time.Duration(c.LatencyNs),
-		Function: Function(c.Fn),
-		PID:      c.Pid,
-		TID:      c.Tid,
-		Comm:     string(comm),
-		ConnID:   c.ConnID,
-		FD:       c.Fd,
-		Size:     c.Size,
-		Data:     make([]byte, 0, c.Captured),
+		QUICHeader: quicHeader,
+		Local:      local,
+		Remote:     remote,
+		Time:       a.clock(c.TimestampNs),
+		Latency:    time.Duration(c.LatencyNs),
+		Function:   Function(c.Fn),
+		PID:        c.Pid,
+		TID:        c.Tid,
+		Comm:       string(comm),
+		ConnID:     c.ConnID,
+		FD:         c.Fd,
+		Size:       c.Size,
+		Data:       make([]byte, 0, c.Captured),
 	}
 }

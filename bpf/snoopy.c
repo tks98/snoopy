@@ -55,11 +55,23 @@ enum fn_id {
 	// (rustls through aws-lc), for programs without another place to see it.
 	FN_RECORD_SEND,
 	FN_RECORD_RECV,
+	// The same through ring.
+	FN_RING_SEND,
+	FN_RING_RECV,
+	// QUIC packets in Rust programs (quinn), through aws-lc and ring.
+	FN_AWSLC_QUIC_SEND,
+	FN_AWSLC_QUIC_RECV,
+	FN_RING_QUIC_SEND,
+	FN_RING_QUIC_RECV,
 };
 
 // A header-only record that isn't a call: a connection whose earlier events
 // went out without a socket now has one, given in the header (fd, addresses).
 #define FN_SOCKET_NOTICE 0xff
+// Another: a QUIC packet was sent, with its header (as sent) and where to,
+// for sockets that aren't connected, whose packets' peers only their sends
+// say. User space tells the packet's connection by its header.
+#define FN_QUIC_PACKET_SENT 0xfe
 
 // How to interpret a function's return value.
 enum ret_kind {
@@ -69,12 +81,18 @@ enum ret_kind {
 	RET_RUST_RESULT, // Rust's io::Result<usize>: Ok (0) or Err, then the byte count
 	RET_SECSTATUS_U32, // NSS's SECSuccess (0), byte count written through an unsigned int*
 	RET_BOOL_EX_TLS13, // RET_BOOL_EX, a TLS 1.3 record's inner plaintext (see tls13_content_len)
+	RET_KNOWN_LEN, // nothing; the byte count, known at entry, is kept in len_ptr
+	RET_KNOWN_LEN_TLS13, // RET_KNOWN_LEN, a TLS 1.3 record's inner plaintext
 };
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
 
 // Each ring buffer record is this header followed by chunk_len bytes of
 // payload, in a record of one of the sizes defined below.
+// A long header's flags, version and both connection IDs, at most 20 bytes
+// each (RFC 9000, section 17.2).
+#define QUIC_HEADER_MAX 47
+
 struct event_header {
 	__u64 timestamp_ns; // CLOCK_MONOTONIC when the call returned
 	__u64 latency_ns;   // time spent inside the call
@@ -93,6 +111,10 @@ struct event_header {
 	__u8 flags;
 	__u8 laddr[16];	    // IPv4 addresses use the first 4 bytes
 	__u8 raddr[16];
+	// A QUIC packet's header, up to its source connection ID, which tells
+	// connections on one socket apart; 0 bytes for other events.
+	__u8 quic_header_len;
+	__u8 quic_header[QUIC_HEADER_MAX];
 	char comm[TASK_COMM_LEN]; // process name
 	__u8 _pad[4];	    // so the payload starts at sizeof(struct event_header)
 };
@@ -124,7 +146,9 @@ struct active_call {
 	__s32 fd;
 	__u8 fn;
 	__u8 ret;      // enum ret_kind
-	__u8 _pad[2];
+	__u8 ad_len;   // a QUIC packet's: its header, at ad
+	__u8 _pad;
+	__u64 ad;
 };
 
 // A thread (C libraries) or goroutine (Go) with TLS calls in flight.
@@ -473,6 +497,14 @@ static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64
 		__builtin_memcpy(h.raddr, info->raddr, sizeof(h.raddr));
 	}
 
+	if (call->ad && call->ad_len) {
+		__u32 len = call->ad_len;
+		if (len > QUIC_HEADER_MAX)
+			len = QUIC_HEADER_MAX;
+		if (!bpf_probe_read_user(h.quic_header, len, (void *)call->ad))
+			h.quic_header_len = len;
+	}
+
 	__u32 captured = h.size < max_capture ? h.size : max_capture;
 	h.captured = captured;
 
@@ -558,10 +590,11 @@ static __always_inline void propagate_fd(__u64 pid_tgid, struct depth_key *dk, _
 #define RUST_RESULT_VALUE(ctx) ((ctx)->user_regs.regs[1])
 #endif
 
-// enter_call_fd records a call in flight. fd is its socket if already known,
-// or -1; otherwise a syscall made during the call tells.
-static __always_inline int enter_call_fd(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
-					 __u64 len_ptr, __s32 fd)
+// enter_call_ad records a call in flight. fd is its socket if already known,
+// or -1; otherwise a syscall made during the call tells. A QUIC packet's
+// header is at ad, of ad_len bytes; ad is 0 for other calls.
+static __always_inline int enter_call_ad(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
+					 __u64 len_ptr, __s32 fd, __u64 ad, __u64 ad_len)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid))
@@ -577,6 +610,8 @@ static __always_inline int enter_call_fd(struct pt_regs *ctx, __u8 fn, __u8 ret,
 	call.fd = fd;
 	call.fn = fn;
 	call.ret = ret;
+	call.ad = ad;
+	call.ad_len = ad_len > 0xff ? 0xff : ad_len;
 	if (fd >= 0)
 		track_conn(pid_tgid, conn, fd);
 
@@ -585,6 +620,13 @@ static __always_inline int enter_call_fd(struct pt_regs *ctx, __u8 fn, __u8 ret,
 	dk.thread = pid_tgid;
 	push_call(&dk, get_depth(&dk), &call);
 	return 0;
+}
+
+// enter_call_ad without a QUIC packet's header.
+static __always_inline int enter_call_fd(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
+					 __u64 len_ptr, __s32 fd)
+{
+	return enter_call_ad(ctx, fn, ret, conn, buf, len_ptr, fd, 0, 0);
 }
 
 static __always_inline int enter_call(struct pt_regs *ctx, __u8 fn, __u8 ret, __u64 conn, const void *buf,
@@ -669,6 +711,12 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 		// the register.
 		n = (__u8)PT_REGS_RC(ctx) == 0 ? (__s64)RUST_RESULT_VALUE(ctx) : 0;
 		break;
+	case RET_KNOWN_LEN:
+	case RET_KNOWN_LEN_TLS13:
+		n = (__s64)call.len_ptr;
+		if (call.ret == RET_KNOWN_LEN_TLS13)
+			n = tls13_content_len(call.buf, n);
+		break;
 	default: {
 		__u64 len = 0;
 		if ((int)PT_REGS_RC(ctx) != 1 || !call.len_ptr ||
@@ -715,6 +763,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #define SYSCALL_FD(regs) ((regs)->di)
 #define SYSCALL_ARG1(regs) ((regs)->si)
 #define SYSCALL_ARG2(regs) ((regs)->dx)
+#define SYSCALL_ARG4(regs) ((regs)->r8)
 #define IS_SOCKET_IO_SYSCALL(id)                                              \
 	((id) == 0 /* read */ || (id) == 1 /* write */ ||                     \
 	 (id) == 19 /* readv */ || (id) == 20 /* writev */ ||                 \
@@ -724,10 +773,13 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #define RECV_KIND(id)                                                         \
 	((id) == 0 || (id) == 45 ? RECV_BUF : (id) == 19 ? RECV_IOVEC :       \
 	 (id) == 47 ? RECV_MSG : (id) == 299 ? RECV_MMSG : 0)
+#define IS_SENDTO(id) ((id) == 44)
+#define IS_SENDMSG(id) ((id) == 46 || (id) == 307)
 #elif defined(__TARGET_ARCH_arm64)
 #define SYSCALL_FD(regs) ((regs)->orig_x0)
 #define SYSCALL_ARG1(regs) ((regs)->user_regs.regs[1])
 #define SYSCALL_ARG2(regs) ((regs)->user_regs.regs[2])
+#define SYSCALL_ARG4(regs) ((regs)->user_regs.regs[4])
 #define IS_SOCKET_IO_SYSCALL(id)                                              \
 	((id) == 63 /* read */ || (id) == 64 /* write */ ||                   \
 	 (id) == 65 /* readv */ || (id) == 66 /* writev */ ||                 \
@@ -737,6 +789,8 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #define RECV_KIND(id)                                                         \
 	((id) == 63 || (id) == 207 ? RECV_BUF : (id) == 65 ? RECV_IOVEC :     \
 	 (id) == 212 ? RECV_MSG : (id) == 243 ? RECV_MMSG : 0)
+#define IS_SENDTO(id) ((id) == 206)
+#define IS_SENDMSG(id) ((id) == 211 || (id) == 269)
 #endif
 
 // Tells user space that a connection has a socket now: its writes are
@@ -816,6 +870,47 @@ struct {
 	__type(value, struct recv_buf);
 } recv_bufs SEC(".maps");
 
+// Where these processes' QUIC packets were encrypted, and for which
+// connection: they're encrypted in place, so a send whose buffer starts at
+// one sends it, to its connection's peer.
+struct sealed_key {
+	__u64 tgid;
+	__u64 buf;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct sealed_key);
+	__type(value, __u64); // the connection
+} sealed_packets SEC(".maps");
+
+// Processes that encrypted QUIC packets there, whose sends are looked up in
+// sealed_packets, with the socket of their last receive: a packet is often
+// decrypted on another thread than it was received on.
+struct quic_proc {
+	__s32 last_recv_fd;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32); // tgid
+	__type(value, struct quic_proc);
+} quic_procs SEC(".maps");
+
+static __always_inline void note_sealed(__u64 pid_tgid, __u64 buf, __u64 conn)
+{
+	__u32 tgid = pid_tgid >> 32;
+	struct quic_proc fresh = {.last_recv_fd = -1};
+	bpf_map_update_elem(&quic_procs, &tgid, &fresh, BPF_NOEXIST);
+	struct sealed_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.buf = buf;
+	bpf_map_update_elem(&sealed_packets, &key, &conn, BPF_ANY);
+}
+
 static __always_inline void note_recv_buf(__u64 pid_tgid, __s32 fd, int kind, struct pt_regs *regs)
 {
 	__u64 arg = 0, buf = 0, len = 0;
@@ -869,6 +964,103 @@ static __always_inline struct recv_buf *recv_buf_at(__u64 pid_tgid, __u64 buf)
 	return r;
 }
 
+// Tells user space that the QUIC packet at buf, of the connection conn, was
+// sent to the struct sockaddr at name.
+static __always_inline void emit_packet_sent(__u64 pid_tgid, __u64 conn, __s32 fd, __u64 buf, __u64 name)
+{
+	// sockaddr_in: family, port, address; sockaddr_in6: family, port, flow
+	// info, address.
+	__u8 sa[24];
+	__builtin_memset(sa, 0, sizeof(sa));
+	if (bpf_probe_read_user(sa, sizeof(sa), (void *)name))
+		return;
+	__u16 family = sa[0] | sa[1] << 8;
+	if (family != AF_INET && family != AF_INET6)
+		return;
+	struct event_256 *r = bpf_ringbuf_reserve(&events, sizeof(*r), 0);
+	if (!r) {
+		count_lost();
+		return;
+	}
+	__builtin_memset(&r->h, 0, sizeof(r->h));
+	if (bpf_probe_read_user(r->h.quic_header, sizeof(r->h.quic_header), (void *)buf)) {
+		bpf_ringbuf_discard(r, 0);
+		return;
+	}
+	r->h.quic_header_len = sizeof(r->h.quic_header);
+	r->h.timestamp_ns = bpf_ktime_get_ns();
+	r->h.conn_id = conn;
+	r->h.pid = pid_tgid >> 32;
+	r->h.tid = (__u32)pid_tgid;
+	r->h.fn = FN_QUIC_PACKET_SENT;
+	r->h.fd = fd;
+	r->h.family = family;
+	r->h.rport = sa[2] << 8 | sa[3];
+	if (family == AF_INET)
+		__builtin_memcpy(r->h.raddr, &sa[4], 4);
+	else
+		__builtin_memcpy(r->h.raddr, &sa[8], 16);
+	bpf_ringbuf_submit(r, 0);
+}
+
+// A send of a QUIC packet, found by where the send's data starts, says which
+// socket its connection is on, whichever thread sends it, and where it goes
+// if the socket isn't connected: sendto's destination, or the (first)
+// message's.
+static __always_inline void note_packet_send(__u64 pid_tgid, __s32 fd, long id, struct pt_regs *regs)
+{
+	__u64 arg = 0, buf = 0, name = 0;
+	if (bpf_probe_read_kernel(&arg, sizeof(arg), &SYSCALL_ARG1(regs)) || !arg)
+		return;
+	if (IS_SENDTO(id)) {
+		buf = arg;
+		bpf_probe_read_kernel(&name, sizeof(name), &SYSCALL_ARG4(regs));
+	} else {
+		// struct msghdr (or an mmsghdr's): msg_name at 0, msg_iov at 16,
+		// whose first iovec's base is the data's start.
+		__u64 iov = 0;
+		if (bpf_probe_read_user(&name, sizeof(name), (void *)arg) ||
+		    bpf_probe_read_user(&iov, sizeof(iov), (void *)(arg + 16)) || !iov ||
+		    bpf_probe_read_user(&buf, sizeof(buf), (void *)iov))
+			return;
+	}
+	if (!buf)
+		return;
+	struct sealed_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.buf = buf;
+	__u64 *found = bpf_map_lookup_elem(&sealed_packets, &key);
+	if (!found)
+		return;
+	__u64 conn = *found;
+	if (name)
+		emit_packet_sent(pid_tgid, conn, fd, buf, name);
+	if (track_conn(pid_tgid, conn, fd))
+		emit_socket_notice(pid_tgid, conn);
+}
+
+// For processes in quic_procs: their last receive's socket, and the sockets
+// and peers of their QUIC packets' sends.
+static __always_inline void note_quic_proc_io(__s32 fd, long id, struct pt_regs *regs)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = pid_tgid >> 32;
+	struct quic_proc *qp = bpf_map_lookup_elem(&quic_procs, &tgid);
+	if (!qp)
+		return;
+	if (RECV_KIND(id)) {
+		if (have_btf) {
+			__u16 family = socket_family(fd);
+			if (family != AF_INET && family != AF_INET6)
+				return;
+		}
+		qp->last_recv_fd = fd;
+	} else if (IS_SENDTO(id) || IS_SENDMSG(id)) {
+		note_packet_send(pid_tgid, fd, id, regs);
+	}
+}
+
 static __always_inline void note_thread_fd(__u64 fd, long id, struct pt_regs *regs)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -920,6 +1112,7 @@ int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 	if (bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD(regs)))
 		return 0;
 	note_thread_fd(fd, id, regs);
+	note_quic_proc_io((__s32)fd, id, regs);
 	return record_fd(fd);
 }
 
@@ -1166,7 +1359,10 @@ static __always_inline int classify_aad(__u64 ad, __u64 ad_len)
 		return AAD_NONE;
 	if (ad_len == 5 && b[0] >= 0x14 && b[0] <= 0x18 && b[1] == 0x03)
 		return AAD_TLS13;
-	if (ad_len == 13 && b[9] == 0x03 && b[10] <= 0x04)
+	// A TLS 1.2 record's starts with its sequence number, whose top byte is
+	// never set in practice, which a 13-byte QUIC header's first byte always
+	// is: the packet number length is in it.
+	if (ad_len == 13 && b[0] == 0 && b[9] == 0x03 && b[10] <= 0x04)
 		return b[8] == TLS_APPLICATION_DATA ? AAD_TLS12_DATA : AAD_TLS12_OTHER;
 	return AAD_QUIC;
 }
@@ -1207,7 +1403,11 @@ static __always_inline __s32 packet_fd(__u64 pid_tgid, struct io_thread *rt, __u
 	}
 	if (rt->dgram_start && in > rt->dgram_start && in < rt->dgram_end)
 		return rt->dgram_fd;
-	return rt->last_fd;
+	if (rt->last_fd >= 0)
+		return rt->last_fd;
+	__u32 tgid = pid_tgid >> 32;
+	struct quic_proc *qp = bpf_map_lookup_elem(&quic_procs, &tgid);
+	return qp ? qp->last_recv_fd : -1;
 }
 
 // BoringSSL's and aws-lc's AEAD functions:
@@ -1225,9 +1425,9 @@ static __always_inline __s32 packet_fd(__u64 pid_tgid, struct io_thread *rt, __u
 // seal_enter emits n bytes of the plaintext being sealed, at buf. Sealing
 // is often in place, so it's copied at entry. What's sealed goes out with
 // the thread's next send, which tells the context's socket.
-static __always_inline int seal_enter(struct pt_regs *ctx, __u64 pid_tgid, __u8 fn, __u64 buf, __s64 n)
+static __always_inline int seal_enter(__u64 pid_tgid, __u8 fn, __u64 conn, __u64 buf, __s64 n, __u64 ad,
+				      __u64 ad_len)
 {
-	__u64 conn = func_arg(ctx, 0);
 	struct io_thread *rt = io_thread(pid_tgid);
 	if (rt)
 		rt->want_conn = conn;
@@ -1238,17 +1438,21 @@ static __always_inline int seal_enter(struct pt_regs *ctx, __u64 pid_tgid, __u8 
 	call.buf = buf;
 	call.fd = -1;
 	call.fn = fn;
+	call.ad = ad;
+	call.ad_len = ad_len > 0xff ? 0xff : ad_len;
 	emit(&call, pid_tgid, n);
 	return 0;
 }
 
 // open_enter records a call whose plaintext is emitted on return: open
 // returns 1 and writes the plaintext's length through out_len.
-static __always_inline int open_enter(struct pt_regs *ctx, __u64 pid_tgid, __u8 fn, __u8 ret)
+static __always_inline int open_enter(struct pt_regs *ctx, __u64 pid_tgid, __u8 fn, __u8 ret, bool quic)
 {
 	struct io_thread *rt = io_thread(pid_tgid);
-	__s32 fd = packet_fd(pid_tgid, rt, func_arg(ctx, 6), func_arg(ctx, 8), func_arg(ctx, 9));
-	return enter_call_fd(ctx, fn, ret, func_arg(ctx, 0), (void *)func_arg(ctx, 1), func_arg(ctx, 2), fd);
+	__u64 ad = func_arg(ctx, 8), ad_len = func_arg(ctx, 9);
+	__s32 fd = packet_fd(pid_tgid, rt, func_arg(ctx, 6), ad, ad_len);
+	return enter_call_ad(ctx, fn, ret, func_arg(ctx, 0), (void *)func_arg(ctx, 1), func_arg(ctx, 2), fd,
+			     quic ? ad : 0, ad_len);
 }
 
 // In Chromium, only QUIC packets: its TLS records are seen at SSL_read and
@@ -1259,7 +1463,8 @@ int quic_seal_enter(struct pt_regs *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid) || !is_quic_packet(ctx))
 		return 0;
-	return seal_enter(ctx, pid_tgid, FN_QUIC_SEND, func_arg(ctx, 6), (__s64)func_arg(ctx, 7));
+	return seal_enter(pid_tgid, FN_QUIC_SEND, func_arg(ctx, 0), func_arg(ctx, 6), (__s64)func_arg(ctx, 7),
+			  func_arg(ctx, 8), func_arg(ctx, 9));
 }
 
 SEC("uprobe/EVP_AEAD_CTX_open")
@@ -1268,29 +1473,32 @@ int quic_open_enter(struct pt_regs *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid) || !is_quic_packet(ctx))
 		return 0;
-	return open_enter(ctx, pid_tgid, FN_QUIC_RECV, RET_BOOL_EX);
+	return open_enter(ctx, pid_tgid, FN_QUIC_RECV, RET_BOOL_EX, true);
 }
 
 // In programs whose plaintext has no other place to be seen, like rustls
 // under tokio, where the reads are inlined: TLS records' application data
 // too. A TLS 1.3 record's real type is at the end of its plaintext.
 // record_seal_enter handles a seal of n bytes at in, with associated data
-// ad of ad_len bytes.
-static __always_inline int record_seal_enter(struct pt_regs *ctx, __u64 in, __s64 n, __u64 ad, __u64 ad_len)
+// ad of ad_len bytes, under the encryption context conn: a TLS record, as
+// fn, or a QUIC packet, as quic_fn.
+static __always_inline int record_seal_enter(__u8 fn, __u8 quic_fn, __u64 conn, __u64 in, __s64 n, __u64 ad,
+					     __u64 ad_len)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid))
 		return 0;
 	switch (classify_aad(ad, ad_len)) {
 	case AAD_QUIC:
-		return seal_enter(ctx, pid_tgid, FN_QUIC_SEND, in, n);
+		note_sealed(pid_tgid, ad, conn); // the packet starts with its header
+		return seal_enter(pid_tgid, quic_fn, conn, in, n, ad, ad_len);
 	case AAD_TLS13:
 		n = tls13_content_len(in, n);
 		if (n > 0)
-			return seal_enter(ctx, pid_tgid, FN_RECORD_SEND, in, n);
+			return seal_enter(pid_tgid, fn, conn, in, n, 0, 0);
 		break;
 	case AAD_TLS12_DATA:
-		return seal_enter(ctx, pid_tgid, FN_RECORD_SEND, in, n);
+		return seal_enter(pid_tgid, fn, conn, in, n, 0, 0);
 	}
 	io_thread(pid_tgid); // so the thread's receives are seen from the handshake on
 	return 0;
@@ -1299,13 +1507,17 @@ static __always_inline int record_seal_enter(struct pt_regs *ctx, __u64 in, __s6
 SEC("uprobe/EVP_AEAD_CTX_seal")
 int aead_seal_enter(struct pt_regs *ctx)
 {
-	return record_seal_enter(ctx, func_arg(ctx, 6), (__s64)func_arg(ctx, 7), func_arg(ctx, 8), func_arg(ctx, 9));
+	return record_seal_enter(FN_RECORD_SEND, FN_AWSLC_QUIC_SEND, func_arg(ctx, 0), func_arg(ctx, 6),
+				 (__s64)func_arg(ctx, 7),
+				 func_arg(ctx, 8), func_arg(ctx, 9));
 }
 
 SEC("uprobe/EVP_AEAD_CTX_seal_scatter")
 int aead_seal_scatter_enter(struct pt_regs *ctx)
 {
-	return record_seal_enter(ctx, func_arg(ctx, 7), (__s64)func_arg(ctx, 8), func_arg(ctx, 11), func_arg(ctx, 12));
+	return record_seal_enter(FN_RECORD_SEND, FN_AWSLC_QUIC_SEND, func_arg(ctx, 0), func_arg(ctx, 7),
+				 (__s64)func_arg(ctx, 8),
+				 func_arg(ctx, 11), func_arg(ctx, 12));
 }
 
 SEC("uprobe/EVP_AEAD_CTX_open")
@@ -1316,14 +1528,75 @@ int aead_open_enter(struct pt_regs *ctx)
 		return 0;
 	switch (classify_aad(func_arg(ctx, 8), func_arg(ctx, 9))) {
 	case AAD_QUIC:
-		return open_enter(ctx, pid_tgid, FN_QUIC_RECV, RET_BOOL_EX);
+		return open_enter(ctx, pid_tgid, FN_AWSLC_QUIC_RECV, RET_BOOL_EX, true);
 	case AAD_TLS13:
-		return open_enter(ctx, pid_tgid, FN_RECORD_RECV, RET_BOOL_EX_TLS13);
+		return open_enter(ctx, pid_tgid, FN_RECORD_RECV, RET_BOOL_EX_TLS13, false);
 	case AAD_TLS12_DATA:
-		return open_enter(ctx, pid_tgid, FN_RECORD_RECV, RET_BOOL_EX);
+		return open_enter(ctx, pid_tgid, FN_RECORD_RECV, RET_BOOL_EX, false);
 	}
 	io_thread(pid_tgid);
 	return 0;
+}
+
+// ring's AEAD functions, which rustls's ring provider calls through
+// function pointers in ring::aead::Algorithm (ring 0.17):
+// fn aes_gcm_seal(key: &KeyInner, nonce: Nonce, aad: Aad<&[u8]>,
+//     in_out: &mut [u8], cpu: cpu::Features) -> Result<Tag, Unspecified>
+// fn aes_gcm_open(key: &KeyInner, nonce: Nonce, aad: Aad<&[u8]>,
+//     in_out: &mut [u8], src: RangeFrom<usize>, cpu: cpu::Features)
+//     -> Result<Tag, Unspecified>
+// and chacha20_poly1305_seal and _open alike. Both encrypt and decrypt in
+// place: open moves the plaintext of in_out[src..] to the start of in_out.
+// It doesn't check the tag, its caller does, so a forged record shows as
+// the bytes it decrypts to. The result is too big for registers, so it's
+// returned through a hidden pointer, which x86-64 passes as the first
+// argument and arm64 in a register of its own. quinn encrypts its QUIC
+// packets with them too.
+#if defined(__TARGET_ARCH_x86)
+#define RING_ARG(i) ((i) + 1)
+#elif defined(__TARGET_ARCH_arm64)
+#define RING_ARG(i) (i)
+#endif
+
+SEC("uprobe/ring_aead_seal")
+int ring_seal_enter(struct pt_regs *ctx)
+{
+	return record_seal_enter(FN_RING_SEND, FN_RING_QUIC_SEND, func_arg(ctx, RING_ARG(0)), func_arg(ctx, RING_ARG(4)),
+				 (__s64)func_arg(ctx, RING_ARG(5)), func_arg(ctx, RING_ARG(2)),
+				 func_arg(ctx, RING_ARG(3)));
+}
+
+SEC("uprobe/ring_aead_open")
+int ring_open_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	__u64 ad = func_arg(ctx, RING_ARG(2)), ad_len = func_arg(ctx, RING_ARG(3));
+	__u64 in_out = func_arg(ctx, RING_ARG(4)), len = func_arg(ctx, RING_ARG(5));
+	__u64 src = func_arg(ctx, RING_ARG(6));
+	__u8 fn = FN_RING_RECV, ret;
+	switch (classify_aad(ad, ad_len)) {
+	case AAD_QUIC:
+		fn = FN_RING_QUIC_RECV;
+		ret = RET_KNOWN_LEN;
+		break;
+	case AAD_TLS13:
+		ret = RET_KNOWN_LEN_TLS13;
+		break;
+	case AAD_TLS12_DATA:
+		ret = RET_KNOWN_LEN;
+		break;
+	default:
+		io_thread(pid_tgid);
+		return 0;
+	}
+	if (src > len)
+		return 0;
+	struct io_thread *rt = io_thread(pid_tgid);
+	__s32 fd = packet_fd(pid_tgid, rt, in_out + src, ad, ad_len);
+	return enter_call_ad(ctx, fn, ret, func_arg(ctx, RING_ARG(0)), (void *)in_out, len - src, fd,
+			     fn == FN_RING_QUIC_RECV ? ad : 0, ad_len);
 }
 
 // NSS's freebl, whose AES-GCM Firefox's QUIC stack (neqo) calls directly;
@@ -1406,8 +1679,8 @@ int aes_aead_enter(struct pt_regs *ctx)
 	struct io_thread *rt = io_thread(pid_tgid);
 	if (!*encrypt) {
 		__s32 fd = packet_fd(pid_tgid, rt, func_arg(ctx, 4), func_arg(ctx, 8), (__u32)func_arg(ctx, 9));
-		return enter_call_fd(ctx, FN_NSS_QUIC_RECV, RET_SECSTATUS_U32, key.ctx, (void *)func_arg(ctx, 1),
-				     func_arg(ctx, 2), fd);
+		return enter_call_ad(ctx, FN_NSS_QUIC_RECV, RET_SECSTATUS_U32, key.ctx, (void *)func_arg(ctx, 1),
+				     func_arg(ctx, 2), fd, func_arg(ctx, 8), (__u32)func_arg(ctx, 9));
 	}
 	if (rt)
 		rt->want_conn = key.ctx;
@@ -1419,6 +1692,8 @@ int aes_aead_enter(struct pt_regs *ctx)
 	call.buf = func_arg(ctx, 4);
 	call.fd = -1;
 	call.fn = FN_NSS_QUIC_SEND;
+	call.ad = func_arg(ctx, 8);
+	call.ad_len = (__u32)func_arg(ctx, 9) > 0xff ? 0xff : (__u32)func_arg(ctx, 9);
 	emit(&call, pid_tgid, (__s64)(__u32)func_arg(ctx, 5));
 	return 0;
 }

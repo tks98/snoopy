@@ -369,6 +369,26 @@ func TestAwsLCSymbols(t *testing.T) {
 	}
 }
 
+func TestRingSymbols(t *testing.T) {
+	for name, want := range map[string]bool{
+		// From ring 0.17.14, with rustls 0.23.
+		"_RNvNtNtCs6Mth2B0oH5X_4ring4aead9algorithm12aes_gcm_seal":           true,
+		"_RNvNtNtCs6Mth2B0oH5X_4ring4aead9algorithm12aes_gcm_open":           true,
+		"_RNvNtNtCs6Mth2B0oH5X_4ring4aead9algorithm22chacha20_poly1305_seal": true,
+		"_RNvNtNtCs6Mth2B0oH5X_4ring4aead9algorithm22chacha20_poly1305_open": true,
+		"_ZN4ring4aead9algorithm12aes_gcm_seal17h0123456789abcdefE":          true,
+		// Key setup, and the method that calls open.
+		"_RNvNtNtCs6Mth2B0oH5X_4ring4aead9algorithm16aes_gcm_init_128":                    false,
+		"_RNvMs_NtNtCs6Mth2B0oH5X_4ring4aead9algorithmNtB4_9Algorithm11open_within":       false,
+		"_RNvNtNtCs6Mth2B0oH5X_4ring4aead9algorithm22chacha20_poly1305_init":              false,
+		"_ZN4ring4aead9algorithm12aes_gcm_seal17h0123456789abcdefE.llvm.1234567890123456": false,
+	} {
+		if got := ringAEAD.MatchString(name); got != want {
+			t.Errorf("%s: %v", name, got)
+		}
+	}
+}
+
 // TestBoringSSLBinaries runs findBoringSSL on real binaries, which are too
 // large to keep here, e.g. Chrome, Brave or Edge from their .deb packages:
 //

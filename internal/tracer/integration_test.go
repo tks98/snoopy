@@ -90,8 +90,8 @@ func (l *eventLog) dump(t *testing.T) {
 		if len(data) > 64 {
 			data = data[:64]
 		}
-		t.Logf("  %v pid=%d tid=%d conn=%#x fd=%d size=%d incomplete=%v %q",
-			ev.Function, ev.PID, ev.TID, ev.ConnID, ev.FD, ev.Size, ev.Incomplete, data)
+		t.Logf("  %v pid=%d tid=%d conn=%#x fd=%d %s > %s size=%d incomplete=%v header=%x %q",
+			ev.Function, ev.PID, ev.TID, ev.ConnID, ev.FD, ev.Local, ev.Remote, ev.Size, ev.Incomplete, ev.QUICHeader, data)
 	}
 }
 
@@ -788,62 +788,210 @@ func TestNewProcess(t *testing.T) {
 
 // TestRustls needs a Rust toolchain, and building the client takes a while,
 // so it only runs with SNOOPY_TEST_RUSTLS=1.
-// rustls under tokio, with its default crypto provider (aws-lc-rs): seen
-// where aws-lc encrypts and decrypts each record, over TLS 1.3 and 1.2.
+// rustls under tokio, with its default crypto provider (aws-lc-rs) and with
+// ring: seen where the provider encrypts and decrypts each record, over TLS
+// 1.3 and 1.2, with AES-GCM and ChaCha20-Poly1305.
 func TestRustlsAsync(t *testing.T) {
 	requireRoot(t)
 	if os.Getenv("SNOOPY_TEST_RUSTLS") != "1" {
 		t.Skip("set SNOOPY_TEST_RUSTLS=1 to build the rustls client with cargo and run this test")
 	}
 	cargo := requireTool(t, "cargo")
-	build := exec.Command(cargo, "build", "--release", "--quiet", "--manifest-path", "testdata/rustlsasync/Cargo.toml")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build rustls client: %v: %s", err, out)
+	providers := []struct {
+		name       string
+		features   []string
+		send, recv Function
+	}{
+		{"aws-lc", nil, FuncRecordSend, FuncRecordRecv},
+		{"ring", []string{"--no-default-features", "--features", "ring"}, FuncRingSend, FuncRingRecv},
 	}
-	client, err := filepath.Abs("testdata/rustlsasync/target/release/rustlsasync")
-	if err != nil {
-		t.Fatal(err)
-	}
-	targets, err := discover.Inspect(client)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(targets) != 1 || targets[0].Rust == nil || !targets[0].Rust.AtRecords() {
-		t.Fatalf("aws-lc's AEAD functions not found: %+v", targets)
+	clients := map[string]string{}
+	var targets []discover.Target
+	for _, p := range providers {
+		dir := "testdata/rustlsasync/target/" + p.name
+		args := append([]string{"build", "--release", "--quiet", "--manifest-path", "testdata/rustlsasync/Cargo.toml",
+			"--target-dir", dir}, p.features...)
+		if out, err := exec.Command(cargo, args...).CombinedOutput(); err != nil {
+			t.Fatalf("build rustls client with %s: %v: %s", p.name, err, out)
+		}
+		client, err := filepath.Abs(dir + "/release/rustlsasync")
+		if err != nil {
+			t.Fatal(err)
+		}
+		found, err := discover.Inspect(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(found) != 1 || found[0].Rust == nil || !found[0].Rust.AtRecords() {
+			t.Fatalf("%s's AEAD functions not found: %+v", p.name, found)
+		}
+		clients[p.name] = client
+		targets = append(targets, found...)
 	}
 	events := startTracer(t, Options{Comm: "rustlsasync"}, targets)
 	srv, port := newServer(t)
 	server := srv.Listener.Addr().String()
 
-	for _, version := range []string{"tls13", "tls12"} {
-		path := "/async-" + version
-		out, err := exec.Command(client, port, path, version).CombinedOutput()
-		if err != nil || !bytes.Contains(out, []byte("served "+path)) {
-			t.Fatalf("rustlsasync %s: %v: %s", version, err, out)
-		}
-		// The connection's first write goes out before its socket is known;
-		// it is held back until the socket notice fills it in.
-		write := waitFor(t, events, version+" request", func(ev *Event) bool {
-			return ev.Function == FuncRecordSend && contains("GET "+path+" HTTP/1.1")(ev)
-		})
-		checkConnection(t, write, server)
-		read := waitFor(t, events, version+" response", func(ev *Event) bool {
-			return ev.Function == FuncRecordRecv && contains("served "+path)(ev)
-		})
-		checkConnection(t, read, server)
-		// Only application data: no handshake messages, no TLS 1.3 content
-		// type left at the end.
-		if !bytes.HasPrefix(write.Data, []byte("GET ")) || !bytes.HasSuffix(write.Data, []byte("\r\n\r\n")) {
-			t.Errorf("%s request: %q", version, write.Data)
-		}
-		if !bytes.HasPrefix(read.Data, []byte("HTTP/1.1 200 OK")) {
-			t.Errorf("%s response: %q", version, read.Data)
+	for _, p := range providers {
+		for _, v := range []struct {
+			name    string
+			options []string
+		}{
+			{"tls13", nil},
+			{"tls12", []string{"tls12"}},
+			{"tls13-chacha", []string{"chacha"}},
+			{"tls12-chacha", []string{"tls12", "chacha"}},
+		} {
+			name := p.name + "-" + v.name
+			path := "/async-" + name
+			out, err := exec.Command(clients[p.name], append([]string{port, path}, v.options...)...).CombinedOutput()
+			if err != nil || !bytes.Contains(out, []byte("served "+path)) {
+				t.Fatalf("rustlsasync %s: %v: %s", name, err, out)
+			}
+			// The connection's first write goes out before its socket is
+			// known; it is held back until the socket notice fills it in.
+			write := waitFor(t, events, name+" request", func(ev *Event) bool {
+				return ev.Function == p.send && contains("GET "+path+" HTTP/1.1")(ev)
+			})
+			checkConnection(t, write, server)
+			read := waitFor(t, events, name+" response", func(ev *Event) bool {
+				return ev.Function == p.recv && contains("served "+path)(ev)
+			})
+			checkConnection(t, read, server)
+			// Only application data: no handshake messages, no TLS 1.3
+			// content type left at the end.
+			if !bytes.HasPrefix(write.Data, []byte("GET ")) || !bytes.HasSuffix(write.Data, []byte("\r\n\r\n")) {
+				t.Errorf("%s request: %q", name, write.Data)
+			}
+			if !bytes.HasPrefix(read.Data, []byte("HTTP/1.1 200 OK")) {
+				t.Errorf("%s response: %q", name, read.Data)
+			}
 		}
 	}
 	// Records only: the Writer isn't probed too, or writes would show twice.
 	if ev := events.find(func(ev *Event) bool { return ev.Function == FuncRustlsWrite || ev.Function == FuncRustlsRead }); ev != nil {
 		t.Errorf("%s probed as well", ev.Function)
 	}
+}
+
+// HTTP/3 over quinn, with rustls's aws-lc-rs and ring providers: seen
+// where the provider encrypts and decrypts each QUIC packet. The server is
+// the same program under another name, so only the client is traced.
+func TestQuinnHTTP3(t *testing.T) {
+	requireRoot(t)
+	if os.Getenv("SNOOPY_TEST_RUSTLS") != "1" {
+		t.Skip("set SNOOPY_TEST_RUSTLS=1 to build the quinn client with cargo and run this test")
+	}
+	cargo := requireTool(t, "cargo")
+	providers := []struct {
+		name       string
+		features   []string
+		send, recv Function
+	}{
+		{"aws-lc", nil, FuncAwsLCQUICSend, FuncAwsLCQUICRecv},
+		{"ring", []string{"--no-default-features", "--features", "ring"}, FuncRingQUICSend, FuncRingQUICRecv},
+	}
+	clients := map[string]string{}
+	var targets []discover.Target
+	for _, p := range providers {
+		dir := "testdata/quinnh3/target/" + p.name
+		args := append([]string{"build", "--release", "--quiet", "--manifest-path", "testdata/quinnh3/Cargo.toml",
+			"--target-dir", dir}, p.features...)
+		if out, err := exec.Command(cargo, args...).CombinedOutput(); err != nil {
+			t.Fatalf("build quinn client with %s: %v: %s", p.name, err, out)
+		}
+		client, err := filepath.Abs(dir + "/release/quinnh3")
+		if err != nil {
+			t.Fatal(err)
+		}
+		found, err := discover.Inspect(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(found) != 1 || found[0].Rust == nil || !found[0].Rust.AtRecords() {
+			t.Fatalf("%s's AEAD functions not found: %+v", p.name, found)
+		}
+		clients[p.name] = client
+		targets = append(targets, found...)
+	}
+	events := startTracer(t, Options{Comm: "quinnh3"}, targets)
+
+	for _, p := range providers {
+		// Two servers, which the client reaches at once over one socket.
+		var ports []string
+		for range 2 {
+			port := freeUDPPort(t)
+			server := filepath.Join(t.TempDir(), "quinnsrv")
+			if err := os.Symlink(clients[p.name], server); err != nil {
+				t.Fatal(err)
+			}
+			srv := exec.Command(server, "server", port)
+			stdout, err := srv.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := srv.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
+			if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
+				t.Fatalf("quinn server with %s: %q, %v", p.name, line, err)
+			}
+			ports = append(ports, port)
+		}
+
+		path := "/h3-" + p.name
+		out, err := exec.Command(clients[p.name], "client", strings.Join(ports, ","), path).CombinedOutput()
+		if err != nil || bytes.Count(out, []byte("200 OK served "+path)) != 2 {
+			t.Fatalf("quinn client with %s: %v: %s", p.name, err, out)
+		}
+		var reads []*Event
+		for _, port := range ports {
+			server := "127.0.0.1:" + port
+			// The response body is plain in its DATA frame; the request's
+			// headers are QPACK-encoded, so only its packet is looked for.
+			read := waitFor(t, events, p.name+" response from "+port, func(ev *Event) bool {
+				return ev.Function == p.recv && contains("served "+path+" on "+port)(ev)
+			})
+			// The socket isn't connected, so a send's peer is only in a
+			// notice of where a packet went, whose header (as sent) has
+			// its connection's ID for the server; output follows the
+			// connection by it (cidConns). quinn's IDs are 8 bytes.
+			sent := waitFor(t, events, p.name+" packet sent to "+port, func(ev *Event) bool {
+				return ev.Function == FuncQUICPacketSent && ev.PID == read.PID && ev.Remote.String() == server &&
+					len(ev.QUICHeader) > 9 && ev.QUICHeader[0]&0x80 == 0 // after the handshake
+			})
+			write := waitFor(t, events, p.name+" request to "+port, func(ev *Event) bool {
+				return ev.Function == p.send && ev.PID == read.PID && len(ev.QUICHeader) > 9 &&
+					bytes.Equal(ev.QUICHeader[1:9], sent.QUICHeader[1:9])
+			})
+			if read.FD < 0 || read.FD != write.FD || sent.FD != write.FD || read.Local != write.Local {
+				t.Errorf("%s: response on fd %d at %s, request on fd %d at %s, sent on fd %d",
+					port, read.FD, read.Local, write.FD, write.Local, sent.FD)
+			}
+			for _, ev := range []*Event{read, write} {
+				if len(ev.QUICHeader) < 9 || ev.QUICHeader[0]&0x80 != 0 {
+					t.Errorf("%s: %s's header: % x", port, ev.Function, ev.QUICHeader)
+				}
+			}
+			reads = append(reads, read)
+		}
+		if reads[0].FD != reads[1].FD {
+			t.Errorf("the client used two sockets: fds %d and %d", reads[0].FD, reads[1].FD)
+		}
+	}
+}
+
+// freeUDPPort returns a UDP port on 127.0.0.1 that was free a moment ago.
+func freeUDPPort(t *testing.T) string {
+	t.Helper()
+	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, port, _ := net.SplitHostPort(c.LocalAddr().String())
+	return port
 }
 
 func TestRustls(t *testing.T) {
@@ -864,6 +1012,13 @@ func TestRustls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The client uses ring, whose records TestRustlsAsync covers. Leaving
+	// ring's functions out tests the Reader and Writer, which are what's
+	// probed with other crypto providers.
+	if len(targets) != 1 || targets[0].Rust == nil || !targets[0].Rust.AtRecords() {
+		t.Fatalf("ring's AEAD functions not found: %+v", targets)
+	}
+	targets[0].Rust.RingSeals, targets[0].Rust.RingOpens = nil, nil
 	events := startTracer(t, Options{Comm: "rustlsclient"}, targets)
 	srv, port := newServer(t)
 	if out, err := exec.Command(client, port, "/rustls").CombinedOutput(); err != nil {

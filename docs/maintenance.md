@@ -488,7 +488,27 @@ connection's encryption context was often allocated where a closed
 connection's had been, which is why `conn_infos` keeps the socket's struct
 file and checks it.
 
-Without aws-lc, rustls's `Reader` and `Writer` (what `rustls::Stream` and clients like ureq
+With ring, rustls's other provider (reqwest 0.12 picks it), ring's AEAD
+code is Rust, and the functions that see every record are the ones ring
+calls through `ring::aead::Algorithm`'s function pointers:
+`ring::aead::algorithm::aes_gcm_seal`, `aes_gcm_open` and the
+`chacha20_poly1305_` pair. Their argument places were found with bpftrace,
+printing each argument and reading the buffers before and after `open`:
+
+```bash
+B=<program>; F=$(nm $B | grep -oE '_R\S*4ring4aead9algorithm12aes_gcm_open$')
+# arm64; on x86-64 use arg3, arg4 and arg5, and the stack for the rest
+bpftrace -e "uprobe:$B:$F { printf(\"ad=%r ad_len=%d len=%d src=%d\n\", buf(arg2, 5), arg3, arg5, arg6); }"
+```
+
+`aad` is a slice (pointer and length), as is `in_out`, and `open`'s `src`
+is where the ciphertext starts in `in_out` (8 for TLS 1.2's explicit nonce).
+The `Result<Tag, Unspecified>` they return is too big for registers: arm64
+returns it through `x8`, x86-64 through a hidden first argument, which moves
+the others along by one (`RING_ARG` in `bpf/snoopy.c`). Both encrypt and
+decrypt in place; after `open`, the plaintext is at the start of `in_out`.
+
+Without aws-lc or ring, rustls's `Reader` and `Writer` (what `rustls::Stream` and clients like ureq
 read and write through) do no socket I/O themselves, and Rust programs keep
 their symbol table by default. `inspectRustls` in
 `internal/discover/inspect.go` matches the mangled names of
@@ -504,11 +524,16 @@ which gives each call its socket.
 
 - **A tokio program shows only its writes:** aws-lc's functions weren't found,
   so snoopy fell back to `Writer::write`. List them and update `awsLCAEAD`
-  in `internal/discover/inspect.go`, and `TestAwsLCSymbols`:
+  in `internal/discover/inspect.go`, and `TestAwsLCSymbols`; for ring,
+  `ringAEAD` and `TestRingSymbols`:
 
   ```bash
-  nm <program> | grep -E 'EVP_AEAD_CTX_(seal|open)'
+  nm <program> | grep -E 'EVP_AEAD_CTX_(seal|open)|4ring4aead9algorithm'
   ```
+
+- **ring's records garbled, or nothing from them:** the functions'
+  arguments moved, or how their result is returned. Rerun the bpftrace
+  session above and update `RING_ARG` and `ring_*_enter`.
 
 - **One direction or one TLS version missing:** aws-lc-rs may call another
   AEAD function for it. Rerun the bpftrace session above with all of
@@ -526,8 +551,42 @@ which gives each call its socket.
   while reading a known amount.
 - **To test:** `SNOOPY_TEST_RUSTLS=1` runs `TestRustls` and
   `TestRustlsAsync`, which build the clients in
-  `internal/tracer/testdata/rustlsclient` (ring) and `rustlsasync`
-  (aws-lc-rs, on tokio) with cargo.
+  `internal/tracer/testdata/rustlsclient` (ring, synchronous) and
+  `rustlsasync` (on tokio, built once with aws-lc-rs and once with ring)
+  with cargo.
+
+## HTTP/3 over quinn
+
+### How it was found
+
+quinn's packets go through rustls's provider like TLS records do, with the
+packet header as associated data, so the record probes saw them once ring's
+stopped skipping QUIC. Two things were different from Chromium. All of a
+quinn endpoint's connections use one UDP socket, which isn't connected, so
+the kernel doesn't know any peer; and tokio runs the encrypting, sending,
+receiving and decrypting on different threads, so per-thread bookkeeping
+gave packets the wrong connection's socket or peer, or none. bpftrace on the
+client showed that quinn receives with `recvmmsg`, 32 datagrams at a time,
+and copies each before decrypting it, so a receive's buffer doesn't lead to
+its packet. But it encrypts each packet in place and sends from there, so a
+send's first iovec base is the header of a packet snoopy saw encrypted
+(`sealed_packets`). And encryption contexts' memory is reused between
+connections on the socket, which first gave the second connection the
+first's peer: so the peer is attached to the connection's IDs in user space
+(`FN_QUIC_PACKET_SENT`, `output/quic_cid.go`), not to a context.
+
+### How to tell it broke, and how to fix it
+
+- **Responses show "peer":** no `FN_QUIC_PACKET_SENT` notices, so sends
+  aren't found by their buffers. Check with bpftrace where `sendmsg`'s iovec
+  starts relative to where `aes_gcm_seal` (or `EVP_AEAD_CTX_seal`) got the
+  header (its associated data).
+- **Two connections' streams mixed:** the IDs aren't being matched; their
+  length or layout may have changed. `TestQUICConnectionsOnOneSocket`
+  builds the packets.
+- **To test:** `SNOOPY_TEST_RUSTLS=1` runs `TestQuinnHTTP3`, which builds
+  `internal/tracer/testdata/quinnh3` with each provider and fetches from two
+  servers at once over one socket.
 
 ## Go crypto/tls
 

@@ -112,6 +112,11 @@ type jsonHeader struct {
 }
 
 func (j *JSON) Print(ev *tracer.Event) error {
+	// Decoding can fill in a QUIC packet's peer (see cidConns).
+	dc := j.dec.decode(ev)
+	if dc.notice {
+		return nil
+	}
 	out := jsonEvent{
 		Time:        ev.Time,
 		Function:    ev.Function.String(),
@@ -147,7 +152,6 @@ func (j *JSON) Print(ev *tracer.Event) error {
 			out.DataBase64 = ev.Data
 		}
 	}
-	dc := j.dec.decode(ev)
 	if dc.isQUIC {
 		for _, it := range dc.quic {
 			if it.Frame != "" {

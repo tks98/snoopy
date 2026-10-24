@@ -64,6 +64,9 @@ func TestFunctionsMatchBPFEnum(t *testing.T) {
 		"FN_QUIC_SEND": FuncQUICSend, "FN_QUIC_RECV": FuncQUICRecv,
 		"FN_NSS_QUIC_SEND": FuncNSSQUICSend, "FN_NSS_QUIC_RECV": FuncNSSQUICRecv,
 		"FN_RECORD_SEND": FuncRecordSend, "FN_RECORD_RECV": FuncRecordRecv,
+		"FN_RING_SEND": FuncRingSend, "FN_RING_RECV": FuncRingRecv,
+		"FN_AWSLC_QUIC_SEND": FuncAwsLCQUICSend, "FN_AWSLC_QUIC_RECV": FuncAwsLCQUICRecv,
+		"FN_RING_QUIC_SEND": FuncRingQUICSend, "FN_RING_QUIC_RECV": FuncRingQUICRecv,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("C enum has %d functions, Go has %d", len(names), len(want))
@@ -71,6 +74,10 @@ func TestFunctionsMatchBPFEnum(t *testing.T) {
 	notice := regexp.MustCompile(`#define FN_SOCKET_NOTICE (0x[0-9a-f]+)`).FindSubmatch(src)
 	if notice == nil || string(notice[1]) != fmt.Sprintf("%#x", fnSocketNotice) {
 		t.Errorf("FN_SOCKET_NOTICE doesn't match fnSocketNotice (%#x)", fnSocketNotice)
+	}
+	sent := regexp.MustCompile(`#define FN_QUIC_PACKET_SENT (0x[0-9a-f]+)`).FindSubmatch(src)
+	if sent == nil || string(sent[1]) != fmt.Sprintf("%#x", fnQUICPacketSent) {
+		t.Errorf("FN_QUIC_PACKET_SENT doesn't match fnQUICPacketSent (%#x)", fnQUICPacketSent)
 	}
 	for i, name := range names {
 		if fn, ok := want[name]; !ok || int(fn) != i+1 {
@@ -92,6 +99,8 @@ func TestFunctionDirection(t *testing.T) {
 		FuncMbedTLSWrite: Write, FuncS2NRecv: Read, FuncS2NSend: Write,
 		FuncRustlsRead: Read, FuncRustlsWrite: Write, FuncQUICSend: Write, FuncQUICRecv: Read,
 		FuncNSSQUICSend: Write, FuncNSSQUICRecv: Read, FuncRecordSend: Write, FuncRecordRecv: Read,
+		FuncRingSend: Write, FuncRingRecv: Read,
+		FuncAwsLCQUICSend: Write, FuncAwsLCQUICRecv: Read, FuncRingQUICSend: Write, FuncRingQUICRecv: Read,
 	} {
 		if got := fn.Direction(); got != want {
 			t.Errorf("%s: direction %s, want %s", fn, got, want)
