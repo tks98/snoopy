@@ -5,3 +5,4 @@
 internal/tracer/testdata/rustlsclient/target/
 internal/tracer/testdata/rustlsasync/target/
 internal/tracer/testdata/quinnh3/target/
+internal/tracer/testdata/rustls020/target/

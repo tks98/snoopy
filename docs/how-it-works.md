@@ -48,7 +48,8 @@ All of them on x86_64 and arm64. Some details:
 - **NSS** functions are used for all kinds of files, so only layered
   descriptors (the SSL layer) are captured.
 - **rustls** is seen where its crypto provider encrypts and decrypts each
-  record, with its default provider, aws-lc-rs, and with ring (0.17), so
+  record, with its default provider, aws-lc-rs, and with ring (0.16 and
+  0.17, so rustls 0.20 on), so
   async programs on tokio-rustls (`hyper`, `reqwest`, `axum`, `tonic`,
   Deno) are covered as well as synchronous ones. With any other provider,
   snoopy falls back to rustls's reader and writer, which works for programs

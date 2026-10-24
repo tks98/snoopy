@@ -213,13 +213,17 @@ signature finding against real binaries (see
   socket. Contexts' memory gets reused by later connections, so
   `conn_infos` keeps the socket's struct file and `emit` only trusts it
   while the fd still refers to that socket (`conn_info_live`).
-- **rustls with ring** (0.17) is read the same way at ring's
+- **rustls with ring** (0.17, and 0.16 for rustls 0.20 and early 0.21) is
+  read the same way at ring's
   `ring::aead::algorithm::aes_gcm_seal`/`_open` and
   `chacha20_poly1305_seal`/`_open` (`ringAEAD`; `ring_*_enter`, emitting
   `FN_RING_SEND`/`FN_RING_RECV`). They're Rust functions: their result is
   returned through a hidden pointer, which x86-64 passes as the first
   argument (`RING_ARG`), and `open`'s plaintext length is known at entry
-  (`RET_KNOWN_LEN`).
+  (`RET_KNOWN_LEN`). ring 0.16's are in `aead::aes_gcm` and
+  `aead::chacha20_poly1305` (`ring016AEAD`); their seal takes the same
+  arguments, and their open takes the ciphertext's start before `in_out`
+  (`ring016_open_enter`).
 - **QUIC in Rust programs (quinn)** is captured at the same functions as
   rustls's records, as `FN_AWSLC_QUIC_*` and `FN_RING_QUIC_*`. quinn uses
   one unconnected UDP socket for all its connections and spreads the work

@@ -514,8 +514,11 @@ type RustInfo struct {
 	// of their open functions.
 	RingSeals []uint64
 	RingOpens []uint64
-	Reads     []uint64 // file offsets of <rustls Reader as Read>::read
-	Writes    []uint64 // file offsets of <rustls Writer as Write>::write
+	// ring 0.16's open functions, whose arguments differ. Its seal
+	// functions are among RingSeals.
+	Ring016Opens []uint64
+	Reads        []uint64 // file offsets of <rustls Reader as Read>::read
+	Writes       []uint64 // file offsets of <rustls Writer as Write>::write
 	// Tokio is set if the program has tokio, under which the Reader's
 	// read is inlined away.
 	Tokio bool
@@ -524,7 +527,8 @@ type RustInfo struct {
 // AtRecords reports whether the program's TLS is seen where its records
 // are encrypted and decrypted, rather than at rustls's Reader and Writer.
 func (ri *RustInfo) AtRecords() bool {
-	return len(ri.Seals) > 0 && len(ri.Opens) > 0 || len(ri.RingSeals) > 0 && len(ri.RingOpens) > 0
+	return len(ri.Seals) > 0 && len(ri.Opens) > 0 ||
+		len(ri.RingSeals) > 0 && len(ri.RingOpens)+len(ri.Ring016Opens) > 0
 }
 
 // describe returns a note on where a program's TLS is read, and what of it
@@ -551,6 +555,13 @@ var awsLCAEAD = regexp.MustCompile(`^aws_lc_[0-9_]+_EVP_AEAD_CTX_(seal|open|seal
 //	_ZN4ring4aead9algorithm22chacha20_poly1305_open17h0123456789abcdefE
 var ringAEAD = regexp.MustCompile(`^_R.*4ring4aead9algorithm(12aes_gcm|22chacha20_poly1305)_(seal|open)$` +
 	`|^_ZN4ring4aead9algorithm(12aes_gcm|22chacha20_poly1305)_(seal|open)17h[0-9a-f]{16}E$`)
+
+// ring016AEAD matches ring 0.16's, which are in the ciphers' own modules:
+//
+//	_RNvNtNtCs4QT3yroOiQf_4ring4aead7aes_gcm12aes_gcm_seal
+//	_ZN4ring4aead17chacha20_poly130522chacha20_poly1305_open17h0123456789abcdefE
+var ring016AEAD = regexp.MustCompile(`^_R.*4ring4aead(7aes_gcm12aes_gcm|17chacha20_poly130522chacha20_poly1305)_(seal|open)$` +
+	`|^_ZN4ring4aead(7aes_gcm12aes_gcm|17chacha20_poly130522chacha20_poly1305)_(seal|open)17h[0-9a-f]{16}E$`)
 
 // The symbols, in Rust's v0 mangling (the default since Rust 1.9x) and the
 // legacy one, e.g.
@@ -591,6 +602,11 @@ func inspectRustls(f *elf.File) *RustInfo {
 			list = &ri.RingSeals
 			if strings.Contains(s.Name, "_open") {
 				list = &ri.RingOpens
+			}
+		case strings.Contains(s.Name, "4ring4aead") && ring016AEAD.MatchString(s.Name):
+			list = &ri.RingSeals
+			if strings.Contains(s.Name, "_open") {
+				list = &ri.Ring016Opens
 			}
 		case !strings.Contains(s.Name, "rustls"):
 			continue

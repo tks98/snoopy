@@ -547,7 +547,9 @@ which gives each call its socket.
 
 - **ring's records garbled, or nothing from them:** the functions'
   arguments moved, or how their result is returned. Rerun the bpftrace
-  session above and update `RING_ARG` and `ring_*_enter`.
+  session above and update `RING_ARG` and `ring_*_enter`. ring 0.16's open
+  (`aead::aes_gcm::aes_gcm_open`) takes `in_prefix_len` before `in_out`;
+  `TestRustlsAsync` covers it with `testdata/rustls020` (rustls 0.20).
 
 - **One direction or one TLS version missing:** aws-lc-rs may call another
   AEAD function for it. Rerun the bpftrace session above with all of

@@ -110,7 +110,8 @@ thing it depends on ships.
   aws-lc-rs calling `seal` for TLS 1.3, `seal_scatter` for TLS 1.2 and
   `open` for both, without one of them calling another's exported symbol.
   With ring: the mangled names of `ring::aead::algorithm::aes_gcm_seal` and
-  the like, ring calling them through function pointers (so they aren't
+  the like (ring 0.17; `ring::aead::aes_gcm::aes_gcm_seal` and the like in
+  0.16, whose open takes its arguments in another order), ring calling them through function pointers (so they aren't
   inlined), and their arguments' places, which depend on Rust returning
   their `Result<Tag, Unspecified>` through a hidden pointer. With other
   providers: the mangled names of `Reader::read` and `Writer::write`, and

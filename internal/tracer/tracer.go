@@ -361,6 +361,7 @@ func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]str
 			{"EVP_AEAD_CTX_open", ri.Opens, t.objs.AeadOpenEnter, false},
 			{"ring::aead seal", ri.RingSeals, t.objs.RingSealEnter, true},
 			{"ring::aead open", ri.RingOpens, t.objs.RingOpenEnter, false},
+			{"ring::aead open (ring 0.16)", ri.Ring016Opens, t.objs.Ring016OpenEnter, false},
 		}
 	}
 	var attached []string

@@ -857,22 +857,24 @@ func TestRustlsAsync(t *testing.T) {
 	cargo := requireTool(t, "cargo")
 	providers := []struct {
 		name       string
+		crate      string // in testdata
 		features   []string
 		send, recv Function
 	}{
-		{"aws-lc", nil, FuncRecordSend, FuncRecordRecv},
-		{"ring", []string{"--no-default-features", "--features", "ring"}, FuncRingSend, FuncRingRecv},
+		{"aws-lc", "rustlsasync", nil, FuncRecordSend, FuncRecordRecv},
+		{"ring", "rustlsasync", []string{"--no-default-features", "--features", "ring"}, FuncRingSend, FuncRingRecv},
+		{"ring-0.16", "rustls020", nil, FuncRingSend, FuncRingRecv}, // with rustls 0.20
 	}
 	clients := map[string]string{}
 	var targets []discover.Target
 	for _, p := range providers {
-		dir := "testdata/rustlsasync/target/" + p.name
-		args := append([]string{"build", "--release", "--quiet", "--manifest-path", "testdata/rustlsasync/Cargo.toml",
+		dir := "testdata/" + p.crate + "/target/" + p.name
+		args := append([]string{"build", "--release", "--quiet", "--manifest-path", "testdata/" + p.crate + "/Cargo.toml",
 			"--target-dir", dir}, p.features...)
 		if out, err := exec.Command(cargo, args...).CombinedOutput(); err != nil {
 			t.Fatalf("build rustls client with %s: %v: %s", p.name, err, out)
 		}
-		client, err := filepath.Abs(dir + "/release/rustlsasync")
+		client, err := filepath.Abs(dir + "/release/" + p.crate)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -886,7 +888,7 @@ func TestRustlsAsync(t *testing.T) {
 		clients[p.name] = client
 		targets = append(targets, found...)
 	}
-	events := startTracer(t, Options{Comm: "rustlsasync"}, targets)
+	events := startTracer(t, Options{Comm: "rustls"}, targets) // rustlsasync and rustls020
 	srv, port := newServer(t)
 	server := srv.Listener.Addr().String()
 
@@ -904,7 +906,7 @@ func TestRustlsAsync(t *testing.T) {
 			path := "/async-" + name
 			out, err := exec.Command(clients[p.name], append([]string{port, path}, v.options...)...).CombinedOutput()
 			if err != nil || !bytes.Contains(out, []byte("served "+path)) {
-				t.Fatalf("rustlsasync %s: %v: %s", name, err, out)
+				t.Fatalf("%s %s: %v: %s", p.crate, name, err, out)
 			}
 			// The connection's first write goes out before its socket is
 			// known; it is held back until the socket notice fills it in.

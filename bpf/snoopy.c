@@ -1625,15 +1625,14 @@ int ring_seal_enter(struct pt_regs *ctx)
 				 func_arg(ctx, RING_ARG(3)));
 }
 
-SEC("uprobe/ring_aead_open")
-int ring_open_enter(struct pt_regs *ctx)
+// ring_open handles an open of the len bytes at in_out, whose ciphertext
+// starts at src.
+static __always_inline int ring_open(struct pt_regs *ctx, __u64 in_out, __u64 len, __u64 src)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid))
 		return 0;
 	__u64 ad = func_arg(ctx, RING_ARG(2)), ad_len = func_arg(ctx, RING_ARG(3));
-	__u64 in_out = func_arg(ctx, RING_ARG(4)), len = func_arg(ctx, RING_ARG(5));
-	__u64 src = func_arg(ctx, RING_ARG(6));
 	__u8 fn = FN_RING_RECV, ret;
 	switch (classify_aad(ad, ad_len)) {
 	case AAD_QUIC:
@@ -1656,6 +1655,24 @@ int ring_open_enter(struct pt_regs *ctx)
 	__s32 fd = packet_fd(pid_tgid, rt, in_out + src, ad, ad_len);
 	return enter_call_ad(ctx, fn, ret, func_arg(ctx, RING_ARG(0)), (void *)in_out, len - src, fd,
 			     fn == FN_RING_QUIC_RECV ? ad : 0, ad_len);
+}
+
+SEC("uprobe/ring_aead_open")
+int ring_open_enter(struct pt_regs *ctx)
+{
+	return ring_open(ctx, func_arg(ctx, RING_ARG(4)), func_arg(ctx, RING_ARG(5)), func_arg(ctx, RING_ARG(6)));
+}
+
+// ring 0.16's (rustls 0.20 and early 0.21), in ring::aead::aes_gcm and
+// ring::aead::chacha20_poly1305, take the ciphertext's start before in_out,
+// and return their Tag the same way:
+// fn aes_gcm_open(key: &aead::KeyInner, nonce: Nonce, aad: Aad<&[u8]>,
+//     in_prefix_len: usize, in_out: &mut [u8], cpu: cpu::Features) -> Tag
+// Their seal functions' arguments are 0.17's.
+SEC("uprobe/ring016_aead_open")
+int ring016_open_enter(struct pt_regs *ctx)
+{
+	return ring_open(ctx, func_arg(ctx, RING_ARG(5)), func_arg(ctx, RING_ARG(6)), func_arg(ctx, RING_ARG(4)));
 }
 
 // ngtcp2's crypto library (libngtcp2_crypto_ossl and its siblings for other
