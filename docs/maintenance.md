@@ -273,8 +273,9 @@ every kernel (v2.5.0's too), since inspecting the private libssl takes
 longer than the 2 s hold under emulation. Every other test should pass.
 
 For what the verifier of each kernel accepts, `tools/loadcheck/run.sh`
-loads every BPF program in default, `--pid` and `--comm` modes under each
-kernel vimto has downloaded, booting it in QEMU with a small init. It's
+loads every BPF program in default, `--pid` and `--comm` modes, in the
+kernel's PID namespace and in a new one (the program numbers PIDs
+differently there), under each kernel vimto has downloaded, booting it in QEMU with a small init. It's
 quicker than the tests, and covers 5.10. Run the tests once per kernel
 first, so vimto has the images.
 
