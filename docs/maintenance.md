@@ -468,9 +468,9 @@ symbols.
   the dynamic symbol table) and see how it computes the address it returns;
   extend `loadedAddresses`.
 - **Firefox stopped using freebl's AES-GCM for QUIC:** find what it uses now.
-  Probe candidate AEAD functions with tracefs (freebl's
-  `ChaCha20Poly1305_Seal` and `Open`, table entries 214 and 215, if it's
-  ChaCha20; NSS's `PK11_` functions; or what neqo's crypto code calls in the
+  Probe candidate AEAD functions with tracefs (for ChaCha20, not freebl's
+  exported `ChaCha20Poly1305_*` functions, which a spike found unused, but
+  whatever calls its `Hacl_Poly1305_32_*`; NSS's `PK11_` functions; or what neqo's crypto code calls in the
   version Firefox ships) and look for QUIC-shaped associated data on the
   Socket Thread. Then probe that, as `aes_aead_enter` does.
 - Test with the preferences under [Running browsers for a

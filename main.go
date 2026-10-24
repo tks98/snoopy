@@ -613,13 +613,15 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 
 	if !cfg.quiet && !stdoutUsed {
 		warn := warnOnce()
+		out := newFlushWriter(os.Stdout)
+		closers = append(closers, out.Close)
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(os.Stdout, output.Options{Warn: warn}))
+			printers = append(printers, output.NewJSON(out, output.Options{Warn: warn}))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(os.Stdout, output.Options{Verbose: cfg.verbose, Warn: warn}))
+			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Warn: warn}))
 		default:
-			printers = append(printers, output.NewText(os.Stdout, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Warn: warn}))
+			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Warn: warn}))
 		}
 	}
 

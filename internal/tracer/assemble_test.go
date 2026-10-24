@@ -3,6 +3,7 @@ package tracer
 import (
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"net/netip"
 	"os"
 	"reflect"
@@ -254,5 +255,21 @@ func TestAssembleReadError(t *testing.T) {
 	evs := a.add(mustParse(t, record(h, "")), time.Now())
 	if len(evs) != 1 || !evs[0].ReadError {
 		t.Fatalf("got %+v", evs)
+	}
+}
+
+// decodeHeader agrees with binary.Decode, field for field.
+func TestDecodeHeader(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	for range 100 {
+		b := make([]byte, headerSize)
+		rng.Read(b)
+		var want rawHeader
+		if _, err := binary.Decode(b, binary.NativeEndian, &want); err != nil {
+			t.Fatal(err)
+		}
+		if got := decodeHeader(b); got != want {
+			t.Fatalf("got %+v, want %+v", got, want)
+		}
 	}
 }

@@ -29,6 +29,7 @@ github.com/tks98/snoopy/v2@latest` installs it.
 | Lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date | Green in CI |
 | Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
 | Latest Chrome, Electron and Firefox found by signature, and Fedora's curl over HTTP/3 | Weekly in CI (`canary.yml`) |
+| Overhead | Measured by hand with `docs/benchmark/run.sh`; results in [docs/performance.md](docs/performance.md) |
 | Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #14 (24 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
 | Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | All 32 pass with quic-go support, with `SNOOPY_TEST_RUSTLS=1` and `SNOOPY_TEST_CURL_HTTP3` pointing at a Fedora 44 chroot |
 | Rust, curl and Go tests on x86_64 (Lima, 6.8) | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, `TestCurlHTTP3`, `TestQuicGoHTTP3` and the Go TLS tests pass with quic-go support, cross-built on arm64 since rustup doesn't run in the emulated VM; copy them into the VM, since its shared folder can serve stale files |
@@ -437,9 +438,11 @@ signature finding against real binaries (see
   libraries a long-running process `dlopen`s more than 3 s after its exec.
 - **Not supported:** rustls under tokio with providers other than aws-lc-rs
   and ring (`Reader::read` is inlined into tokio-rustls), Java, QUIC/HTTP/3
-  outside Chromium, Firefox, quinn, ngtcp2 and quic-go, Firefox's QUIC with ChaCha20-Poly1305
-  (freebl's `ChaCha20Poly1305_Seal`/`Open`, table entries 214/215, would be
-  the place), apps using OpenSSL only via its BIO layer (`openssl s_server
+  outside Chromium, Firefox, quinn, ngtcp2 and quic-go, Firefox's QUIC with
+  ChaCha20-Poly1305 (which, a spike showed, reaches freebl's HACL* Poly1305
+  without going through its exported `ChaCha20Poly1305_Seal`/`Open`/
+  `Encrypt`/`Decrypt`, so where to probe is still to be found; Firefox only
+  uses it with servers that pick ChaCha20), apps using OpenSSL only via its BIO layer (`openssl s_server
   -www`), and bodies with shared-dictionary encodings (Chrome's `dcb`, `dcz`).
 - **HTTP/3 and bodies need the connection's start:** QPACK and HPACK tables
   are built up over a connection, Firefox's packet keys get their direction
