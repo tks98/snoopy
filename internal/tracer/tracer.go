@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -459,13 +460,21 @@ func (t *Tracer) AttachSyscalls() error {
 // little later, and programs may load more as they go.
 var rescanDelays = []time.Duration{0, 50 * time.Millisecond, 500 * time.Millisecond, 3 * time.Second}
 
+// maxHold is how long a new process is held while its files are inspected
+// and attached to; inspecting a large program the first time (a browser's
+// stripped BoringSSL) can take longer, and it isn't held up for that.
+const maxHold = 2 * time.Second
+
 // WatchNewProcesses attaches, in the background, to the TLS libraries and
 // programs of processes that start from now on, as w finds them. accept, if
 // not nil, decides whether to look at a process at all; attached is called
 // with the result of every attempt to attach. TLS calls a process makes
-// before its files are inspected are missed. Call stop to stop watching and
-// wait for the watcher to finish.
-func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) bool,
+// before its files are inspected are missed, unless hold says to hold it:
+// then a process whose executable or root filesystem is new to w is
+// stopped (with ptrace, which its parent doesn't see, unlike SIGSTOP) until
+// they're attached to, or maxHold. Call stop to stop watching and wait for
+// the watcher to finish.
+func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid int) bool,
 	attached func(target discover.Target, funcs []string, err error)) (stop func(), err error) {
 	l, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_exec", Program: t.objs.SchedProcessExec})
 	if err != nil {
@@ -480,7 +489,9 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) boo
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	pids := make(chan int)
-	wg.Add(2)
+	holds := make(chan int, 64)
+	held := make(chan heldProcess)
+	wg.Add(3)
 	go func() { // read execs and schedule inspections
 		defer wg.Done()
 		var rec ringbuf.Record
@@ -494,6 +505,12 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) boo
 				continue
 			}
 			pid := int(binary.NativeEndian.Uint32(rec.RawSample))
+			if hold != nil && hold(pid) && !w.Known(pid) {
+				select {
+				case holds <- pid:
+				default: // too many at once; they're looked at as usual
+				}
+			}
 			for _, d := range rescanDelays {
 				time.AfterFunc(d, func() {
 					select {
@@ -504,24 +521,61 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) boo
 			}
 		}
 	}()
+	go func() { // hold new processes, one at a time
+		defer wg.Done()
+		// ptrace requests have to come from the thread that seized.
+		runtime.LockOSThread()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case pid := <-holds:
+				sig, ok := seize(pid)
+				if !ok {
+					continue
+				}
+				p := heldProcess{pid: pid, done: make(chan struct{})}
+				select {
+				case held <- p:
+					select {
+					case <-p.done:
+					case <-time.After(maxHold):
+					}
+				case <-ctx.Done():
+				}
+				release(pid, sig)
+			}
+		}
+	}()
 	go func() { // inspect and attach, one process at a time
 		defer wg.Done()
+		// For a held process, what it's about to load too (root).
+		inspect := func(pid int, root bool) {
+			if accept != nil && !accept(pid) {
+				return
+			}
+			var targets []discover.Target
+			if root {
+				targets = append(w.Root(pid), w.Needed(pid)...)
+			}
+			for _, target := range append(targets, w.Process(pid)...) {
+				if target.Problem != nil {
+					attached(target, nil, target.Problem)
+					continue
+				}
+				funcs, err := t.Attach(target)
+				attached(target, funcs, err)
+			}
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case pid := <-pids:
-				if accept != nil && !accept(pid) {
-					continue
-				}
-				for _, target := range w.Process(pid) {
-					if target.Problem != nil {
-						attached(target, nil, target.Problem)
-						continue
-					}
-					funcs, err := t.Attach(target)
-					attached(target, funcs, err)
-				}
+				inspect(pid, false)
+			case p := <-held:
+				inspect(p.pid, true)
+				close(p.done)
 			}
 		}
 	}()
@@ -530,6 +584,63 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept func(pid int) boo
 		wg.Wait()
 		reader.Close()
 	}, nil
+}
+
+type heldProcess struct {
+	pid  int
+	done chan struct{} // closed once its files are attached to
+}
+
+// seize stops a process with ptrace, without its parent seeing it stop, and
+// returns the signal it stopped for, if any, which release passes on.
+func seize(pid int) (sig int, ok bool) {
+	if unix.PtraceSeize(pid) != nil {
+		return 0, false // gone, already traced, or not allowed (Yama)
+	}
+	if unix.PtraceInterrupt(pid) != nil {
+		release(pid, 0)
+		return 0, false
+	}
+	// Wait for it to stop, without blocking: another thread waiting for the
+	// process (if it's our own child) can take the notification, and then
+	// only /proc says it stopped.
+	for deadline := time.Now().Add(maxHold); time.Now().Before(deadline); time.Sleep(100 * time.Microsecond) {
+		var ws unix.WaitStatus
+		n, err := unix.Wait4(pid, &ws, unix.WALL|unix.WNOHANG, nil)
+		switch {
+		case err == unix.EINTR:
+			continue
+		case n == pid && ws.Stopped():
+			// PTRACE_INTERRUPT's own stop is a PTRACE_EVENT_STOP; any
+			// other stop is a signal arriving, to deliver when it goes.
+			if ws.TrapCause() == unix.PTRACE_EVENT_STOP {
+				return 0, true
+			}
+			return int(ws.StopSignal()), true
+		case n == pid || err != nil && err != unix.ECHILD:
+			return 0, false // it exited
+		}
+		if traceStopped(pid) {
+			return 0, true
+		}
+	}
+	release(pid, 0)
+	return 0, false
+}
+
+// traceStopped reports whether a process is in a ptrace stop: state t in
+// /proc/<pid>/stat, after the command name, which may contain anything.
+func traceStopped(pid int) bool {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	i := bytes.LastIndexByte(stat, ')')
+	return i >= 0 && i+2 < len(stat) && stat[i+2] == 't'
+}
+
+func release(pid, sig int) {
+	_, _, _ = unix.Syscall6(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(pid), 0, uintptr(sig), 0, 0)
 }
 
 // Run delivers events to handle until ctx is cancelled. handle is called

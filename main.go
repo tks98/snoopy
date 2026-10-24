@@ -323,7 +323,7 @@ func run(cfg config) error {
 	}
 	// Also attach to what processes started from now on use.
 	if !cfg.noScan {
-		stopWatching, err := t.WatchNewProcesses(discover.NewWatcher(targets), acceptProcess(cfg, t),
+		stopWatching, err := t.WatchNewProcesses(discover.NewWatcher(targets), acceptProcess(cfg, t), holdProcess(cfg),
 			func(target discover.Target, funcs []string, err error) { reportAttach(cfg, target, funcs, err, false) })
 		if err != nil {
 			logf("warning: programs started from now on are only traced if they use a library already attached to: %v", err)
@@ -522,6 +522,25 @@ func acceptProcess(cfg config, t *tracer.Tracer) func(pid int) bool {
 			}
 		}
 		return true
+	}
+}
+
+// holdProcess says which new processes to hold until their files are
+// attached to, so that a short-lived one's TLS isn't missed: with --comm or
+// --pid, the ones asked for. Without either, every program's first run on
+// the machine would be held, which is too much to impose.
+func holdProcess(cfg config) func(pid int) bool {
+	if cfg.comm == "" && cfg.pid == 0 {
+		return nil
+	}
+	return func(pid int) bool {
+		if cfg.comm != "" {
+			comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+			if err != nil || !strings.HasPrefix(strings.TrimSuffix(string(comm), "\n"), cfg.comm) {
+				return false
+			}
+		}
+		return cfg.pid == 0 || discover.IsDescendant(pid, cfg.pid)
 	}
 }
 
