@@ -11,3 +11,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  - package-ecosystem: gomod
+    directory: /cmd/kubectl-snoopy
+    schedule:
+      interval: weekly
+    groups:
+      plugin-dependencies:
+        patterns: ["*"]

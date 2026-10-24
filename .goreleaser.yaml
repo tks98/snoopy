@@ -3,20 +3,41 @@ version: 2
 project_name: snoopy
 
 builds:
-  - env:
+  - id: snoopy
+    env:
       - CGO_ENABLED=0
     goos: [linux]
     goarch: [amd64, arm64]
     flags: [-trimpath]
     ldflags:
       - -s -w -X main.version={{ .Version }}
+  # The kubectl plugin, a module of its own, which runs where kubectl does.
+  - id: kubectl-snoopy
+    dir: cmd/kubectl-snoopy
+    binary: kubectl-snoopy
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
 
 archives:
-  - formats: [tar.gz]
+  - id: snoopy
+    ids: [snoopy]
+    formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - LICENSE
       - README.md
+  # krew wants the license in the archive.
+  - id: kubectl-snoopy
+    ids: [kubectl-snoopy]
+    formats: [tar.gz]
+    name_template: "kubectl-snoopy_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
 
 checksum:
   name_template: checksums.txt
@@ -28,7 +49,8 @@ changelog:
 # It needs the host's PID namespace and privileges to trace anything; see
 # docs/usage.md, "Containers and Kubernetes".
 dockers_v2:
-  - images:
+  - ids: [snoopy]
+    images:
       - ghcr.io/tks98/snoopy
     tags:
       - "{{ .Version }}"
@@ -46,3 +68,27 @@ dockers_v2:
       manifest:org.opencontainers.image.description: See what Linux programs send over TLS, with eBPF
       manifest:org.opencontainers.image.source: https://github.com/tks98/snoopy
       manifest:org.opencontainers.image.licenses: MIT
+
+# The krew manifest, kept in dist/ and attached to the release by the
+# release workflow, not pushed to krew-index: submitting it there is done by
+# hand (docs/kubernetes.md).
+krews:
+  - name: snoopy
+    ids: [kubectl-snoopy]
+    homepage: https://github.com/tks98/snoopy
+    short_description: Show what a pod sends and receives over TLS
+    description: |
+      Shows what a pod's containers send and receive over TLS, decoded
+      (HTTP/1.1, HTTP/2, HTTP/3, gRPC), without certificates or changes to
+      the pod. It runs snoopy, an eBPF tracer, on the pod's node in a
+      privileged pod of its own that shares the node's PID namespace,
+      attaches to it, and deletes it when you stop.
+    caveats: |
+      The snoopy pod is privileged and shares the node's PID namespace, so
+      it needs a namespace whose Pod Security level allows that, and
+      permission to create pods there and attach to them. Nodes need Linux
+      5.10 or later.
+
+      Its output contains whatever the pod sends, passwords and tokens
+      included.
+    skip_upload: true

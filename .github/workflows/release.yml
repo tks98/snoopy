@@ -31,3 +31,10 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attach the krew manifest
+        # For krew-index, which it's submitted to by hand (docs/kubernetes.md).
+        run: |
+          cp dist/krew/snoopy.yaml dist/krew-snoopy.yaml
+          gh release upload "$GITHUB_REF_NAME" dist/krew-snoopy.yaml --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

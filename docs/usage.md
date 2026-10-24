@@ -247,7 +247,8 @@ In a container, snoopy finds the host's TLS libraries through
 programs on the host and in containers alike.
 
 On Kubernetes, that's a pod with `hostPID: true` and a privileged container,
-on the node to trace.
+on the node to trace, which `kubectl snoopy POD` makes for you: see
+[kubernetes.md](kubernetes.md).
 
 ## Overhead
 

@@ -35,6 +35,14 @@ jobs:
         with:
           version: "~> v2"
           args: release --snapshot --clean
+      - name: krew installs the plugin from its manifest
+        run: |
+          curl -fsSLO https://github.com/kubernetes-sigs/krew/releases/download/v0.4.5/krew-linux_amd64.tar.gz
+          tar xzf krew-linux_amd64.tar.gz ./krew-linux_amd64
+          ./krew-linux_amd64 install krew
+          export PATH="$HOME/.krew/bin:$PATH"
+          kubectl krew install --manifest=dist/krew/snoopy.yaml --archive="$(ls dist/kubectl-snoopy_*_linux_amd64.tar.gz)"
+          kubectl snoopy --version
       - name: The images run
         run: |
           docker images ghcr.io/tks98/snoopy
