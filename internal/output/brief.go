@@ -38,7 +38,7 @@ func NewBrief(w io.Writer, opts Options) *Brief {
 	return &Brief{
 		w:     w,
 		opts:  opts,
-		dec:   newDecoders(opts.Warn),
+		dec:   newDecoders(opts),
 		dim:   s(color.Faint),
 		title: s(color.Bold),
 		write: s(color.FgCyan),
@@ -105,7 +105,7 @@ func (b *Brief) summary(ev *tracer.Event, dc decoded) string {
 	case dc.http1 != nil:
 		return briefHTTP1(dc.http1)
 	}
-	return briefData(ev.Data)
+	return briefData(dc.data)
 }
 
 // briefQUIC describes the HTTP/3 frames in a packet, or else its QUIC

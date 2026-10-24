@@ -111,7 +111,9 @@ needs no compiler, kernel headers or BCC.
 
 snoopy's output contains whatever the traced programs send: passwords, API
 tokens, cookies and personal data. Only use it on systems you are authorized
-to inspect, and treat its output and pcap files as sensitive.
+to inspect, and treat its output and pcap files as sensitive. `--redact`
+masks credentials, secret fields and recognizable tokens in the output, for
+sharing it ([docs/usage.md](docs/usage.md#sharing-output)).
 
 ## License
 
