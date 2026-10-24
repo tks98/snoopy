@@ -41,6 +41,9 @@ type quicItem struct {
 // connection migration), keeping its keys. Connections sharing a socket are
 // told apart by their connection IDs (see cidConns).
 type quicConns struct {
+	// last is the connection of the last packet processed, as both of its
+	// directions know it (send unset).
+	last   quicKey
 	dirs   map[quicKey]*quicDir // several keys share one after a migration
 	locals map[quicKey]netip.AddrPort
 	cids   *cidConns
@@ -175,6 +178,8 @@ func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 	if cc != nil {
 		key = quicKey{pid: ev.PID, fd: cidFD, conn: cc.id, send: key.send}
 	}
+	c.last = key
+	c.last.send = false
 	d := c.dir(key, ev)
 	c.clock++
 	d.lastUsed, d.lastCtx, d.lastTime = c.clock, ev.ConnID, ev.Time
