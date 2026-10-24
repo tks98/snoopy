@@ -144,6 +144,7 @@ const (
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
 	snoopyMapIoThreads              = "io_threads"
+	snoopyMapLastWakeup             = "last_wakeup"
 	snoopyMapQuicProcs              = "quic_procs"
 	snoopyMapQuicTraffic            = "quic_traffic"
 	snoopyMapRecvBufs               = "recv_bufs"
@@ -296,6 +297,7 @@ type snoopyMapSpecs struct {
 	Events        *ebpf.MapSpec `ebpf:"events"`
 	Execs         *ebpf.MapSpec `ebpf:"execs"`
 	IoThreads     *ebpf.MapSpec `ebpf:"io_threads"`
+	LastWakeup    *ebpf.MapSpec `ebpf:"last_wakeup"`
 	QuicProcs     *ebpf.MapSpec `ebpf:"quic_procs"`
 	QuicTraffic   *ebpf.MapSpec `ebpf:"quic_traffic"`
 	RecvBufs      *ebpf.MapSpec `ebpf:"recv_bufs"`
@@ -344,6 +346,7 @@ type snoopyMaps struct {
 	Events        *ebpf.Map `ebpf:"events"`
 	Execs         *ebpf.Map `ebpf:"execs"`
 	IoThreads     *ebpf.Map `ebpf:"io_threads"`
+	LastWakeup    *ebpf.Map `ebpf:"last_wakeup"`
 	QuicProcs     *ebpf.Map `ebpf:"quic_procs"`
 	QuicTraffic   *ebpf.Map `ebpf:"quic_traffic"`
 	RecvBufs      *ebpf.Map `ebpf:"recv_bufs"`
@@ -362,6 +365,7 @@ func (m *snoopyMaps) Close() error {
 		m.Events,
 		m.Execs,
 		m.IoThreads,
+		m.LastWakeup,
 		m.QuicProcs,
 		m.QuicTraffic,
 		m.RecvBufs,

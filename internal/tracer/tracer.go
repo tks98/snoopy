@@ -817,6 +817,10 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 		pollInterval  = 200 * time.Millisecond
 		maxChunkWait  = time.Second
 		maxSocketWait = 300 * time.Millisecond
+		// The BPF side wakes the reader at most once a millisecond per CPU
+		// (WAKEUP_INTERVAL_NS), so records can arrive without a wakeup, the
+		// last of a burst especially; they wait at most this long.
+		readWait = 20 * time.Millisecond
 	)
 	asm := newAssembler(t.clock)
 	sockets := newSocketWaiter()
@@ -850,7 +854,7 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 			return nil
 		}
 
-		t.reader.SetDeadline(time.Now().Add(pollInterval))
+		t.reader.SetDeadline(time.Now().Add(readWait))
 		err := t.reader.ReadInto(&rec)
 		now := time.Now()
 		switch {

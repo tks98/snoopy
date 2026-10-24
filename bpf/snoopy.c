@@ -221,6 +221,22 @@ struct {
 	__uint(max_entries, 16 << 20); // resized from user space
 } events SEC(".maps");
 
+// When each CPU last let a data record wake the reader. Waking it is an
+// interrupt (irq_work), which under load cost more than the rest of
+// emitting a record together, so it's done at most once per
+// WAKEUP_INTERVAL_NS per CPU; user space also reads on a short timer, for
+// records no wakeup followed.
+#define WAKEUP_INTERVAL_NS 1000000
+// bpf_ringbuf_submit's flags, from linux/bpf.h
+#define BPF_RB_NO_WAKEUP 1
+#define BPF_RB_FORCE_WAKEUP 2
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} last_wakeup SEC(".maps");
+
 // PIDs of processes that executed a new program, so user space can attach
 // to TLS libraries and programs that start after it did, and with probes
 // per process, of those forked from a traced one.
@@ -439,14 +455,14 @@ static __always_inline bool track_conn(__u64 pid_tgid, __u64 conn, __s32 fd)
 		if (bpf_probe_read_user(r->data, len, src)) {                 \
 			r->h.flags |= EVENT_FLAG_READ_ERROR;                  \
 			r->h.chunk_len = 0;                                   \
-			bpf_ringbuf_submit(r, 0);                             \
+			bpf_ringbuf_submit(r, flags);                         \
 			return -1;                                            \
 		}                                                             \
-		bpf_ringbuf_submit(r, 0);                                     \
+		bpf_ringbuf_submit(r, flags);                                 \
 		return 0;                                                     \
 	} while (0)
 
-static __always_inline int output_full_chunk(const struct event_header *h, const void *src)
+static __always_inline int output_full_chunk(const struct event_header *h, const void *src, __u64 flags)
 {
 	const __u32 len = CHUNK_SIZE;
 	OUTPUT_CHUNK(16384);
@@ -455,7 +471,8 @@ static __always_inline int output_full_chunk(const struct event_header *h, const
 // The last chunk of a call can be smaller. Only it picks a record size, so
 // each iteration of the chunk loop has a single path that continues; the
 // verifier would otherwise have to explore every combination of sizes.
-static __always_inline int output_last_chunk(const struct event_header *h, const void *src, __u32 len)
+static __always_inline int output_last_chunk(const struct event_header *h, const void *src, __u32 len,
+					     __u64 flags)
 {
 	if (len <= 256)
 		OUTPUT_CHUNK(256);
@@ -471,6 +488,23 @@ static __always_inline int output_last_chunk(const struct event_header *h, const
 static __always_inline bool conn_info_live(struct conn_info *info)
 {
 	return !have_btf || !info->file || (__u64)socket_file(info->fd) == info->file;
+}
+
+// The flags to submit a call's records with: no wakeup if this CPU woke the
+// reader less than WAKEUP_INTERVAL_NS ago, else a forced one. Not the ring
+// buffer's own choice, which wakes the reader only if it has read
+// everything before the record: with records submitted without a wakeup
+// still unread, it never would.
+static __always_inline __u64 submit_flags(__u64 now)
+{
+	__u32 key = 0;
+	__u64 *last = bpf_map_lookup_elem(&last_wakeup, &key);
+	if (!last)
+		return 0;
+	if (now - *last < WAKEUP_INTERVAL_NS)
+		return BPF_RB_NO_WAKEUP;
+	*last = now;
+	return BPF_RB_FORCE_WAKEUP;
 }
 
 static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
@@ -515,6 +549,7 @@ static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64
 
 	__u32 captured = h.size < max_capture ? h.size : max_capture;
 	h.captured = captured;
+	__u64 flags = submit_flags(now);
 
 	for (__u32 i = 0; i < MAX_CHUNKS; i++) {
 		__u32 off = i * CHUNK_SIZE;
@@ -524,7 +559,7 @@ static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64
 		__u32 len = captured - off;
 		const void *src = (const void *)(call->buf + off);
 		h.chunk_offset = off;
-		int err = len > CHUNK_SIZE ? output_full_chunk(&h, src) : output_last_chunk(&h, src, len);
+		int err = len > CHUNK_SIZE ? output_full_chunk(&h, src, flags) : output_last_chunk(&h, src, len, flags);
 		if (err == -2)
 			count_lost();
 		if (err || len <= CHUNK_SIZE)
