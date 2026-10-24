@@ -13,7 +13,6 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -298,7 +297,7 @@ func run(cfg config) error {
 	for _, w := range warnings {
 		logf("warning: %v", w)
 	}
-	if len(targets) == 0 {
+	if len(targets) == 0 && !t.PerProcess() { // per process, they're found as processes start
 		return errors.New("no TLS libraries found to attach to; point snoopy at one with --lib")
 	}
 
@@ -447,13 +446,15 @@ func run(cfg config) error {
 }
 
 // reportKey identifies a target's file however it was reached, by name or
-// through a process's /proc directory.
+// through a process's /proc directory: by its inode, since resolving
+// symlinks in user space goes wrong through /proc/<pid>/root.
 func reportKey(target discover.Target) string {
-	path := target.Name()
-	if real, err := filepath.EvalSymlinks(target.Path); err == nil {
-		path = real
+	key := target.Name()
+	var st syscall.Stat_t
+	if syscall.Stat(target.Path, &st) == nil {
+		key = fmt.Sprintf("%d:%d", st.Dev, st.Ino)
 	}
-	return target.Library.String() + " " + path
+	return target.Library.String() + " " + key
 }
 
 // hidden returns how many events a printer left out so far.

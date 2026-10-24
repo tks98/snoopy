@@ -181,11 +181,11 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 			candidates = append(candidates, files...)
 		}
 		// For the programs it will start.
-		for _, path := range systemLibraries() {
+		for _, path := range append(systemLibraries(), hostLibraries(proc)...) {
 			candidates = append(candidates, candidate{path: path})
 		}
 	} else {
-		for _, path := range append(knownFiles(opts.Comm), systemLibraries()...) {
+		for _, path := range slices.Concat(knownFiles(opts.Comm), systemLibraries(), hostLibraries(proc)) {
 			candidates = append(candidates, candidate{path: path})
 		}
 		if !opts.NoScan {
@@ -560,6 +560,32 @@ func systemLibraries() []string {
 					m = real
 				}
 				out = append(out, m)
+			}
+		}
+	}
+	return out
+}
+
+// hostLibraries returns the TLS libraries in the usual places of the host's
+// root filesystem, through /proc/1/root, when snoopy runs in a container
+// that shares the host's PID namespace: the image it runs from has none.
+// Symlinks are left out, since they'd resolve in the container's root;
+// libraries are regular files, their dev symlinks aren't.
+func hostLibraries(proc string) []string {
+	host := filepath.Join(proc, "1", "root")
+	hostID, err := dirID(host)
+	ownID, errOwn := dirID("/")
+	if err != nil || errOwn != nil || hostID == ownID {
+		return nil
+	}
+	var out []string
+	for _, dir := range libDirs {
+		for _, pat := range libPatterns {
+			matches, _ := filepath.Glob(filepath.Join(host, dir, pat))
+			for _, m := range matches {
+				if fi, err := os.Lstat(m); err == nil && fi.Mode().IsRegular() {
+					out = append(out, m)
+				}
 			}
 		}
 	}

@@ -23,3 +23,26 @@ checksum:
 
 changelog:
   sort: asc
+
+# A multi-arch image with just the static binary, at ghcr.io/tks98/snoopy.
+# It needs the host's PID namespace and privileges to trace anything; see
+# docs/usage.md, "Containers and Kubernetes".
+dockers_v2:
+  - images:
+      - ghcr.io/tks98/snoopy
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.title: snoopy
+      org.opencontainers.image.description: See what Linux programs send over TLS, with eBPF
+      org.opencontainers.image.source: https://github.com/tks98/snoopy
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.licenses: MIT
+    annotations:
+      manifest:org.opencontainers.image.description: See what Linux programs send over TLS, with eBPF
+      manifest:org.opencontainers.image.source: https://github.com/tks98/snoopy
+      manifest:org.opencontainers.image.licenses: MIT

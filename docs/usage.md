@@ -234,11 +234,17 @@ Fields that don't apply are left out.
 
 Run snoopy on the host, or in a privileged container that shares the host's
 PID namespace, so it can see other containers' processes and their files
-through `/proc`:
+through `/proc`. Each release has an image with just the binary, for amd64
+and arm64:
 
 ```bash
-docker run --rm -it --privileged --pid=host -v "$PWD/snoopy:/snoopy" ubuntu /snoopy
+docker run --rm -it --privileged --pid=host ghcr.io/tks98/snoopy --brief
+docker run --rm -it --privileged --pid=host ghcr.io/tks98/snoopy:2.6.0 --comm curl
 ```
+
+In a container, snoopy finds the host's TLS libraries through
+`/proc/1/root`, and other containers' through their processes, so it traces
+programs on the host and in containers alike.
 
 On Kubernetes, that's a pod with `hostPID: true` and a privileged container,
 on the node to trace.
