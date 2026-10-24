@@ -33,24 +33,67 @@ import (
 var version = "dev"
 
 type config struct {
-	pid       int
-	comm      string
-	container string
-	hosts     stringList
-	ports     portList
-	libs      stringList
-	noScan    bool
-	brief     bool
-	json      bool
-	hex       bool
-	full      bool
-	maxSize   int
-	count     int
-	pcap      string
-	quiet     bool
-	noColor   bool
-	verbose   bool
-	version   bool
+	pid        int
+	comm       string
+	containers containerList
+	hosts      stringList
+	ports      portList
+	libs       stringList
+	noScan     bool
+	brief      bool
+	json       bool
+	hex        bool
+	full       bool
+	maxSize    int
+	count      int
+	pcap       string
+	quiet      bool
+	noColor    bool
+	verbose    bool
+	version    bool
+}
+
+// containerList is --container's: IDs or ID prefixes, each optionally with
+// a name to show for it (ID=NAME), given repeatedly or comma-separated.
+type containerList []containerSpec
+
+type containerSpec struct{ id, name string }
+
+func (c *containerList) String() string {
+	var s []string
+	for _, spec := range *c {
+		s = append(s, spec.id)
+	}
+	return strings.Join(s, ",")
+}
+
+func (c *containerList) Set(v string) error {
+	for _, item := range strings.Split(v, ",") {
+		id, name, _ := strings.Cut(strings.TrimSpace(item), "=")
+		// Runtimes write IDs as <runtime>://<id> (Kubernetes' containerID).
+		if _, rest, ok := strings.Cut(id, "://"); ok {
+			id = rest
+		}
+		if id == "" {
+			return fmt.Errorf("empty container ID in %q", v)
+		}
+		*c = append(*c, containerSpec{strings.ToLower(id), name})
+	}
+	return nil
+}
+
+// match reports whether a container ID is one of those given, and the name
+// it was given; with none given, every one matches.
+func (c containerList) match(id string) (name string, ok bool) {
+	if len(c) == 0 {
+		return "", true
+	}
+	for _, spec := range c {
+		if id != "" && strings.HasPrefix(id, spec.id) {
+			return spec.name, true
+		}
+	}
+	return "", false
 }
 
 type stringList []string
@@ -80,7 +123,9 @@ Which processes:
   --pid PID          only this process and those it starts
   --comm NAME        only processes whose name starts with NAME, as in
                      /proc/<pid>/comm (curl, firefox, chrome)
-  --container ID     only processes in the container with this ID, or ID prefix
+  --container ID     only processes in the container with this ID, or ID
+                     prefix; repeatable, or comma-separated. ID=NAME shows
+                     NAME for the container's events
 
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
@@ -130,7 +175,7 @@ func flags(c *config, stderr io.Writer) *flag.FlagSet {
 	// The usages are in the help text instead.
 	fs.IntVar(&c.pid, "pid", 0, "")
 	fs.StringVar(&c.comm, "comm", "", "")
-	fs.StringVar(&c.container, "container", "", "")
+	fs.Var(&c.containers, "container", "")
 	fs.Var(&c.hosts, "host", "")
 	fs.Var(&c.ports, "port", "")
 	fs.Var(&c.libs, "lib", "")
@@ -278,7 +323,8 @@ func run(cfg config) error {
 	// one to see.
 	// With a process filter, probes go on those processes only, so the
 	// rest don't pay for them; that needs the watcher, for new ones.
-	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize, PerProcess: !cfg.noScan})
+	perProcess := !cfg.noScan && (cfg.pid != 0 || cfg.comm != "" || len(cfg.containers) > 0)
+	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize, PerProcess: perProcess})
 	if err != nil {
 		return err
 	}
@@ -312,7 +358,11 @@ func run(cfg config) error {
 				}
 			}
 		}
+		resolver := procinfo.NewResolver("/proc")
 		for _, pid := range discover.Selected(cfg.pid, cfg.comm) {
+			if _, ok := cfg.containers.match(resolver.ContainerID(uint32(pid))); !ok {
+				continue
+			}
 			// What it has, then what it may load.
 			for _, target := range append(watcher.Process(pid), watcher.Root(pid)...) {
 				funcs, err := t.Attach(target, pid)
@@ -393,9 +443,11 @@ func run(cfg config) error {
 			quic.add(ev.PID) // before any filter, so its HTTP/3 isn't taken for uncaptured
 		}
 		ev.ContainerID = resolver.ContainerID(ev.PID)
-		if cfg.container != "" && !strings.HasPrefix(ev.ContainerID, cfg.container) {
+		name, ok := cfg.containers.match(ev.ContainerID)
+		if !ok {
 			return
 		}
+		ev.ContainerName = name
 		if !ev.Remote.IsValid() {
 			if local, remote, ok := resolver.Addresses(ev.PID, ev.FD); ok {
 				ev.Local, ev.Remote = local, remote
@@ -555,7 +607,7 @@ func reportAttach(cfg config, target discover.Target, funcs []string, err error,
 // that --pid, --comm and --container would trace. With --pid, a process
 // accepted is also added to those traced.
 func acceptProcess(cfg config, t *tracer.Tracer) func(pid int) bool {
-	if cfg.pid == 0 && cfg.comm == "" && cfg.container == "" {
+	if cfg.pid == 0 && cfg.comm == "" && len(cfg.containers) == 0 {
 		return nil
 	}
 	resolver := procinfo.NewResolver("/proc") // not shared: Resolver isn't safe for concurrent use
@@ -566,7 +618,7 @@ func acceptProcess(cfg config, t *tracer.Tracer) func(pid int) bool {
 				return false
 			}
 		}
-		if cfg.container != "" && !strings.HasPrefix(resolver.ContainerID(uint32(pid)), cfg.container) {
+		if _, ok := cfg.containers.match(resolver.ContainerID(uint32(pid))); !ok {
 			return false
 		}
 		if cfg.pid != 0 {
@@ -596,19 +648,23 @@ func warnOnce() func(string) {
 }
 
 // holdProcess says which new processes to hold until their files are
-// attached to, so that a short-lived one's TLS isn't missed: with --comm or
-// --pid, the ones asked for. Without either, every program's first run on
-// the machine would be held, which is too much to impose.
+// attached to, so that a short-lived one's TLS isn't missed: with --comm,
+// --pid or --container, the ones asked for. Without any, every program's
+// first run on the machine would be held, which is too much to impose.
 func holdProcess(cfg config) func(pid int) bool {
-	if cfg.comm == "" && cfg.pid == 0 {
+	if cfg.comm == "" && cfg.pid == 0 && len(cfg.containers) == 0 {
 		return nil
 	}
+	resolver := procinfo.NewResolver("/proc") // not shared: Resolver isn't safe for concurrent use
 	return func(pid int) bool {
 		if cfg.comm != "" {
 			comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 			if err != nil || !strings.HasPrefix(strings.TrimSuffix(string(comm), "\n"), cfg.comm) {
 				return false
 			}
+		}
+		if _, ok := cfg.containers.match(resolver.ContainerID(uint32(pid))); !ok {
+			return false
 		}
 		return cfg.pid == 0 || discover.IsDescendant(pid, cfg.pid)
 	}

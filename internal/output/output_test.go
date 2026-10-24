@@ -152,6 +152,31 @@ func TestTextBinaryAndNotes(t *testing.T) {
 	}
 }
 
+// A container given a name (--container ID=NAME) is shown by it.
+func TestContainerName(t *testing.T) {
+	ev := event(tracer.FuncSSLWrite, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	ev.ContainerID = "4b825dc642cb6eb9a060"
+	ev.ContainerName = "shop/checkout-7d9f/app"
+	for name, p := range map[string]func(*bytes.Buffer) Printer{
+		"text":  func(b *bytes.Buffer) Printer { return NewText(b, Options{}) },
+		"brief": func(b *bytes.Buffer) Printer { return NewBrief(b, Options{}) },
+		"json":  func(b *bytes.Buffer) Printer { return NewJSON(b, Options{}) },
+	} {
+		var buf bytes.Buffer
+		if err := p(&buf).Print(ev); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]string{
+			"text":  "container shop/checkout-7d9f/app",
+			"brief": "shop/checkout-7d9f/app curl[42]",
+			"json":  `"container_name":"shop/checkout-7d9f/app"`,
+		}[name]
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("%s: missing %q in:\n%s", name, want, buf.String())
+		}
+	}
+}
+
 // Text shows a body's first maxBodyShown bytes, and describes the rest and
 // binary data, unless Full is set.
 func TestTextBodyLimits(t *testing.T) {

@@ -55,6 +55,6 @@ snoopy is or isn't the better choice. Corrections are welcome.
   decompressed (gzip, deflate, Brotli, zstd), and gRPC messages shown as
   protobuf fields without the schema, or one line per call with `--brief`,
   JSON with `--json`, or a pcap with `--pcap`.
-- **Cheap enough to leave running**, with `--comm` or `--pid` especially,
+- **Cheap enough to leave running**, with `--comm`, `--pid` or `--container` especially,
   where only the processes asked for pay for its probes;
   [performance.md](performance.md) has the numbers.

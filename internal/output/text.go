@@ -89,7 +89,10 @@ func (t *Text) Print(ev *tracer.Event) error {
 		extra = append(extra, fmt.Sprintf("fd %d", ev.FD))
 	}
 	extra = append(extra, fmt.Sprintf("conn %#x", ev.ConnID))
-	if ev.ContainerID != "" {
+	switch {
+	case ev.ContainerName != "":
+		extra = append(extra, "container "+ev.ContainerName)
+	case ev.ContainerID != "":
 		extra = append(extra, "container "+shortID(ev.ContainerID))
 	}
 	fmt.Fprintf(&b, "  %s\n", t.dim(strings.Join(extra, ", ")))
