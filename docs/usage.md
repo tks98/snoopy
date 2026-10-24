@@ -127,6 +127,15 @@ are loaded after the `exec`. TLS calls a new program makes before then are
 missed, unless it uses a library snoopy was already attached to, such as the
 system `libssl`.
 
+With `--comm` or `--pid`, a new process they select whose program, root
+filesystem (a container's or chroot's) or library path snoopy hasn't seen
+before is held at its `exec` until snoopy has attached to it and to the TLS
+libraries it's about to load, for at most 2 s, so a short-lived one's
+first request isn't missed. It's held with ptrace, which its parent doesn't
+see: a shell doesn't report it as stopped. A process that's already being
+traced (by a debugger or strace) isn't held, nor is any without those
+options, since every program's first run would be.
+
 `--pid` follows the processes the given one starts, which matters for
 browsers: Chrome does its networking in a separate process, so `--pid` of
 its main process captures that one. Without kernel BTF, a child that doesn't

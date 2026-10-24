@@ -316,6 +316,14 @@ signature finding against real binaries (see
   unconnected socket and separate goroutines like quinn, so the same
   `quic_procs`, packet-sent notices and connection IDs give sockets and
   peers.
+- **Warnings for quiet failures:** `quic_traffic` counts, per traced
+  process, datagrams on UDP sockets connected to port 443 (`note_udp443`,
+  only the datagram syscalls, up to 64) and untraceable Firefox packets;
+  `watchCounters` in `main.go` warns about a process with enough of the
+  first and no QUIC events for a whole tick. `RustInfo.describe` and
+  `GoInfo.QUICMissing` give attach-time warnings (`Target.Limits`, or a
+  `Problem` when nothing can be attached), and `Options.Warn` is told when
+  headers can't be decoded because the connection started before snoopy.
 - **QUIC in Firefox:** neqo (via the `nss_rs` crate) calls freebl's
   `AES_CreateContext` and `AES_AEAD` directly, through function pointers, not
   through PK11 or any exported function. `FREEBL_GetVector` is exported and
@@ -405,9 +413,17 @@ signature finding against real binaries (see
 
 - **New programs after startup** are found through a `sched_process_exec`
   raw tracepoint (`WatchNewProcesses`) and inspected at 0, 50 ms, 500 ms and
-  3 s after the exec. TLS calls made before a new library is attached are
-  missed, and libraries a long-running process `dlopen`s more than 3 s after
-  its exec aren't picked up.
+  3 s after the exec. With `--comm` or `--pid` (`holdProcess` in `main.go`),
+  a selected process whose executable, root or library path is new is held
+  first: seized and interrupted with ptrace from a goroutine locked to its
+  thread (`seize`, `release`), so its parent doesn't see a stop, while
+  `Watcher.Root` (TLS libraries in its root's library directories) and
+  `Watcher.Needed` (its DT_NEEDED tree, resolved as ld.so would) are
+  attached to, for at most `maxHold`. A process snoopy is the parent of
+  can have the stop's notification taken by its own wait, so `seize` polls
+  and checks `/proc/<pid>/stat` too. Without those options, TLS calls made
+  before a new library is attached are missed, and so are those of
+  libraries a long-running process `dlopen`s more than 3 s after its exec.
 - **Not supported:** rustls under tokio with providers other than aws-lc-rs
   and ring (`Reader::read` is inlined into tokio-rustls), Java, QUIC/HTTP/3
   outside Chromium, Firefox, quinn, ngtcp2 and quic-go, Firefox's QUIC with ChaCha20-Poly1305

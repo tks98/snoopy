@@ -17,10 +17,11 @@ type JSON struct {
 	dec decoders
 }
 
-func NewJSON(w io.Writer) *JSON {
+// NewJSON returns a printer of NDJSON. Of opts, only Warn applies.
+func NewJSON(w io.Writer, opts Options) *JSON {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	return &JSON{enc: enc, dec: newDecoders()}
+	return &JSON{enc: enc, dec: newDecoders(opts.Warn)}
 }
 
 // jsonEvent is the documented JSON schema; see docs/usage.md.

@@ -248,8 +248,11 @@ In order of how much each removes.
    `freebl.go` to reading decoded fields instead of printed text.
 3. **Make the QUIC parser keep what it parsed** before an unknown frame,
    instead of dropping the whole packet.
-4. **Warn about the rest of the quiet failures.** snoopy now warns about
-   Firefox's QUIC connections from before it started. It could also say so
-   when a browser's connections keep showing stuck header blocks, or when it
-   attached to Firefox's freebl but captured nothing while Firefox used UDP
-   port 443.
+4. **Done: warnings for the quiet failures.** snoopy warns about Firefox's
+   QUIC connections from before it started; about a program whose UDP
+   traffic on port 443 had none of its QUIC packets captured, which is how a
+   browser's or library's changed QUIC path would show; about a tokio
+   program whose rustls provider isn't aws-lc-rs or ring, and a quic-go
+   program whose AEADs weren't found, when attaching; and about headers that
+   can't be decoded because their connection started before snoopy. The
+   maintenance guide's "Which part broke?" table lists them.

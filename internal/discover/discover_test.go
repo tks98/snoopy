@@ -613,3 +613,53 @@ func TestProcessFilesChroot(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+// A process that has only just started hasn't loaded its libraries; Needed
+// finds them as the loader will, here curl's libssl through libcurl.
+func TestNeeded(t *testing.T) {
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skip("no curl")
+	}
+	proc := t.TempDir()
+	dir := filepath.Join(proc, "7")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range map[string]string{"root": "/", "exe": curl} {
+		if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "environ"), []byte("HOME=/root\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := &Watcher{proc: proc, seen: map[fileID]bool{}, roots: map[fileID]bool{}}
+	var libs []string
+	for _, target := range w.Needed(7) {
+		libs = append(libs, filepath.Base(target.Path)+" "+target.Library.String())
+	}
+	if !slices.ContainsFunc(libs, func(l string) bool { return strings.HasPrefix(l, "libssl.so") && strings.HasSuffix(l, " openssl") }) {
+		t.Errorf("libssl not among %q", libs)
+	}
+	if w.Known(7) {
+		t.Error("its executable and root were never looked at, but Known says they were")
+	}
+}
+
+func TestRustInfoDescribe(t *testing.T) {
+	for _, c := range []struct {
+		ri          RustInfo
+		note, limit string
+	}{
+		{RustInfo{Seals: []uint64{1}, Opens: []uint64{2}, Tokio: true}, "records through aws-lc", ""},
+		{RustInfo{RingSeals: []uint64{1}, RingOpens: []uint64{2}, Tokio: true}, "records through ring", ""},
+		{RustInfo{Reads: []uint64{1}, Writes: []uint64{2}}, "", ""}, // synchronous, like ureq
+		{RustInfo{Reads: []uint64{1}, Writes: []uint64{2}, Tokio: true}, "", "only its writes are traced"},
+	} {
+		note, limits := c.ri.describe()
+		if note != c.note || !strings.Contains(limits, c.limit) || (c.limit == "") != (limits == "") {
+			t.Errorf("%+v: %q, %q", c.ri, note, limits)
+		}
+	}
+}
