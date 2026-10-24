@@ -38,7 +38,19 @@ const (
 	FuncNSSQUICRecv
 	FuncRecordSend
 	FuncRecordRecv
+	FuncRingSend
+	FuncRingRecv
+	FuncAwsLCQUICSend
+	FuncAwsLCQUICRecv
+	FuncRingQUICSend
+	FuncRingQUICRecv
 )
+
+// FuncQUICPacketSent isn't a call but a notice: a QUIC packet was sent from
+// a socket that isn't connected (quinn's), to Remote. Its QUICHeader is the
+// packet's header as sent, which tells its connection, and it has no data.
+// It's for following connections, not for showing.
+const FuncQUICPacketSent Function = fnQUICPacketSent
 
 var functionNames = map[Function]string{
 	FuncSSLRead:      "SSL_read",
@@ -67,6 +79,15 @@ var functionNames = map[Function]string{
 	FuncNSSQUICRecv:  "AES_AEAD (decrypt)",
 	FuncRecordSend:   "EVP_AEAD_CTX_seal (TLS)",
 	FuncRecordRecv:   "EVP_AEAD_CTX_open (TLS)",
+	FuncRingSend:     "ring::aead seal (TLS)",
+	FuncRingRecv:     "ring::aead open (TLS)",
+	// In Rust programs (quinn).
+	FuncAwsLCQUICSend: "EVP_AEAD_CTX_seal",
+	FuncAwsLCQUICRecv: "EVP_AEAD_CTX_open",
+	FuncRingQUICSend:  "ring::aead seal",
+	FuncRingQUICRecv:  "ring::aead open",
+
+	FuncQUICPacketSent: "QUIC packet sent",
 }
 
 func (f Function) String() string {
@@ -93,7 +114,8 @@ func (f Function) Library() discover.Library {
 		return discover.MbedTLS
 	case FuncS2NRecv, FuncS2NSend:
 		return discover.S2N
-	case FuncRustlsRead, FuncRustlsWrite, FuncRecordSend, FuncRecordRecv:
+	case FuncRustlsRead, FuncRustlsWrite, FuncRecordSend, FuncRecordRecv, FuncRingSend, FuncRingRecv,
+		FuncAwsLCQUICSend, FuncAwsLCQUICRecv, FuncRingQUICSend, FuncRingQUICRecv:
 		return discover.Rustls
 	}
 	return 0
@@ -102,7 +124,12 @@ func (f Function) Library() discover.Library {
 // IsQUIC reports whether the function's data is the frames of a QUIC packet
 // (HTTP/3), captured where the packet is encrypted or decrypted.
 func (f Function) IsQUIC() bool {
-	return f == FuncQUICSend || f == FuncQUICRecv || f == FuncNSSQUICSend || f == FuncNSSQUICRecv
+	switch f {
+	case FuncQUICSend, FuncQUICRecv, FuncNSSQUICSend, FuncNSSQUICRecv,
+		FuncAwsLCQUICSend, FuncAwsLCQUICRecv, FuncRingQUICSend, FuncRingQUICRecv:
+		return true
+	}
+	return false
 }
 
 // IsRecord reports whether the function's data is the plaintext of TLS
@@ -110,7 +137,7 @@ func (f Function) IsQUIC() bool {
 // a connection has its own encryption context, so the context, which is the
 // event's ConnID, differs between a connection's reads and writes.
 func (f Function) IsRecord() bool {
-	return f == FuncRecordSend || f == FuncRecordRecv
+	return f == FuncRecordSend || f == FuncRecordRecv || f == FuncRingSend || f == FuncRingRecv
 }
 
 // Direction is whether data was received or sent.
@@ -133,7 +160,7 @@ func (f Function) Direction() Direction {
 	switch f {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
 		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend,
-		FuncRecordSend:
+		FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend, FuncQUICPacketSent:
 		return Write
 	}
 	return Read
@@ -154,6 +181,9 @@ type Event struct {
 	// the captured bytes, which may be fewer (see Truncated).
 	Size uint32
 	Data []byte
+	// QUICHeader is a QUIC packet's header, up to its source connection ID
+	// if it has one, which tells connections sharing a socket apart.
+	QUICHeader []byte
 
 	// ReadError is set if the payload could not be copied from the process.
 	ReadError bool

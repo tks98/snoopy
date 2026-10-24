@@ -53,6 +53,9 @@ func (b *Brief) Hidden() int { return b.hidden }
 
 func (b *Brief) Print(ev *tracer.Event) error {
 	dc := b.dec.decode(ev)
+	if dc.notice {
+		return nil
+	}
 	if !b.opts.Verbose && dc.housekeeping() {
 		b.hidden++
 		return nil

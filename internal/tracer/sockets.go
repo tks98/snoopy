@@ -9,11 +9,20 @@ import (
 // call, saying which socket a connection uses.
 const fnSocketNotice = 0xff
 
+// fnQUICPacketSent is FN_QUIC_PACKET_SENT: another, saying where a QUIC
+// packet on a socket that isn't connected was sent. It's delivered as an
+// event of FuncQUICPacketSent.
+const fnQUICPacketSent = 0xfe
+
 // learnsSocketLater reports whether the function's data is encrypted before
 // the thread's next socket syscall shows which socket it goes out on, so a
 // connection's first write can't have one when it's emitted.
 func (f Function) learnsSocketLater() bool {
-	return f == FuncRustlsWrite || f == FuncQUICSend || f == FuncNSSQUICSend || f == FuncRecordSend
+	switch f {
+	case FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend, FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend:
+		return true
+	}
+	return false
 }
 
 // socketWaiter holds back events that went out without a socket until the

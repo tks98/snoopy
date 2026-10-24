@@ -38,20 +38,24 @@ type quicItem struct {
 // several encryption contexts over its life (one per encryption level, and a
 // new one at each key update), so the context identifies it only if the
 // socket isn't known. A connection can also move to a new socket (QUIC
-// connection migration), keeping its keys.
+// connection migration), keeping its keys. Connections sharing a socket are
+// told apart by their connection IDs (see cidConns).
 type quicConns struct {
 	dirs   map[quicKey]*quicDir // several keys share one after a migration
 	locals map[quicKey]netip.AddrPort
+	cids   *cidConns
 	clock  uint64
 	pool   *bodyPool
 }
 
 type quicKey struct {
 	pid  uint32
-	fd   int32
-	conn uint64 // the encryption context, if fd is -1
+	fd   int32  // -1 if unknown, cidFD for a connection known by its IDs
+	conn uint64 // the encryption context if fd is -1, the cidConn's id if cidFD
 	send bool
 }
+
+const cidFD = -2
 
 type quicDir struct {
 	streams  map[uint64]*quicStream
@@ -120,12 +124,22 @@ const (
 const migrationWindow = 10 * time.Second
 
 func newQUICConns(pool *bodyPool) *quicConns {
-	return &quicConns{dirs: map[quicKey]*quicDir{}, locals: map[quicKey]netip.AddrPort{}, pool: pool}
+	return &quicConns{dirs: map[quicKey]*quicDir{}, locals: map[quicKey]netip.AddrPort{}, cids: newCIDConns(), pool: pool}
 }
 
 // dir returns the state for an event's direction of its connection.
 func (c *quicConns) dir(key quicKey, ev *tracer.Event) *quicDir {
 	d := c.dirs[key]
+	if key.fd == cidFD {
+		if d == nil {
+			if len(c.dirs) >= maxQUICDirs {
+				c.evict()
+			}
+			d = newQUICDir(c.pool)
+			c.dirs[key] = d
+		}
+		return d
+	}
 	if l := c.locals[key]; d != nil && ev.Local.IsValid() && l.IsValid() && l != ev.Local {
 		d = nil // a new socket with a closed one's fd: a new connection
 	}
@@ -157,6 +171,10 @@ func (c *quicConns) dir(key quicKey, ev *tracer.Event) *quicDir {
 // doesn't parse as QUIC frames.
 func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 	key := quicKeyOf(ev)
+	cc := c.cids.of(ev)
+	if cc != nil {
+		key = quicKey{pid: ev.PID, fd: cidFD, conn: cc.id, send: key.send}
+	}
 	d := c.dir(key, ev)
 	c.clock++
 	d.lastUsed, d.lastCtx, d.lastTime = c.clock, ev.ConnID, ev.Time
@@ -173,9 +191,12 @@ func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 
 	// A decrypted packet's frames end exactly where it does, unless the
 	// capture was cut short; anything else isn't QUIC.
-	frames, streamData, err := parseQUICFrames(ev.Data)
+	frames, streamData, issued, err := parseQUICFrames(ev.Data)
 	if err != nil && !ev.Truncated() {
 		return nil, false
+	}
+	if cc != nil {
+		c.cids.learn(ev, cc, issued)
 	}
 	for _, f := range frames {
 		items = append(items, quicItem{Frame: f})
@@ -238,9 +259,10 @@ func quicVarint(b []byte) (uint64, int, bool) {
 var errQUICShort = errors.New("frame cut off")
 
 // parseQUICFrames parses a decrypted packet's frames (RFC 9000, section 19)
-// and returns a summary of each and the STREAM frames' data. Consecutive
-// PADDING frames are summarized once.
-func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, err error) {
+// and returns a summary of each, the STREAM frames' data and the connection
+// IDs issued in NEW_CONNECTION_ID frames. Consecutive PADDING frames are
+// summarized once.
+func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, issued [][]byte, err error) {
 	vars := func(n int) ([]uint64, bool) {
 		out := make([]uint64, n)
 		for i := range out {
@@ -263,7 +285,7 @@ func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, err e
 	for len(b) > 0 {
 		typ, n, ok := quicVarint(b)
 		if !ok {
-			return summaries, streams, errQUICShort
+			return summaries, streams, issued, errQUICShort
 		}
 		b = b[n:]
 		switch {
@@ -278,67 +300,67 @@ func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, err e
 		case typ == 0x02 || typ == 0x03: // ACK: largest, delay, range count, first range, ranges
 			v, ok := vars(4)
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			if _, ok := vars(2 * int(min(v[2], 1024))); !ok || v[2] > 1024 {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			if typ == 0x03 {
 				if _, ok := vars(3); !ok {
-					return summaries, streams, errQUICShort
+					return summaries, streams, issued, errQUICShort
 				}
 			}
 			summaries = append(summaries, fmt.Sprintf("ACK largest=%d", v[0]))
 		case typ == 0x04: // RESET_STREAM
 			v, ok := vars(3)
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, fmt.Sprintf("RESET_STREAM id=%d error=%#x", v[0], v[1]))
 		case typ == 0x05: // STOP_SENDING
 			v, ok := vars(2)
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, fmt.Sprintf("STOP_SENDING id=%d error=%#x", v[0], v[1]))
 		case typ == 0x06: // CRYPTO
 			v, ok := vars(2)
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			if _, ok := bytesN(v[1]); !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, fmt.Sprintf("CRYPTO off=%d len=%d", v[0], v[1]))
 		case typ == 0x07: // NEW_TOKEN
 			v, ok := vars(1)
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			if _, ok := bytesN(v[0]); !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, "NEW_TOKEN")
 		case typ >= 0x08 && typ <= 0x0f: // STREAM: id, [offset], [length], data
 			v, ok := vars(1)
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			sf := streamFrame{id: v[0], fin: typ&0x01 != 0}
 			if typ&0x04 != 0 {
 				off, ok := vars(1)
 				if !ok {
-					return summaries, streams, errQUICShort
+					return summaries, streams, issued, errQUICShort
 				}
 				sf.offset = off[0]
 			}
 			if typ&0x02 != 0 {
 				l, ok := vars(1)
 				if !ok {
-					return summaries, streams, errQUICShort
+					return summaries, streams, issued, errQUICShort
 				}
 				if sf.data, ok = bytesN(l[0]); !ok {
-					return summaries, streams, errQUICShort
+					return summaries, streams, issued, errQUICShort
 				}
 			} else {
 				sf.data, b = b, nil
@@ -357,27 +379,29 @@ func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, err e
 				args = 2
 			}
 			if _, ok := vars(args); !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, names[typ-0x10])
 		case typ == 0x18: // NEW_CONNECTION_ID: seq, retire prior to, length, id, reset token
 			if _, ok := vars(2); !ok || len(b) < 1 {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			l := uint64(b[0])
 			b = b[1:]
-			if _, ok := bytesN(l + 16); !ok {
-				return summaries, streams, errQUICShort
+			idAndToken, ok := bytesN(l + 16)
+			if !ok {
+				return summaries, streams, issued, errQUICShort
 			}
+			issued = append(issued, idAndToken[:l])
 			summaries = append(summaries, "NEW_CONNECTION_ID")
 		case typ == 0x19: // RETIRE_CONNECTION_ID
 			if _, ok := vars(1); !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, "RETIRE_CONNECTION_ID")
 		case typ == 0x1a || typ == 0x1b: // PATH_CHALLENGE, PATH_RESPONSE
 			if _, ok := bytesN(8); !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, map[uint64]string{0x1a: "PATH_CHALLENGE", 0x1b: "PATH_RESPONSE"}[typ])
 		case typ == 0x1c || typ == 0x1d: // CONNECTION_CLOSE: error, [frame type], reason
@@ -387,15 +411,15 @@ func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, err e
 			}
 			v, ok := vars(args)
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			l, ok := vars(1)
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			reason, ok := bytesN(l[0])
 			if !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, fmt.Sprintf("CONNECTION_CLOSE error=%#x %q", v[0], reason))
 		case typ == 0x1e:
@@ -404,10 +428,10 @@ func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, err e
 			if typ == 0x31 {
 				l, ok := vars(1)
 				if !ok {
-					return summaries, streams, errQUICShort
+					return summaries, streams, issued, errQUICShort
 				}
 				if _, ok := bytesN(l[0]); !ok {
-					return summaries, streams, errQUICShort
+					return summaries, streams, issued, errQUICShort
 				}
 			} else {
 				b = nil
@@ -415,16 +439,16 @@ func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, err e
 			summaries = append(summaries, "DATAGRAM")
 		case typ == 0xaf: // ACK_FREQUENCY (draft-ietf-quic-ack-frequency)
 			if _, ok := vars(4); !ok {
-				return summaries, streams, errQUICShort
+				return summaries, streams, issued, errQUICShort
 			}
 			summaries = append(summaries, "ACK_FREQUENCY")
 		case typ == 0x1f: // IMMEDIATE_ACK (same draft)
 			summaries = append(summaries, "IMMEDIATE_ACK")
 		default:
-			return summaries, streams, fmt.Errorf("unknown frame type %#x", typ)
+			return summaries, streams, issued, fmt.Errorf("unknown frame type %#x", typ)
 		}
 	}
-	return summaries, streams, nil
+	return summaries, streams, issued, nil
 }
 
 // streamData delivers a STREAM frame's data and returns the HTTP/3 frames it

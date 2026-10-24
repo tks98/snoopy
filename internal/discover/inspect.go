@@ -77,8 +77,11 @@ func Inspect(path string) ([]Target, error) {
 
 	if ri := inspectRustls(f); ri != nil {
 		t := Target{Path: path, Library: Rustls, Rust: ri}
-		if ri.AtRecords() {
+		switch {
+		case len(ri.Seals) > 0 && len(ri.Opens) > 0:
 			t.Note = "records through aws-lc"
+		case ri.AtRecords():
+			t.Note = "records through ring"
 		}
 		targets = append(targets, t)
 	}
@@ -441,7 +444,9 @@ func fileOffset(f *elf.File, addr uint64) (uint64, error) {
 // RustInfo locates rustls's plaintext in a Rust program. With rustls's
 // default crypto provider, aws-lc-rs, that's where aws-lc encrypts and
 // decrypts each record: its EVP_AEAD_CTX_seal and EVP_AEAD_CTX_open, C
-// functions whose names aws-lc-sys prefixes with its version. Otherwise it's
+// functions whose names aws-lc-sys prefixes with its version. With the ring
+// provider, it's ring's AES-GCM and ChaCha20-Poly1305 functions, which ring
+// calls through function pointers, so they're never inlined. Otherwise it's
 // the read method of rustls's Reader and the write method of its Writer,
 // mangled Rust symbols that async programs (tokio-rustls) inline away.
 // There may be several of each if more than one version is linked in.
@@ -450,19 +455,30 @@ type RustInfo struct {
 	Seals    []uint64 // file offsets of aws-lc's EVP_AEAD_CTX_seal
 	Scatters []uint64 // EVP_AEAD_CTX_seal_scatter, which it uses for TLS 1.2
 	Opens    []uint64 // and EVP_AEAD_CTX_open
-	Reads    []uint64 // file offsets of <rustls Reader as Read>::read
-	Writes   []uint64 // file offsets of <rustls Writer as Write>::write
+	// File offsets of ring's aes_gcm_seal and chacha20_poly1305_seal, and
+	// of their open functions.
+	RingSeals []uint64
+	RingOpens []uint64
+	Reads     []uint64 // file offsets of <rustls Reader as Read>::read
+	Writes    []uint64 // file offsets of <rustls Writer as Write>::write
 }
 
 // AtRecords reports whether the program's TLS is seen where its records
 // are encrypted and decrypted, rather than at rustls's Reader and Writer.
 func (ri *RustInfo) AtRecords() bool {
-	return len(ri.Seals) > 0 && len(ri.Opens) > 0
+	return len(ri.Seals) > 0 && len(ri.Opens) > 0 || len(ri.RingSeals) > 0 && len(ri.RingOpens) > 0
 }
 
 // awsLCAEAD matches aws-lc's AEAD functions as aws-lc-sys names them, e.g.
 // aws_lc_0_46_0_EVP_AEAD_CTX_open.
 var awsLCAEAD = regexp.MustCompile(`^aws_lc_[0-9_]+_EVP_AEAD_CTX_(seal|open|seal_scatter)$`)
+
+// ringAEAD matches ring's AEAD functions in either mangling (see below), e.g.
+//
+//	_RNvNtNtCs3UTaxMUTQMS_4ring4aead9algorithm12aes_gcm_seal
+//	_ZN4ring4aead9algorithm22chacha20_poly1305_open17h0123456789abcdefE
+var ringAEAD = regexp.MustCompile(`^_R.*4ring4aead9algorithm(12aes_gcm|22chacha20_poly1305)_(seal|open)$` +
+	`|^_ZN4ring4aead9algorithm(12aes_gcm|22chacha20_poly1305)_(seal|open)17h[0-9a-f]{16}E$`)
 
 // The symbols, in Rust's v0 mangling (the default since Rust 1.9x) and the
 // legacy one, e.g.
@@ -498,6 +514,11 @@ func inspectRustls(f *elf.File) *RustInfo {
 			default:
 				list = &ri.Opens
 			}
+		case strings.Contains(s.Name, "4ring4aead9algorithm") && ringAEAD.MatchString(s.Name):
+			list = &ri.RingSeals
+			if strings.Contains(s.Name, "_open") {
+				list = &ri.RingOpens
+			}
 		case !strings.Contains(s.Name, "rustls"):
 			continue
 		case rustlsRead.MatchString(s.Name):
@@ -514,7 +535,7 @@ func inspectRustls(f *elf.File) *RustInfo {
 	}
 	hasRustls = hasRustls || len(ri.Reads) > 0 || len(ri.Writes) > 0
 	if !hasRustls || !ri.AtRecords() && len(ri.Reads) == 0 && len(ri.Writes) == 0 {
-		return nil // aws-lc without rustls is another library's to trace
+		return nil // aws-lc or ring without rustls is another library's to trace
 	}
 	return &ri
 }

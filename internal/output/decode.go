@@ -54,6 +54,7 @@ func connOf(ev *tracer.Event) uint64 {
 
 // decoded is what an event's data was found to hold.
 type decoded struct {
+	notice  bool // a tracer.FuncQUICPacketSent, which isn't to be printed
 	isQUIC  bool
 	notQUIC bool       // a QUIC packet that doesn't parse as QUIC frames
 	quic    []quicItem // a QUIC packet's frames and the HTTP/3 they complete
@@ -64,6 +65,10 @@ type decoded struct {
 }
 
 func (d decoders) decode(ev *tracer.Event) decoded {
+	if ev.Function == tracer.FuncQUICPacketSent {
+		d.quic.sent(ev)
+		return decoded{notice: true}
+	}
 	if ev.Function.IsQUIC() {
 		items, ok := d.quic.process(ev)
 		return decoded{isQUIC: true, notQUIC: !ok, quic: items}

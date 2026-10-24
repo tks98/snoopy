@@ -23,7 +23,9 @@ type snoopyActiveCall struct {
 	Fd      int32
 	Fn      uint8
 	Ret     uint8
-	Pad     [2]uint8
+	AdLen   uint8
+	Pad     uint8
+	Ad      uint64
 }
 
 type snoopyAesCtxKey struct {
@@ -66,26 +68,28 @@ type snoopyDepthKey struct {
 }
 
 type snoopyEventHeader struct {
-	_           structs.HostLayout
-	TimestampNs uint64
-	LatencyNs   uint64
-	ConnId      uint64
-	Pid         uint32
-	Tid         uint32
-	Size        uint32
-	Captured    uint32
-	ChunkOffset uint32
-	ChunkLen    uint32
-	Fd          int32
-	Family      uint16
-	Lport       uint16
-	Rport       uint16
-	Fn          uint8
-	Flags       uint8
-	Laddr       [16]uint8
-	Raddr       [16]uint8
-	Comm        [16]int8
-	Pad         [4]uint8
+	_             structs.HostLayout
+	TimestampNs   uint64
+	LatencyNs     uint64
+	ConnId        uint64
+	Pid           uint32
+	Tid           uint32
+	Size          uint32
+	Captured      uint32
+	ChunkOffset   uint32
+	ChunkLen      uint32
+	Fd            int32
+	Family        uint16
+	Lport         uint16
+	Rport         uint16
+	Fn            uint8
+	Flags         uint8
+	Laddr         [16]uint8
+	Raddr         [16]uint8
+	QuicHeaderLen uint8
+	QuicHeader    [47]uint8
+	Comm          [16]int8
+	Pad           [4]uint8
 }
 
 type snoopyIoThread struct {
@@ -97,6 +101,11 @@ type snoopyIoThread struct {
 	DgramEnd   uint64
 }
 
+type snoopyQuicProc struct {
+	_          structs.HostLayout
+	LastRecvFd int32
+}
+
 type snoopyRecvBuf struct {
 	_    structs.HostLayout
 	File uint64
@@ -105,6 +114,12 @@ type snoopyRecvBuf struct {
 }
 
 type snoopyRecvBufKey struct {
+	_    structs.HostLayout
+	Tgid uint64
+	Buf  uint64
+}
+
+type snoopySealedKey struct {
 	_    structs.HostLayout
 	Tgid uint64
 	Buf  uint64
@@ -123,7 +138,9 @@ const (
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
 	snoopyMapIoThreads              = "io_threads"
+	snoopyMapQuicProcs              = "quic_procs"
 	snoopyMapRecvBufs               = "recv_bufs"
+	snoopyMapSealedPackets          = "sealed_packets"
 	snoopyMapTracedTgids            = "traced_tgids"
 	snoopyProgPR_ReadEnter          = "PR_Read_enter"
 	snoopyProgPR_RecvEnter          = "PR_Recv_enter"
@@ -144,6 +161,8 @@ const (
 	snoopyProgMbedtlsSslWriteEnter  = "mbedtls_ssl_write_enter"
 	snoopyProgQuicOpenEnter         = "quic_open_enter"
 	snoopyProgQuicSealEnter         = "quic_seal_enter"
+	snoopyProgRingOpenEnter         = "ring_open_enter"
+	snoopyProgRingSealEnter         = "ring_seal_enter"
 	snoopyProgRustlsReadEnter       = "rustls_read_enter"
 	snoopyProgRustlsWriteEnter      = "rustls_write_enter"
 	snoopyProgS2nRecvEnter          = "s2n_recv_enter"
@@ -226,6 +245,8 @@ type snoopyProgramSpecs struct {
 	MbedtlsSslWriteEnter  *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_write_enter"`
 	QuicOpenEnter         *ebpf.ProgramSpec `ebpf:"quic_open_enter"`
 	QuicSealEnter         *ebpf.ProgramSpec `ebpf:"quic_seal_enter"`
+	RingOpenEnter         *ebpf.ProgramSpec `ebpf:"ring_open_enter"`
+	RingSealEnter         *ebpf.ProgramSpec `ebpf:"ring_seal_enter"`
 	RustlsReadEnter       *ebpf.ProgramSpec `ebpf:"rustls_read_enter"`
 	RustlsWriteEnter      *ebpf.ProgramSpec `ebpf:"rustls_write_enter"`
 	S2nRecvEnter          *ebpf.ProgramSpec `ebpf:"s2n_recv_enter"`
@@ -245,17 +266,19 @@ type snoopyProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type snoopyMapSpecs struct {
-	ActiveCalls *ebpf.MapSpec `ebpf:"active_calls"`
-	AesCreating *ebpf.MapSpec `ebpf:"aes_creating"`
-	AesGcmCtxs  *ebpf.MapSpec `ebpf:"aes_gcm_ctxs"`
-	CallDepth   *ebpf.MapSpec `ebpf:"call_depth"`
-	ConnInfos   *ebpf.MapSpec `ebpf:"conn_infos"`
-	Counters    *ebpf.MapSpec `ebpf:"counters"`
-	Events      *ebpf.MapSpec `ebpf:"events"`
-	Execs       *ebpf.MapSpec `ebpf:"execs"`
-	IoThreads   *ebpf.MapSpec `ebpf:"io_threads"`
-	RecvBufs    *ebpf.MapSpec `ebpf:"recv_bufs"`
-	TracedTgids *ebpf.MapSpec `ebpf:"traced_tgids"`
+	ActiveCalls   *ebpf.MapSpec `ebpf:"active_calls"`
+	AesCreating   *ebpf.MapSpec `ebpf:"aes_creating"`
+	AesGcmCtxs    *ebpf.MapSpec `ebpf:"aes_gcm_ctxs"`
+	CallDepth     *ebpf.MapSpec `ebpf:"call_depth"`
+	ConnInfos     *ebpf.MapSpec `ebpf:"conn_infos"`
+	Counters      *ebpf.MapSpec `ebpf:"counters"`
+	Events        *ebpf.MapSpec `ebpf:"events"`
+	Execs         *ebpf.MapSpec `ebpf:"execs"`
+	IoThreads     *ebpf.MapSpec `ebpf:"io_threads"`
+	QuicProcs     *ebpf.MapSpec `ebpf:"quic_procs"`
+	RecvBufs      *ebpf.MapSpec `ebpf:"recv_bufs"`
+	SealedPackets *ebpf.MapSpec `ebpf:"sealed_packets"`
+	TracedTgids   *ebpf.MapSpec `ebpf:"traced_tgids"`
 }
 
 // snoopyVariableSpecs contains global variables before they are loaded into the kernel.
@@ -290,17 +313,19 @@ func (o *snoopyObjects) Close() error {
 //
 // It can be passed to loadSnoopyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type snoopyMaps struct {
-	ActiveCalls *ebpf.Map `ebpf:"active_calls"`
-	AesCreating *ebpf.Map `ebpf:"aes_creating"`
-	AesGcmCtxs  *ebpf.Map `ebpf:"aes_gcm_ctxs"`
-	CallDepth   *ebpf.Map `ebpf:"call_depth"`
-	ConnInfos   *ebpf.Map `ebpf:"conn_infos"`
-	Counters    *ebpf.Map `ebpf:"counters"`
-	Events      *ebpf.Map `ebpf:"events"`
-	Execs       *ebpf.Map `ebpf:"execs"`
-	IoThreads   *ebpf.Map `ebpf:"io_threads"`
-	RecvBufs    *ebpf.Map `ebpf:"recv_bufs"`
-	TracedTgids *ebpf.Map `ebpf:"traced_tgids"`
+	ActiveCalls   *ebpf.Map `ebpf:"active_calls"`
+	AesCreating   *ebpf.Map `ebpf:"aes_creating"`
+	AesGcmCtxs    *ebpf.Map `ebpf:"aes_gcm_ctxs"`
+	CallDepth     *ebpf.Map `ebpf:"call_depth"`
+	ConnInfos     *ebpf.Map `ebpf:"conn_infos"`
+	Counters      *ebpf.Map `ebpf:"counters"`
+	Events        *ebpf.Map `ebpf:"events"`
+	Execs         *ebpf.Map `ebpf:"execs"`
+	IoThreads     *ebpf.Map `ebpf:"io_threads"`
+	QuicProcs     *ebpf.Map `ebpf:"quic_procs"`
+	RecvBufs      *ebpf.Map `ebpf:"recv_bufs"`
+	SealedPackets *ebpf.Map `ebpf:"sealed_packets"`
+	TracedTgids   *ebpf.Map `ebpf:"traced_tgids"`
 }
 
 func (m *snoopyMaps) Close() error {
@@ -314,7 +339,9 @@ func (m *snoopyMaps) Close() error {
 		m.Events,
 		m.Execs,
 		m.IoThreads,
+		m.QuicProcs,
 		m.RecvBufs,
+		m.SealedPackets,
 		m.TracedTgids,
 	)
 }
@@ -354,6 +381,8 @@ type snoopyPrograms struct {
 	MbedtlsSslWriteEnter  *ebpf.Program `ebpf:"mbedtls_ssl_write_enter"`
 	QuicOpenEnter         *ebpf.Program `ebpf:"quic_open_enter"`
 	QuicSealEnter         *ebpf.Program `ebpf:"quic_seal_enter"`
+	RingOpenEnter         *ebpf.Program `ebpf:"ring_open_enter"`
+	RingSealEnter         *ebpf.Program `ebpf:"ring_seal_enter"`
 	RustlsReadEnter       *ebpf.Program `ebpf:"rustls_read_enter"`
 	RustlsWriteEnter      *ebpf.Program `ebpf:"rustls_write_enter"`
 	S2nRecvEnter          *ebpf.Program `ebpf:"s2n_recv_enter"`
@@ -390,6 +419,8 @@ func (p *snoopyPrograms) Close() error {
 		p.MbedtlsSslWriteEnter,
 		p.QuicOpenEnter,
 		p.QuicSealEnter,
+		p.RingOpenEnter,
+		p.RingSealEnter,
 		p.RustlsReadEnter,
 		p.RustlsWriteEnter,
 		p.S2nRecvEnter,

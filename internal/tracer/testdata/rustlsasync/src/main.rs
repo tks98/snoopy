@@ -1,15 +1,16 @@
 // rustls client on tokio for the integration tests, with rustls's default
-// crypto provider (aws-lc-rs):
-//   rustlsasync <port> <path> [tls12]
-// sends a GET for <path> to 127.0.0.1:<port> over TLS 1.3, or TLS 1.2,
-// accepting any certificate, and prints the response.
+// crypto provider (aws-lc-rs) or, built with the ring feature, ring:
+//   rustlsasync <port> <path> [tls12] [chacha]
+// sends a GET for <path> to 127.0.0.1:<port> over TLS 1.3, or TLS 1.2, with
+// AES-GCM or ChaCha20-Poly1305, accepting any certificate, and prints the
+// response.
 
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::{CipherSuite, DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug)]
@@ -54,11 +55,26 @@ impl ServerCertVerifier for AcceptAny {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: rustlsasync <port> <path> [tls12]");
+        eprintln!("usage: rustlsasync <port> <path> [tls12] [chacha]");
         std::process::exit(2);
     }
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let versions: &[&rustls::SupportedProtocolVersion] = if args.get(3).map(String::as_str) == Some("tls12") {
+    let options = &args[3..];
+    #[cfg(feature = "ring")]
+    let mut provider = rustls::crypto::ring::default_provider();
+    #[cfg(not(feature = "ring"))]
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    let chacha = options.iter().any(|o| o == "chacha");
+    provider.cipher_suites.retain(|s| {
+        let is_chacha = matches!(
+            s.suite(),
+            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+                | CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+                | CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+        );
+        is_chacha == chacha
+    });
+    let provider = Arc::new(provider);
+    let versions: &[&rustls::SupportedProtocolVersion] = if options.iter().any(|o| o == "tls12") {
         &[&rustls::version::TLS12]
     } else {
         &[&rustls::version::TLS13]

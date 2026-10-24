@@ -1,0 +1,26 @@
+[package]
+name = "quinnh3"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# HTTP/3 over quinn and h3 on tokio, with rustls's aws-lc-rs provider or,
+# with --no-default-features --features ring, ring. The QUIC packets' frames
+# are seen where the provider encrypts and decrypts them.
+[features]
+default = ["aws-lc"]
+aws-lc = ["rustls/aws_lc_rs", "quinn/rustls-aws-lc-rs", "rcgen/aws_lc_rs"]
+ring = ["rustls/ring", "quinn/rustls-ring", "rcgen/ring"]
+
+[dependencies]
+bytes = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "logging"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[profile.release]
+debug = false

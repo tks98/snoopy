@@ -329,7 +329,8 @@ func (t *Tracer) Attach(target discover.Target) ([]string, error) {
 }
 
 // attachRustls attaches to rustls's Reader::read and Writer::write, found by
-// their mangled names, at their file offsets.
+// their mangled names, at their file offsets, or to where its crypto
+// provider encrypts and decrypts records.
 func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]string, error) {
 	if ri == nil {
 		return nil, errors.New("missing rustls function information")
@@ -351,6 +352,8 @@ func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo) ([]str
 			{"EVP_AEAD_CTX_seal", ri.Seals, t.objs.AeadSealEnter, true},
 			{"EVP_AEAD_CTX_seal_scatter", ri.Scatters, t.objs.AeadSealScatterEnter, true},
 			{"EVP_AEAD_CTX_open", ri.Opens, t.objs.AeadOpenEnter, false},
+			{"ring::aead seal", ri.RingSeals, t.objs.RingSealEnter, true},
+			{"ring::aead open", ri.RingOpens, t.objs.RingOpenEnter, false},
 		}
 	}
 	var attached []string
@@ -566,6 +569,10 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 				for _, ev := range sockets.notice(c) {
 					release(ev)
 				}
+				break
+			}
+			if c.Fn == fnQUICPacketSent {
+				release(asm.newEvent(c))
 				break
 			}
 			for _, ev := range asm.add(c, now) {

@@ -109,20 +109,40 @@ thing it depends on ships.
   naming its C functions `aws_lc_<version>_EVP_AEAD_CTX_seal` and so on, and
   aws-lc-rs calling `seal` for TLS 1.3, `seal_scatter` for TLS 1.2 and
   `open` for both, without one of them calling another's exported symbol.
-  With ring: the mangled names of `Reader::read` and `Writer::write`, and
+  With ring: the mangled names of `ring::aead::algorithm::aes_gcm_seal` and
+  the like, ring calling them through function pointers (so they aren't
+  inlined), and their arguments' places, which depend on Rust returning
+  their `Result<Tag, Unspecified>` through a hidden pointer. With other
+  providers: the mangled names of `Reader::read` and `Writer::write`, and
   Rust returning `io::Result<usize>` in two registers.
 - **Breaks when:** aws-lc-sys changes its prefix, or aws-lc-rs moves to other
-  AEAD functions; rustls moves `Reader` and `Writer`, or rustc changes how it
+  AEAD functions; ring renames or reorganizes `aead::algorithm` (ring 0.18,
+  or changing those functions' arguments); rustls moves `Reader` and `Writer`, or rustc changes how it
   returns that `Result`. Rust's ABI is explicitly unstable.
 - **How it shows:** renamed symbols mean nothing attaches, which is loud,
-  except that a program with rustls but no aws-lc functions found falls back
-  to the reader and writer, so under tokio only its writes show. Another
+  except that a program with rustls but neither provider's functions found
+  falls back to the reader and writer, so under tokio only its writes show.
+  Moved arguments in ring's functions mean garbage or nothing, quietly. Another
   AEAD function for one TLS version loses that direction's data quietly, as
   TLS 1.2's requests were before `seal_scatter` was probed. A changed return
   layout means wrong lengths or no data, which is quiet.
 - **Already seen:** under tokio, `Reader::read` is inlined and writes are
   vectored, so async programs weren't covered until records were read at
   aws-lc. aws-lc-rs seals TLS 1.2 records with `seal_scatter`, not `seal`.
+
+### HTTP/3 over quinn
+
+- **Depends on:** what rustls's records depend on (above), and quinn
+  encrypting each packet in the buffer it's then sent from, starting with
+  its header, with `sendmsg` or `sendto` to an address; packets' connection
+  IDs not being zero-length.
+- **Breaks when:** quinn copies packets into another buffer before sending
+  them, or connects its socket (which would be fine: the kernel would know
+  the peer).
+- **How it shows:** responses show "peer" for the remote address, and
+  connections sharing a socket may be decoded mixed together, quietly.
+- **Guarded by:** `TestQuinnHTTP3` (`SNOOPY_TEST_RUSTLS=1`), two
+  connections over one socket with each provider.
 - **Guarded by:** `TestRustls` and `TestRustlsAsync` (TLS 1.3 and 1.2), only
   with `SNOOPY_TEST_RUSTLS=1`, and `TestRustlsSymbols` and
   `TestAwsLCSymbols`.
