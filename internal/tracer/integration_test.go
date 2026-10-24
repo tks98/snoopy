@@ -1095,6 +1095,46 @@ func TestQuicGoHTTP3(t *testing.T) {
 	}
 }
 
+// UDP traffic on port 443, HTTP/3's, is counted per process, for main to
+// warn when none of a program's QUIC packets were captured.
+func TestQUICTraffic(t *testing.T) {
+	requireRoot(t)
+	python := requireTool(t, "python3")
+	tr, err := New(Options{Comm: "python3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.ResolvesAddresses() {
+		t.Skip("needs BTF")
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tr.Close() })
+	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+	if err != nil {
+		t.Skipf("listen on UDP port 443: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	script := `import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("127.0.0.1", 443))
+for _ in range(40):
+    s.send(b"\xc0 not really QUIC")
+`
+	cmd := exec.Command(python, "-c", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("python: %v: %s", err, out)
+	}
+	traffic, err := tr.QUICTraffic()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := traffic[uint32(cmd.Process.Pid)]; got.UDP443 < 32 || got.Untracked != 0 {
+		t.Errorf("python's traffic: %+v", got)
+	}
+}
+
 // quinnServer starts the quinn test program as an HTTP/3 server, under
 // another name than the client's, and returns its port on 127.0.0.1.
 func quinnServer(t *testing.T, program string) string {

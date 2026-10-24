@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -337,7 +338,8 @@ func run(cfg config) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go watchCounters(ctx, t)
+	quic := &quicSeen{pids: map[uint32]bool{}}
+	go watchCounters(ctx, t, quic)
 	if cfg.pid != 0 && !t.ResolvesAddresses() {
 		// Without BTF, the BPF program can't tell a process's parents, so
 		// processes that fork without executing a program are found here.
@@ -348,6 +350,9 @@ func run(cfg config) error {
 	calls := 0
 	logf("tracing; press Ctrl-C to stop")
 	err = t.Run(ctx, func(ev *tracer.Event) {
+		if ev.Function.IsQUIC() {
+			quic.add(ev.PID) // before any filter, so its HTTP/3 isn't taken for uncaptured
+		}
 		ev.ContainerID = resolver.ContainerID(ev.PID)
 		if cfg.container != "" && !strings.HasPrefix(ev.ContainerID, cfg.container) {
 			return
@@ -525,6 +530,20 @@ func acceptProcess(cfg config, t *tracer.Tracer) func(pid int) bool {
 	}
 }
 
+// warnOnce returns a func that logs each warning it's given once.
+func warnOnce() func(string) {
+	var mu sync.Mutex
+	said := map[string]bool{}
+	return func(msg string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !said[msg] {
+			said[msg] = true
+			logf("warning: %s", msg)
+		}
+	}
+}
+
 // holdProcess says which new processes to hold until their files are
 // attached to, so that a short-lived one's TLS isn't missed: with --comm or
 // --pid, the ones asked for. Without either, every program's first run on
@@ -593,13 +612,14 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 	}
 
 	if !cfg.quiet && !stdoutUsed {
+		warn := warnOnce()
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(os.Stdout))
+			printers = append(printers, output.NewJSON(os.Stdout, output.Options{Warn: warn}))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(os.Stdout, output.Options{Verbose: cfg.verbose}))
+			printers = append(printers, output.NewBrief(os.Stdout, output.Options{Verbose: cfg.verbose, Warn: warn}))
 		default:
-			printers = append(printers, output.NewText(os.Stdout, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose}))
+			printers = append(printers, output.NewText(os.Stdout, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Warn: warn}))
 		}
 	}
 
@@ -615,16 +635,57 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 // watchCounters warns about what the BPF program counts going missing: data
 // dropped because the ring buffer was full, and QUIC packets of connections
 // that started before snoopy and can't be followed (Firefox's).
-func watchCounters(ctx context.Context, t *tracer.Tracer) {
+// quicSeen is the processes snoopy captured QUIC packets from.
+type quicSeen struct {
+	mu   sync.Mutex
+	pids map[uint32]bool
+}
+
+func (q *quicSeen) add(pid uint32) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pids[pid] = true
+}
+
+func (q *quicSeen) has(pid uint32) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.pids[pid]
+}
+
+// minUDP443 is how many datagrams on UDP port 443 a process has to send or
+// receive, with none of its QUIC packets captured, to be warned about.
+const minUDP443 = 32
+
+func watchCounters(ctx context.Context, t *tracer.Tracer, quic *quicSeen) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	var reported uint64
 	quicWarned := false
+	// HTTP/3 traffic of which nothing was captured: a QUIC library snoopy
+	// doesn't support, or one that changed. Captured packets are delivered
+	// a little behind the traffic, so a process is warned about only once
+	// it has had enough traffic and no packets for a whole tick.
+	noQUICPending, noQUICWarned := map[uint32]bool{}, map[uint32]bool{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			traffic, _ := t.QUICTraffic()
+			for pid, qt := range traffic {
+				if qt.UDP443 < minUDP443 || qt.Untracked > 0 || noQUICWarned[pid] || quic.has(pid) {
+					continue
+				}
+				if !noQUICPending[pid] {
+					noQUICPending[pid] = true
+					continue
+				}
+				noQUICWarned[pid] = true
+				comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+				logf("warning: %s (pid %d) sends or receives on UDP port 443, HTTP/3's, but none of its QUIC packets were captured: its QUIC library isn't supported, or has changed (see docs/maintenance.md)",
+					strings.TrimSpace(string(comm)), pid)
+			}
 			lost, err := t.LostEvents()
 			if err == nil && lost > reported {
 				logf("warning: %d chunks dropped so far because the ring buffer was full", lost)

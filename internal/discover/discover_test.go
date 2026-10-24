@@ -646,3 +646,20 @@ func TestNeeded(t *testing.T) {
 		t.Error("its executable and root were never looked at, but Known says they were")
 	}
 }
+
+func TestRustInfoDescribe(t *testing.T) {
+	for _, c := range []struct {
+		ri          RustInfo
+		note, limit string
+	}{
+		{RustInfo{Seals: []uint64{1}, Opens: []uint64{2}, Tokio: true}, "records through aws-lc", ""},
+		{RustInfo{RingSeals: []uint64{1}, RingOpens: []uint64{2}, Tokio: true}, "records through ring", ""},
+		{RustInfo{Reads: []uint64{1}, Writes: []uint64{2}}, "", ""}, // synchronous, like ureq
+		{RustInfo{Reads: []uint64{1}, Writes: []uint64{2}, Tokio: true}, "", "only its writes are traced"},
+	} {
+		note, limits := c.ri.describe()
+		if note != c.note || !strings.Contains(limits, c.limit) || (c.limit == "") != (limits == "") {
+			t.Errorf("%+v: %q, %q", c.ri, note, limits)
+		}
+	}
+}

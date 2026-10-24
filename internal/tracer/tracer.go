@@ -738,6 +738,27 @@ func (t *Tracer) UntrackedQUIC() (uint64, error) {
 	return t.counter(1) // COUNTER_UNTRACKED_QUIC
 }
 
+// QUICTraffic is what the BPF program saw of a process's HTTP/3: datagrams
+// it sent or received on UDP sockets connected to port 443 (counted up to
+// 64), and QUIC packets of its that couldn't be traced because their
+// encryption context was created before snoopy started.
+type QUICTraffic struct {
+	UDP443, Untracked uint32
+}
+
+// QUICTraffic returns each traced process's QUICTraffic, by PID. It needs
+// BTF to tell UDP sockets and their ports; without it, there's none.
+func (t *Tracer) QUICTraffic() (map[uint32]QUICTraffic, error) {
+	out := map[uint32]QUICTraffic{}
+	var pid uint32
+	var qt QUICTraffic
+	it := t.objs.QuicTraffic.Iterate()
+	for it.Next(&pid, &qt) {
+		out[pid] = qt
+	}
+	return out, it.Err()
+}
+
 func (t *Tracer) counter(index uint32) (uint64, error) {
 	var perCPU []uint64
 	if err := t.objs.Counters.Lookup(index, &perCPU); err != nil {

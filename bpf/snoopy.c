@@ -785,6 +785,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 	 (id) == 47 ? RECV_MSG : (id) == 299 ? RECV_MMSG : 0)
 #define IS_SENDTO(id) ((id) == 44)
 #define IS_SENDMSG(id) ((id) == 46 || (id) == 307)
+#define IS_DATAGRAM_IO(id) ((id) >= 44 && (id) <= 47 || (id) == 299 || (id) == 307)
 #elif defined(__TARGET_ARCH_arm64)
 #define SYSCALL_FD(regs) ((regs)->orig_x0)
 #define SYSCALL_ARG1(regs) ((regs)->user_regs.regs[1])
@@ -801,6 +802,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 	 (id) == 212 ? RECV_MSG : (id) == 243 ? RECV_MMSG : 0)
 #define IS_SENDTO(id) ((id) == 206)
 #define IS_SENDMSG(id) ((id) == 211 || (id) == 269)
+#define IS_DATAGRAM_IO(id) ((id) == 206 || (id) == 207 || (id) == 211 || (id) == 212 || (id) == 243 || (id) == 269)
 #endif
 
 // Tells user space that a connection has a socket now: its writes are
@@ -1050,6 +1052,50 @@ static __always_inline void note_packet_send(__u64 pid_tgid, __s32 fd, long id, 
 		emit_socket_notice(pid_tgid, conn);
 }
 
+// Per traced process: how many datagrams it sent or received on UDP sockets
+// connected to port 443, HTTP/3's, up to QUIC_TRAFFIC_MAX, and how many
+// QUIC packets it decrypted that couldn't be traced (Firefox's, from before
+// snoopy). User space compares the first with the QUIC packets captured, to
+// warn when a program's HTTP/3 isn't: its QUIC library isn't supported, or
+// has changed.
+struct quic_traffic {
+	__u32 udp443;
+	__u32 untracked;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32); // tgid
+	__type(value, struct quic_traffic);
+} quic_traffic SEC(".maps");
+
+#define QUIC_TRAFFIC_MAX 64
+#define SOCK_DGRAM 2
+#define HTTPS_PORT_BE 0xbb01 // 443, in network byte order
+
+static __always_inline void note_udp443(__u64 pid_tgid, __s32 fd, long id)
+{
+	if (!have_btf || !IS_DATAGRAM_IO(id))
+		return;
+	__u32 tgid = pid_tgid >> 32;
+	struct quic_traffic *qt = bpf_map_lookup_elem(&quic_traffic, &tgid);
+	if (qt && qt->udp443 >= QUIC_TRAFFIC_MAX)
+		return;
+	struct file *file = socket_file(fd);
+	if (!file)
+		return;
+	struct socket *sock = BPF_CORE_READ(file, private_data);
+	if (BPF_CORE_READ(sock, type) != SOCK_DGRAM || BPF_CORE_READ(sock, sk, __sk_common.skc_dport) != HTTPS_PORT_BE)
+		return;
+	if (qt) {
+		__sync_fetch_and_add(&qt->udp443, 1);
+		return;
+	}
+	struct quic_traffic fresh = {.udp443 = 1};
+	bpf_map_update_elem(&quic_traffic, &tgid, &fresh, BPF_NOEXIST);
+}
+
 // For processes in quic_procs: their last receive's socket, and the sockets
 // and peers of their QUIC packets' sends.
 static __always_inline void note_quic_proc_io(__s32 fd, long id, struct pt_regs *regs)
@@ -1123,6 +1169,9 @@ int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	note_thread_fd(fd, id, regs);
 	note_quic_proc_io((__s32)fd, id, regs);
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (should_trace(pid_tgid))
+		note_udp443(pid_tgid, (__s32)fd, id);
 	return record_fd(fd);
 }
 
@@ -1722,6 +1771,14 @@ int aes_aead_enter(struct pt_regs *ctx)
 	__u8 *encrypt = bpf_map_lookup_elem(&aes_gcm_ctxs, &key);
 	if (!encrypt) { // created before snoopy started: direction unknown
 		count(COUNTER_UNTRACKED_QUIC);
+		__u32 tgid = pid_tgid >> 32;
+		struct quic_traffic *qt = bpf_map_lookup_elem(&quic_traffic, &tgid);
+		if (qt)
+			__sync_fetch_and_add(&qt->untracked, 1);
+		else {
+			struct quic_traffic fresh = {.untracked = 1};
+			bpf_map_update_elem(&quic_traffic, &tgid, &fresh, BPF_NOEXIST);
+		}
 		return 0;
 	}
 	struct io_thread *rt = io_thread(pid_tgid);
