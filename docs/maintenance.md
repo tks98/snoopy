@@ -265,6 +265,19 @@ docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src ubuntu:24.04 bash 
 vimto needs the checkout to be a git repository; a git worktree's `.git` file
 points outside the mount, so copy the tree and `git init` it first.
 
+On an arm64 Linux machine (or VM), vimto runs arm64 kernels natively, with
+`qemu-system-aarch64`, but without KVM a VM in a VM is slow, and two things
+don't work there: vimto's 5.10 runs fail on an overlayfs xattr ("set opaque
+xattr: operation not supported"), and `TestHoldNewProcess` times out on
+every kernel (v2.5.0's too), since inspecting the private libssl takes
+longer than the 2 s hold under emulation. Every other test should pass.
+
+For what the verifier of each kernel accepts, `tools/loadcheck/run.sh`
+loads every BPF program in default, `--pid` and `--comm` modes under each
+kernel vimto has downloaded, booting it in QEMU with a small init. It's
+quicker than the tests, and covers 5.10. Run the tests once per kernel
+first, so vimto has the images.
+
 ## Chrome, Electron and other Chromium builds
 
 ### How it was found
