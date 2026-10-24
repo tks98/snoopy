@@ -55,6 +55,35 @@ func TestParseFlags(t *testing.T) {
 	}
 }
 
+// --container takes IDs and prefixes, named or not, repeated or
+// comma-separated, and Kubernetes' runtime://ID form.
+func TestContainers(t *testing.T) {
+	c, err := parseFlags([]string{"--container", "containerd://3F2A=shop/checkout/app,9b1c", "--container", "77=db"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := containerList{{"3f2a", "shop/checkout/app"}, {"9b1c", ""}, {"77", "db"}}
+	if !reflect.DeepEqual(c.containers, want) {
+		t.Fatalf("got %+v, want %+v", c.containers, want)
+	}
+	for id, wantName := range map[string]string{"3f2a00": "shop/checkout/app", "9b1cff": "", "7788": "db"} {
+		if name, ok := c.containers.match(id); !ok || name != wantName {
+			t.Errorf("%s: %q, %v", id, name, ok)
+		}
+	}
+	for _, id := range []string{"abcd", ""} {
+		if _, ok := c.containers.match(id); ok {
+			t.Errorf("%q matched", id)
+		}
+	}
+	if _, ok := (containerList{}).match(""); !ok {
+		t.Error("with no --container, a process outside containers didn't match")
+	}
+	if _, err := parseFlags([]string{"--container", "=name"}, io.Discard); err == nil {
+		t.Error("an empty ID was accepted")
+	}
+}
+
 // Each flag is in the help text, which is written by hand.
 func TestUsage(t *testing.T) {
 	var help strings.Builder

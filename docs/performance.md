@@ -92,11 +92,11 @@ The BPF programs' own time per call, for nginx at 1 KiB traced: 180 to
   traced call cost about 6 µs: most of `tls_return`'s 2 µs was waking
   snoopy's reader after every record, which 2.6 does at most once a
   millisecond per CPU.
-- **With `--comm` or `--pid`, programs snoopy isn't tracing pay nothing for
+- **With `--comm`, `--pid` or `--container`, programs snoopy isn't tracing pay nothing for
   its probes:** they're attached to the selected processes only, with the
   kernel's PID filter (this needs kernel BTF). nginx untraced cost 12.5 µs
   per request against 11.4 without snoopy, the rest being the syscall hook
-  below. Without them, or with `--container` alone, the probes are on the
+  below. Without them, the probes are on the
   library's file, so every process using it traps on them, and only then
   does snoopy's BPF program see that it isn't one to trace: about 3 µs per
   call (nginx untraced before 2.6, 20.2 µs per request), and about 7 µs on

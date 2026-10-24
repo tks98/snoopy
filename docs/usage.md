@@ -29,7 +29,9 @@ Which processes:
   --pid PID          only this process and those it starts
   --comm NAME        only processes whose name starts with NAME, as in
                      /proc/<pid>/comm (curl, firefox, chrome)
-  --container ID     only processes in the container with this ID, or ID prefix
+  --container ID     only processes in the container with this ID, or ID
+                     prefix; repeatable, or comma-separated. ID=NAME shows
+                     NAME for the container's events
 
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
@@ -157,9 +159,9 @@ are loaded after the `exec`. TLS calls a new program makes before then are
 missed, unless it uses a library snoopy was already attached to, such as the
 system `libssl`.
 
-With `--comm` or `--pid`, snoopy attaches its probes to the processes they
-select rather than to the files, so other programs using the same library
-don't pay for them (see [Overhead](#overhead)). Each new process they select
+With `--comm`, `--pid` or `--container`, snoopy attaches its probes to the
+processes they select rather than to the files, so other programs using the
+same library don't pay for them (see [Overhead](#overhead)). Each new process they select
 is held at its `exec`, or when it's forked, until snoopy has attached to it
 and to the TLS libraries it's about to load, for at most 2 s, so a
 short-lived one's first request isn't missed. It's held with ptrace, which
@@ -168,8 +170,8 @@ that's already being traced (by a debugger or strace) can't be held, so its
 first calls can be missed, and so can a forked one's, in the moment before
 it's held. Without kernel BTF the probes stay on the files, and only a new
 process whose program, root filesystem (a container's or chroot's) or
-library path snoopy hasn't seen before is held. Without `--comm` or `--pid`
-the probes are on the files and nothing is held, since every program's
+library path snoopy hasn't seen before is held. Without `--comm`, `--pid`
+or `--container` the probes are on the files and nothing is held, since every program's
 first run would be.
 
 `--pid` follows the processes the given one starts, which matters for
@@ -215,6 +217,7 @@ Each line is one call to a TLS read or write function:
 | `direction` | `read` (received from the peer) or `write` (sent to it). |
 | `process_name`, `pid`, `tid` | The calling process and thread. |
 | `container_id` | The container the process runs in, if any. |
+| `container_name` | The name `--container ID=NAME` gave that container, if any. |
 | `conn_id` | The library's handle for the connection (`SSL*`, `gnutls_session_t`, `PRFileDesc*`, `WOLFSSL*`, `mbedtls_ssl_context*`, `struct s2n_connection*` or `*tls.Conn`). Stays the same for the lifetime of a connection; a library may reuse it for a later connection. For QUIC packets it is the encryption context, of which a connection uses several. |
 | `fd`, `local_addr`, `remote_addr` | The socket, if known. |
 | `latency_ns` | Time spent inside the call. |
@@ -246,13 +249,19 @@ In a container, snoopy finds the host's TLS libraries through
 `/proc/1/root`, and other containers' through their processes, so it traces
 programs on the host and in containers alike.
 
+`--container` takes a container's ID or a prefix of it (`docker ps` shows
+12 digits), and can be repeated. `--container ID=NAME` shows NAME for that
+container's events: after `container` in text, before the process in
+`--brief`, and as `container_name` in JSON. Kubernetes' form,
+`containerd://<id>`, is accepted as it is.
+
 On Kubernetes, that's a pod with `hostPID: true` and a privileged container,
 on the node to trace.
 
 ## Overhead
 
 Each traced TLS call costs the calling program a few microseconds. Without
-`--comm` or `--pid`, other programs using a library snoopy is attached to
+`--comm`, `--pid` or `--container`, other programs using a library snoopy is attached to
 (the system's OpenSSL) pay for its probes too, a few microseconds per call,
 because they're on the library's file; with them, only the processes
 selected do. Text output keeps up with tens of thousands of calls

@@ -52,12 +52,14 @@ type Options struct {
 	// RingBufferSize is the size of the kernel-to-user buffer in bytes; a
 	// power of two. Zero means 16 MiB.
 	RingBufferSize int
-	// PerProcess, with PID or Comm, attaches probes to the processes those
-	// select rather than to files, with the kernel's PID filter: then other
-	// programs using the same library don't trap on them. Each new process
-	// needs its own, attached to by WatchNewProcesses (forks too), so its
-	// first calls can be missed. It needs BTF, to tell forks from threads;
-	// without, probes are per file.
+	// PerProcess attaches probes to the processes the caller attaches for
+	// (Attach's pid) rather than to files, with the kernel's PID filter:
+	// then other programs using the same library don't trap on them. It's
+	// for when only some processes are traced (PID, Comm, or a container
+	// the caller filters on). Each new process needs its own, attached to
+	// by WatchNewProcesses (forks too), so its first calls can be missed.
+	// It needs BTF, to tell forks from threads; without, probes are per
+	// file.
 	PerProcess bool
 
 	// ignoreKernelBTF loads the program as if the kernel had no BTF (tests).
@@ -155,7 +157,7 @@ func New(opts Options) (*Tracer, error) {
 
 	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{},
 		procs: map[int]*procLinks{}, everyone: map[procFile]bool{}}
-	t.perProcess = opts.PerProcess && t.haveBTF && (opts.PID != 0 || opts.Comm != "")
+	t.perProcess = opts.PerProcess && t.haveBTF
 	if err := spec.LoadAndAssign(&t.objs, &loadOpts); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {

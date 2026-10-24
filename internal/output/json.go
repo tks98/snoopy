@@ -34,6 +34,7 @@ type jsonEvent struct {
 	PID         uint32    `json:"pid"`
 	TID         uint32    `json:"tid"`
 	ContainerID string    `json:"container_id,omitempty"`
+	Container   string    `json:"container_name,omitempty"`
 	ConnID      string    `json:"conn_id"`
 	FD          *int32    `json:"fd,omitempty"`
 	LocalAddr   string    `json:"local_addr,omitempty"`
@@ -136,6 +137,7 @@ func (j *JSON) Print(ev *tracer.Event) error {
 		PID:         ev.PID,
 		TID:         ev.TID,
 		ContainerID: ev.ContainerID,
+		Container:   ev.ContainerName,
 		ConnID:      fmt.Sprintf("%#x", ev.ConnID),
 		LatencyNs:   ev.Latency.Nanoseconds(),
 		Size:        ev.Size,

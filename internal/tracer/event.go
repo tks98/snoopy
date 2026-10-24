@@ -204,9 +204,10 @@ type Event struct {
 	Incomplete bool
 
 	// Filled in by enrichment, if available.
-	ContainerID string
-	Local       netip.AddrPort
-	Remote      netip.AddrPort
+	ContainerID   string
+	ContainerName string // the name it was given (--container ID=NAME)
+	Local         netip.AddrPort
+	Remote        netip.AddrPort
 }
 
 // Truncated reports whether fewer bytes were captured than transferred.
