@@ -140,6 +140,8 @@ measure() {
 		if [ -n "$sn" ]; then
 			snoopycpu=$(awk -v a="$before" -v b="$(cpu $sn)" -v t=$((runs * secs)) 'BEGIN { printf "%.0f%%", (b - a) / t * 100 }')
 			$stats && progstats $sn > "$tmp/stats.after"
+			# Why, if there are none, for machines that differ.
+			local nostats="$(grep -ls '^prog_id' /proc/$sn/fdinfo/* 2>/dev/null | wc -l) program fds, bpftool says: $(bpftool prog show 2>&1 | head -1)"
 			kill -INT $sn
 			wait $sn 2>/dev/null || true
 			# Chunks the ring buffer had no room for, which snoopy warns about.
@@ -155,6 +157,7 @@ measure() {
 			join <(sort "$tmp/stats.before") <(sort "$tmp/stats.after") | awk '
 				{ n = $6 - $3; if (n > 1000) printf "%s %s ns × %d, ", $2, int(($7 - $4) / n), n }' |
 				sed 's/, $//; s/^/    BPF: /' | grep . || true
+			[ -s "$tmp/stats.after" ] || echo "    BPF: no statistics; $nostats"
 		fi
 	done
 }
