@@ -648,7 +648,7 @@ func TestNeeded(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "environ"), []byte("HOME=/root\x00"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w := &Watcher{proc: proc, seen: map[fileID]bool{}, roots: map[fileID]bool{}}
+	w := &Watcher{proc: proc, seen: map[fileID][]Target{}, roots: map[fileID]bool{}}
 	var libs []string
 	for _, target := range w.Needed(7) {
 		libs = append(libs, filepath.Base(target.Path)+" "+target.Library.String())
@@ -658,6 +658,52 @@ func TestNeeded(t *testing.T) {
 	}
 	if w.Known(7) {
 		t.Error("its executable and root were never looked at, but Known says they were")
+	}
+}
+
+// Per process, a file's targets are returned for every process that uses it,
+// by that process's path; otherwise only the first time.
+func TestWatcherPerProcess(t *testing.T) {
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skip("no curl")
+	}
+	proc := t.TempDir()
+	for _, pid := range []string{"7", "8"} {
+		dir := filepath.Join(proc, pid)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for link, target := range map[string]string{"root": "/", "exe": curl} {
+			if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	paths := func(targets []Target) []string {
+		var out []string
+		for _, t := range targets {
+			if t.Library == OpenSSL {
+				out = append(out, t.Path)
+			}
+		}
+		return out
+	}
+	for _, perProcess := range []bool{false, true} {
+		w := &Watcher{proc: proc, perProcess: perProcess, seen: map[fileID][]Target{}, roots: map[fileID]bool{}}
+		first, second := paths(w.Needed(7)), paths(w.Needed(8))
+		if len(first) == 0 {
+			t.Fatal("no libssl found for curl")
+		}
+		if !perProcess && len(second) != 0 {
+			t.Errorf("not per process, libssl was returned again: %q", second)
+		}
+		if perProcess && (len(second) != len(first) || !strings.HasPrefix(second[0], filepath.Join(proc, "8", "root"))) {
+			t.Errorf("per process, the second process got %q, after %q", second, first)
+		}
+		if perProcess && w.Known(8) {
+			t.Error("per process, Known says a process needs no probes of its own")
+		}
 	}
 }
 
