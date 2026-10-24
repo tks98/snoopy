@@ -98,6 +98,8 @@ needs no compiler, kernel headers or BCC.
   tracing works.
 - [Performance](docs/performance.md): what snoopy costs the programs it
   traces, and the ones it doesn't.
+- [Comparison](docs/comparison.md): snoopy next to mitmproxy, Wireshark,
+  eCapture and others, and when to use which.
 - [Contributing](CONTRIBUTING.md): building, testing and releasing.
 - [Release risks](docs/release-risks.md) and
   [maintenance](docs/maintenance.md): what breaks when browsers and libraries
