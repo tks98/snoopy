@@ -3,8 +3,9 @@ version: 2
 project_name: snoopy
 
 # snoopy's Java agent (--java), built with a JDK 21 or later into
-# java/out, reproducibly for a given JDK (java/build.sh). Not something
-# `go install` or a plain go build needs.
+# java/out, reproducibly for a given JDK (java/build.sh; the release
+# workflow pins its JDK). Not something `go install` or a plain go build
+# needs.
 before:
   hooks:
     - sh java/build.sh
@@ -18,6 +19,9 @@ builds:
     flags: [-trimpath]
     ldflags:
       - -s -w -X main.version={{ .Version }}
+    # The binaries' times are the commit's, as is everything in the
+    # archives, so the same commit builds the same archives.
+    mod_timestamp: "{{ .CommitTimestamp }}"
   # The kubectl plugin, a module of its own, which runs where kubectl does.
   - id: kubectl-snoopy
     dir: cmd/kubectl-snoopy
@@ -29,36 +33,67 @@ builds:
     flags: [-trimpath]
     ldflags:
       - -s -w -X main.version={{ .Version }}
+    # The binaries' times are the commit's, as is everything in the
+    # archives, so the same commit builds the same archives.
+    mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
   - id: snoopy
     ids: [snoopy]
     formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    builds_info: &binary
+      owner: root
+      group: root
+      mode: 0755
+      mtime: "{{ .CommitDate }}"
     files:
-      - LICENSE
-      - README.md
+      - src: LICENSE
+        info: &file
+          owner: root
+          group: root
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+      - src: README.md
+        info: *file
       # Next to snoopy, where --java looks for them.
       - src: java/out/snoopy-*.jar
         strip_parent: true
+        info: *file
   # krew wants the license in the archive.
   - id: kubectl-snoopy
     ids: [kubectl-snoopy]
     formats: [tar.gz]
     name_template: "kubectl-snoopy_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    builds_info: *binary
     files:
-      - LICENSE
+      - src: LICENSE
+        info: *file
 
+# An SBOM (SPDX JSON, by syft) for each archive, released next to it.
+sboms:
+  - artifacts: archive
+
+# checksums.txt covers everything released: the archives, their SBOMs, the
+# jars and the krew manifest. The release workflow attests it.
 checksum:
   name_template: checksums.txt
   extra_files:
     - glob: java/out/snoopy-*.jar
+    # The krew pipe writes it after the checksums are first made; they're
+    # made again when the release is published, and then it's there. (A
+    # pattern, not a path, so that it may match nothing the first time.)
+    - glob: dist/krew/*.yaml
+      name_template: krew-snoopy.yaml
 
 # The agent's jars on their own too, for a snoopy from go install or a
-# package without them.
+# package without them; and the krew manifest, for krew-index, which it's
+# submitted to by hand (docs/kubernetes.md).
 release:
   extra_files:
     - glob: java/out/snoopy-*.jar
+    - glob: dist/krew/*.yaml
+      name_template: krew-snoopy.yaml
 
 changelog:
   sort: asc
@@ -91,9 +126,9 @@ dockers_v2:
       manifest:org.opencontainers.image.source: https://github.com/tks98/snoopy
       manifest:org.opencontainers.image.licenses: MIT
 
-# The krew manifest, kept in dist/ and attached to the release by the
-# release workflow, not pushed to krew-index: submitting it there is done by
-# hand (docs/kubernetes.md).
+# The krew manifest, kept in dist/ and attached to the release as
+# krew-snoopy.yaml (release.extra_files), not pushed to krew-index:
+# submitting it there is done by hand (docs/kubernetes.md).
 krews:
   - name: snoopy
     ids: [kubectl-snoopy]
