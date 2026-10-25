@@ -141,15 +141,15 @@ func New(opts Options) (*Tracer, error) {
 	var comm [16]byte
 	copy(comm[:], opts.Comm)
 	pidnsDev, pidnsIno := pidNamespace()
-	// Per process, with Comm, the processes attached for are what's traced
-	// (Attach adds them to traced_tgids): one that renames itself later
-	// stays traced, and probes on a file every process uses (--lib) only
-	// trace them.
+	// Per process, the processes attached for are what's traced (Attach
+	// adds them to traced_tgids): one that renames itself later stays
+	// traced, probes on a file every process uses (--lib) only trace them,
+	// and their library loads are told of from their start.
 	perProcess := opts.PerProcess && btfErr == nil
 	for name, value := range map[string]any{
 		"pidns_dev":    pidnsDev,
 		"pidns_ino":    pidnsIno,
-		"filter_tgids": opts.PID != 0 || perProcess && opts.Comm != "",
+		"filter_tgids": opts.PID != 0 || perProcess,
 		"max_capture":  uint32(opts.MaxCapture),
 		// Without BTF the kernel only knows thread names, so the process
 		// name is filtered on in user space instead.
@@ -289,7 +289,7 @@ func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
 	if !t.perProcess {
 		pid = 0
 	}
-	if pid != 0 && t.opts.Comm != "" {
+	if pid != 0 {
 		if err := t.TracePID(uint32(pid)); err != nil {
 			return nil, err
 		}
@@ -624,10 +624,24 @@ func (t *Tracer) AttachSyscalls() error {
 // little later, and programs may load more as they go.
 var rescanDelays = []time.Duration{0, 50 * time.Millisecond, 500 * time.Millisecond, 3 * time.Second}
 
+// libraryRescanDelays are when a process that loaded a TLS library, and
+// isn't held, is looked at again: the BPF program sees the mmap before it's
+// done.
+var libraryRescanDelays = []time.Duration{20 * time.Millisecond, 300 * time.Millisecond}
+
+// loadedLibrary marks a PID in the execs ring buffer that loaded a library
+// (LOADED_LIBRARY in the BPF program).
+const loadedLibrary = 0x80000000
+
 // maxHold is how long a new process is held while its files are inspected
 // and attached to; inspecting a large program the first time (a browser's
 // stripped BoringSSL) can take longer, and it isn't held up for that.
 const maxHold = 2 * time.Second
+
+// maxLibraryHold is how long a thread that loaded a TLS library is held: a
+// stripped BoringSSL (Conscrypt's) is analyzed the first time snoopy sees
+// its build, which takes seconds, and the thread is about to use it.
+const maxLibraryHold = 10 * time.Second
 
 // WatchNewProcesses attaches, in the background, to the TLS libraries and
 // programs of processes that start from now on, as w finds them, and per
@@ -637,7 +651,8 @@ const maxHold = 2 * time.Second
 // before its files are inspected are missed, unless hold says to hold it:
 // then a process whose executable or root filesystem is new to w is
 // stopped (with ptrace, which its parent doesn't see, unlike SIGSTOP) until
-// they're attached to, or maxHold. Call stop to stop watching and wait for
+// they're attached to, or maxHold; and so is a thread of a process to hold
+// that loads a TLS library, until it's attached to. Call stop to stop watching and wait for
 // the watcher to finish.
 func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid int) bool,
 	attached func(target discover.Target, funcs []string, err error)) (stop func(), err error) {
@@ -663,7 +678,7 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	pids := make(chan int)
-	holds := make(chan int, 64)
+	holds := make(chan heldProcess, 64)
 	held := make(chan heldProcess)
 	wg.Add(3)
 	go func() { // read execs and schedule inspections
@@ -679,9 +694,33 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 				continue
 			}
 			pid := int(binary.NativeEndian.Uint32(rec.RawSample))
+			if pid&loadedLibrary != 0 && len(rec.RawSample) >= 8 {
+				// A process loaded a TLS library: the thread that did is
+				// held until it's attached to, if the process is one to
+				// hold, as it's about to use it; else it's looked at again
+				// once the mapping is done.
+				pid &^= loadedLibrary
+				tid := int(binary.NativeEndian.Uint32(rec.RawSample[4:]))
+				if hold != nil && hold(pid) {
+					select {
+					case holds <- heldProcess{pid: pid, tid: tid, library: true}:
+						continue
+					default:
+					}
+				}
+				for _, d := range libraryRescanDelays {
+					time.AfterFunc(d, func() {
+						select {
+						case pids <- pid:
+						case <-ctx.Done():
+						}
+					})
+				}
+				continue
+			}
 			if hold != nil && hold(pid) && !w.Known(pid) {
 				select {
-				case holds <- pid:
+				case holds <- heldProcess{pid: pid, tid: pid}:
 				default: // too many at once; they're looked at as usual
 				}
 			}
@@ -703,21 +742,22 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 			select {
 			case <-ctx.Done():
 				return
-			case pid := <-holds:
-				sig, ok := seize(pid)
+			case p := <-holds:
+				// A new process, or a thread that loaded a TLS library.
+				sig, ok := seize(p.tid)
 				if !ok {
 					continue
 				}
-				p := heldProcess{pid: pid, done: make(chan struct{})}
+				p.done = make(chan struct{})
 				select {
 				case held <- p:
 					select {
 					case <-p.done:
-					case <-time.After(maxHold):
+					case <-time.After(p.maxHold()):
 					}
 				case <-ctx.Done():
 				}
-				release(pid, sig)
+				release(p.tid, sig)
 			}
 		}
 	}()
@@ -728,6 +768,13 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 		inspect := func(pid int, root bool) {
 			if accept != nil && !accept(pid) {
 				return
+			}
+			if t.perProcess {
+				// Traced even before anything is attached for it, so that
+				// the libraries it loads later are told of.
+				if err := t.TracePID(uint32(pid)); err != nil {
+					attached(discover.Target{}, nil, err)
+				}
 			}
 			var targets, later []discover.Target
 			if root || t.perProcess {
@@ -770,7 +817,7 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 			case pid := <-pids:
 				inspect(pid, false)
 			case p := <-held:
-				inspect(p.pid, true)
+				inspect(p.pid, !p.library)
 				close(p.done)
 			}
 		}
@@ -783,12 +830,24 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 }
 
 type heldProcess struct {
-	pid  int
-	done chan struct{} // closed once its files are attached to
+	pid, tid int // the thread held: the process's for a new one
+	// library is set for a thread that loaded a TLS library, rather than a
+	// new process.
+	library bool
+	done    chan struct{} // closed once its files are attached to
 }
 
-// seize stops a process with ptrace, without its parent seeing it stop, and
-// returns the signal it stopped for, if any, which release passes on.
+// maxHold is how long the thread is held at most.
+func (p heldProcess) maxHold() time.Duration {
+	if p.library {
+		return maxLibraryHold
+	}
+	return maxHold
+}
+
+// seize stops a process, or one of its threads (pid is a thread ID), with
+// ptrace, without its parent seeing it stop, and returns the signal it
+// stopped for, if any, which release passes on.
 func seize(pid int) (sig int, ok bool) {
 	if unix.PtraceSeize(pid) != nil {
 		return 0, false // gone, already traced, or not allowed (Yama)

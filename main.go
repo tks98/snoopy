@@ -433,6 +433,11 @@ func run(cfg config) error {
 			if _, ok := cfg.containers.match(resolver.ContainerID(uint32(pid))); !ok {
 				continue
 			}
+			// Traced even if nothing is attached for it yet, so that the
+			// libraries it loads later are told of.
+			if err := t.TracePID(uint32(pid)); err != nil {
+				logf("warning: %v", err)
+			}
 			// What it has, then what it may load.
 			for _, target := range append(watcher.Process(pid), watcher.Root(pid)...) {
 				funcs, err := t.Attach(target, pid)

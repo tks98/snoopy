@@ -15,7 +15,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -26,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -866,7 +869,12 @@ func startPerProcess(t *testing.T, comm string) (*Tracer, *eventLog) {
 		name, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 		return err == nil && strings.HasPrefix(string(name), comm)
 	}
-	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil, true), named, named, func(discover.Target, []string, error) {})
+	start := time.Now()
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil, true), named, named, func(target discover.Target, funcs []string, err error) {
+		if len(funcs) > 0 || err != nil {
+			t.Logf("%v: attached %s: %v %v", time.Since(start), target.Path, funcs, err)
+		}
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -948,6 +956,101 @@ os.waitpid(pid, 0)
 	})
 	if child.PID == parent.PID {
 		t.Errorf("the child's request came from its parent's PID %d", parent.PID)
+	}
+}
+
+// javaLibs are the jars the Java tests use, from Maven Central: Netty with
+// netty-tcnative's BoringSSL, and Conscrypt.
+var javaLibs = []string{
+	"io/netty/netty-common/4.1.139.Final/netty-common-4.1.139.Final.jar",
+	"io/netty/netty-buffer/4.1.139.Final/netty-buffer-4.1.139.Final.jar",
+	"io/netty/netty-transport/4.1.139.Final/netty-transport-4.1.139.Final.jar",
+	"io/netty/netty-resolver/4.1.139.Final/netty-resolver-4.1.139.Final.jar",
+	"io/netty/netty-codec/4.1.139.Final/netty-codec-4.1.139.Final.jar",
+	"io/netty/netty-handler/4.1.139.Final/netty-handler-4.1.139.Final.jar",
+	"io/netty/netty-transport-native-unix-common/4.1.139.Final/netty-transport-native-unix-common-4.1.139.Final.jar",
+	"io/netty/netty-tcnative-classes/2.0.84.Final/netty-tcnative-classes-2.0.84.Final.jar",
+	"io/netty/netty-tcnative-boringssl-static/2.0.84.Final/netty-tcnative-boringssl-static-2.0.84.Final-linux-{arch}.jar",
+	"org/conscrypt/conscrypt-openjdk-uber/2.8.0/conscrypt-openjdk-uber-2.8.0.jar",
+}
+
+// javaClasspath downloads javaLibs into testdata/java/lib, once, checked
+// against the SHA-1 sums Maven Central publishes, and returns their
+// classpath.
+func javaClasspath(t *testing.T) string {
+	t.Helper()
+	arch := map[string]string{"amd64": "x86_64", "arm64": "aarch_64"}[runtime.GOARCH]
+	dir, err := filepath.Abs("testdata/java/lib")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	get := func(url string) []byte {
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Skipf("download %s: %v", url, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("download %s: %s", url, resp.Status)
+		}
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	var cp []string
+	for _, lib := range javaLibs {
+		lib = strings.ReplaceAll(lib, "{arch}", arch)
+		path := filepath.Join(dir, filepath.Base(lib))
+		cp = append(cp, path)
+		if _, err := os.Stat(path); err == nil {
+			continue
+		}
+		url := "https://repo1.maven.org/maven2/" + lib
+		jar, want := get(url), strings.Fields(string(get(url+".sha1")))
+		if sum := sha1.Sum(jar); len(want) == 0 || hex.EncodeToString(sum[:]) != want[0] {
+			t.Fatalf("%s: SHA-1 %x, Maven Central says %v", url, sum, want)
+		}
+		if err := os.WriteFile(path, jar, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return strings.Join(cp, ":")
+}
+
+// Java programs whose TLS is native, BoringSSL in a JNI library they extract
+// to a temporary file, load and delete: Netty with netty-tcnative (gRPC-Java
+// uses it too) and Conscrypt. Traced per process with --comm java, whether
+// they load it at start or seconds later, when only the BPF program's notice
+// of the library being mapped tells snoopy to look again.
+func TestJavaNativeTLS(t *testing.T) {
+	requireRoot(t)
+	java := requireTool(t, "java")
+	cp := javaClasspath(t)
+	_, events := startPerProcess(t, "java")
+	srv, _ := newServer(t)
+	for _, c := range []struct {
+		class, path string
+		delay       time.Duration
+	}{
+		{"NettyClient", "/netty", 0},
+		{"ConscryptClient", "/conscrypt", 0},
+		{"NettyClient", "/netty-late", 5 * time.Second},
+		{"ConscryptClient", "/conscrypt-late", 5 * time.Second},
+	} {
+		// Under sh, so its parent isn't the tracer (see TestHoldNewProcess).
+		cmd := exec.Command("sh", "-c", `"$0" -cp "$1" "$2" "$3" "$4"; :`, java, cp,
+			"testdata/java/"+c.class+".java", srv.URL+c.path, fmt.Sprint(c.delay.Milliseconds()))
+		if out, err := cmd.CombinedOutput(); err != nil || !bytes.Contains(out, []byte("served "+c.path)) {
+			t.Fatalf("%s %s: %v: %s", c.class, c.path, err, out)
+		}
+		waitFor(t, events, c.class+" "+c.path, func(ev *Event) bool {
+			return ev.Function.Direction() == Write && contains("GET "+c.path+" ")(ev)
+		})
 	}
 }
 

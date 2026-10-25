@@ -246,7 +246,9 @@ struct {
 
 // PIDs of processes that executed a new program, so user space can attach
 // to TLS libraries and programs that start after it did, and with probes
-// per process, of those forked from a traced one.
+// per process, of those forked from a traced one; and with LOADED_LIBRARY
+// set, followed by a thread's, of those that loaded a TLS library
+// (note_library_load).
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 64 << 10);
@@ -423,7 +425,8 @@ static __always_inline void count_lost(void)
 // Fills in the addresses of the current task's socket fd, if it is a TCP/IP
 // socket: current->files->fdt->fd[fd]->private_data is its struct socket.
 // Returns the current process's file at fd if it is a socket. Needs BTF.
-static __always_inline struct file *socket_file(__s32 fd)
+// Returns the current process's file at fd, or NULL. Needs BTF.
+static __always_inline struct file *file_at(__s32 fd)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct fdtable *fdt = BPF_CORE_READ(task, files, fdt);
@@ -434,7 +437,13 @@ static __always_inline struct file *socket_file(__s32 fd)
 	struct file *file = NULL;
 	if (bpf_core_read(&file, sizeof(file), &fds[fd]) || !file)
 		return NULL;
-	if ((BPF_CORE_READ(file, f_inode, i_mode) & S_IFMT) != S_IFSOCK)
+	return file;
+}
+
+static __always_inline struct file *socket_file(__s32 fd)
+{
+	struct file *file = file_at(fd);
+	if (!file || (BPF_CORE_READ(file, f_inode, i_mode) & S_IFMT) != S_IFSOCK)
 		return NULL;
 	return file;
 }
@@ -877,6 +886,7 @@ static __always_inline int record_fd(__u64 fd)
 // iovec array, msghdr or (first) mmsghdr there; 0 for sends.
 enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #if defined(__TARGET_ARCH_x86)
+#define SYS_MMAP 9
 #define SYSCALL_FD(regs) ((regs)->di)
 #define SYSCALL_ARG1(regs) ((regs)->si)
 #define SYSCALL_ARG2(regs) ((regs)->dx)
@@ -894,6 +904,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #define IS_SENDMSG(id) ((id) == 46 || (id) == 307)
 #define IS_DATAGRAM_IO(id) ((id) >= 44 && (id) <= 47 || (id) == 299 || (id) == 307)
 #elif defined(__TARGET_ARCH_arm64)
+#define SYS_MMAP 222
 #define SYSCALL_FD(regs) ((regs)->orig_x0)
 #define SYSCALL_ARG1(regs) ((regs)->user_regs.regs[1])
 #define SYSCALL_ARG2(regs) ((regs)->user_regs.regs[2])
@@ -1286,12 +1297,86 @@ int sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
 	return 0;
 }
 
+#define PROT_EXEC 4
+// LOADED_LIBRARY marks a PID in execs that loaded a TLS library, rather than
+// executed a program; the thread that did follows it.
+#define LOADED_LIBRARY 0x80000000u
+
+// The names TLS libraries' files start with, as user space looks for them
+// (libPatterns in internal/discover): a process's mapping one is told of.
+#define LIBNAME_MAX 20
+static const char tls_library_names[][LIBNAME_MAX] = {
+	"libssl.so", "libgnutls.so", "libnspr4.so", "libfreeblpriv3.so", "libwolfssl.so",
+	"libmbedtls.so", "libs2n.so", "libngtcp2_crypto_", "libnetty_tcnative", "libconscrypt",
+};
+
+static __always_inline bool tls_library_name(const char *name)
+{
+	for (int i = 0; i < (int)(sizeof(tls_library_names) / LIBNAME_MAX); i++) {
+		bool match = true;
+		for (int j = 0; j < LIBNAME_MAX; j++) {
+			char c = tls_library_names[i][j];
+			if (!c)
+				break;
+			if (name[j] != c) {
+				match = false;
+				break;
+			}
+		}
+		if (match)
+			return true;
+	}
+	return false;
+}
+
+struct library_load {
+	__u32 pid; // with LOADED_LIBRARY set
+	__u32 tid;
+};
+
+// Tells user space when a process it traces maps a TLS library executable,
+// which is how one is loaded, with the thread that did: one it loads late
+// gets attached to, as the TLS library a JVM extracts and loads the first
+// time it needs it (netty-tcnative, Conscrypt), and user space can hold that
+// thread, about to use it, until it is. Needs BTF.
+static __always_inline void note_library_load(struct pt_regs *regs)
+{
+	if (!have_btf)
+		return;
+	__u64 prot = 0, fd = 0;
+	if (bpf_probe_read_kernel(&prot, sizeof(prot), &SYSCALL_ARG2(regs)) ||
+	    bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_ARG4(regs)))
+		return;
+	if (!(prot & PROT_EXEC) || (__s32)fd < 0)
+		return;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return;
+	struct file *file = file_at((__s32)fd);
+	if (!file)
+		return;
+	char name[LIBNAME_MAX];
+	__builtin_memset(name, 0, sizeof(name));
+	if (bpf_probe_read_kernel_str(name, sizeof(name), BPF_CORE_READ(file, f_path.dentry, d_name.name)) <= 0 ||
+	    !tls_library_name(name))
+		return;
+	__u64 ns = ns_pid_tgid();
+	if (!ns)
+		return;
+	struct library_load load = {.pid = (ns >> 32) | LOADED_LIBRARY, .tid = (__u32)ns};
+	bpf_ringbuf_output(&execs, &load, sizeof(load), 0);
+}
+
 // raw_syscalls:sys_enter(struct pt_regs *regs, long id). A raw tracepoint
 // needs neither tracefs nor BTF, unlike the per-syscall tracepoints.
 SEC("raw_tracepoint/sys_enter")
 int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
 	long id = (long)ctx->args[1];
+	if (id == SYS_MMAP) {
+		note_library_load((struct pt_regs *)ctx->args[0]);
+		return 0;
+	}
 	if (!IS_SOCKET_IO_SYSCALL(id))
 		return 0;
 

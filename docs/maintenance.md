@@ -759,6 +759,16 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   probes are per file, and user space scans `/proc` for new children of
   `--pid` every second.
 
+- **Libraries loaded late:** `note_library_load`, in `sys_enter`, tells user
+  space (through `execs`, with `LOADED_LIBRARY` set and the thread ID) when
+  a process it traces maps executable a file whose name starts with one of
+  `tls_library_names`, which must match `libPatterns` in
+  `internal/discover`. With `--comm`, `--pid` or `--container`, that thread
+  is held with ptrace until the library is attached to; otherwise the
+  process is looked at again. Java's netty-tcnative and Conscrypt are found
+  this way, extracted to temporary files and deleted; `TestJavaNativeTLS`
+  loads them at start and five seconds later.
+
 ## HTTP decoding and compressed bodies
 
 These follow published standards and rarely need fixing.

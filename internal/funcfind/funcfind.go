@@ -11,7 +11,9 @@
 //
 // x86-64 and arm64 are supported. Functions start at direct call targets
 // (with a frame pointer prologue, on x86-64), so functions only ever called
-// indirectly aren't found.
+// indirectly aren't found; an x86-64 binary built without frame pointers
+// has its functions start where its table of their unwind information
+// (.eh_frame_hdr) says.
 package funcfind
 
 import (
@@ -39,6 +41,8 @@ type Binary struct {
 	data     []segment // allocated, non-executable sections; read by segments()
 	loads    []elf.ProgHeader
 	callers  map[uint64]int // direct call targets, built on first use
+	starts   []uint64       // x86-64 functions' starts from .eh_frame_hdr, read by fdeStarts()
+	fdes     int            // whether to use starts: 0 not decided yet, 1 yes, -1 no
 	// absolute is set for an executable that isn't position-independent,
 	// whose code can load an address as a 32-bit immediate.
 	absolute bool
@@ -105,7 +109,13 @@ func (b *Binary) FindString(suffix string) (uint64, bool) {
 	needle := append([]byte(suffix), 0)
 	for _, s := range b.segments() {
 		if i := bytes.Index(s.data, needle); i >= 0 {
-			start := bytes.LastIndexByte(s.data[:i], 0) + 1
+			// Back to the string's start: the bytes before it may be other
+			// data, with no NUL in between (Conscrypt's x86-64 build has a
+			// table there).
+			start := i
+			for start > 0 && s.data[start-1] >= 0x20 && s.data[start-1] < 0x7f {
+				start--
+			}
 			return s.addr + uint64(start), true
 		}
 	}
@@ -162,6 +172,9 @@ func (b *Binary) isBoundary(a uint64) bool {
 
 // FuncAt returns the function containing the instruction at pc.
 func (b *Binary) FuncAt(pc uint64) (*Func, bool) {
+	if b.useFDEs() {
+		return b.fdeFuncAt(pc)
+	}
 	align := b.align()
 	start := pc &^ (align - 1)
 	for start > b.textAddr && !b.isStart(start) && pc-start < maxFuncSize {

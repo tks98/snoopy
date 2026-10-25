@@ -97,7 +97,11 @@ func (t Target) Name() string {
 
 // libPatterns are the file name globs of shared libraries we know how to probe.
 var libPatterns = []string{"libssl.so*", "libgnutls.so*", "libnspr4.so*", "libfreeblpriv3.so", "libwolfssl.so*", "libmbedtls.so*", "libs2n.so*",
-	"libngtcp2_crypto_*.so*"}
+	"libngtcp2_crypto_*.so*",
+	// Java's native TLS providers, BoringSSL inside: Netty's (gRPC-Java's
+	// too) and Conscrypt. Both are extracted to a temporary file with a
+	// random suffix (libnetty_tcnative_linux_x86_64123.so), and deleted.
+	"libnetty_tcnative*.so", "libconscrypt*.so"}
 
 // knownPrograms are where Chromium-based browsers, Electron apps and
 // Firefox's own NSS libraries are installed. Inspecting them at startup means
@@ -802,6 +806,10 @@ func isTLSLibraryName(name string) bool {
 
 type fileID struct {
 	dev, ino uint64
+	// modified is when a file was last written: a file deleted while it's
+	// still mapped (as Java's libraries extracted to /tmp are) can have its
+	// inode reused for another one.
+	modified int64
 }
 
 func idOf(path string) (fileID, error) {
@@ -816,7 +824,7 @@ func idOf(path string) (fileID, error) {
 	if !ok {
 		return fileID{}, errors.New("no inode information")
 	}
-	return fileID{dev: uint64(st.Dev), ino: st.Ino}, nil
+	return fileID{dev: uint64(st.Dev), ino: st.Ino, modified: fi.ModTime().UnixNano()}, nil
 }
 
 func joinNotes(a, b string) string {

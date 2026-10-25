@@ -117,7 +117,20 @@ struct inode {
 	umode_t i_mode;
 } __attribute__((preserve_access_index));
 
+struct qstr {
+	const unsigned char *name;
+} __attribute__((preserve_access_index));
+
+struct dentry {
+	struct qstr d_name;
+} __attribute__((preserve_access_index));
+
+struct path {
+	struct dentry *dentry;
+} __attribute__((preserve_access_index));
+
 struct file {
+	struct path f_path;
 	struct inode *f_inode;
 	void *private_data;
 } __attribute__((preserve_access_index));
