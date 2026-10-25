@@ -11,8 +11,9 @@
 //
 // x86-64 and arm64 are supported. Functions start at direct call targets
 // (with a frame pointer prologue, on x86-64), so functions only ever called
-// indirectly aren't found; on x86-64, where the binary has a table of its
-// functions' unwind information (.eh_frame_hdr), they start where it says.
+// indirectly aren't found; an x86-64 binary built without frame pointers
+// has its functions start where its table of their unwind information
+// (.eh_frame_hdr) says.
 package funcfind
 
 import (
@@ -41,6 +42,7 @@ type Binary struct {
 	loads    []elf.ProgHeader
 	callers  map[uint64]int // direct call targets, built on first use
 	starts   []uint64       // x86-64 functions' starts from .eh_frame_hdr, read by fdeStarts()
+	fdes     int            // whether to use starts: 0 not decided yet, 1 yes, -1 no
 	// absolute is set for an executable that isn't position-independent,
 	// whose code can load an address as a 32-bit immediate.
 	absolute bool
@@ -170,7 +172,7 @@ func (b *Binary) isBoundary(a uint64) bool {
 
 // FuncAt returns the function containing the instruction at pc.
 func (b *Binary) FuncAt(pc uint64) (*Func, bool) {
-	if !b.arm64 && len(b.fdeStarts()) > 0 {
+	if b.useFDEs() {
 		return b.fdeFuncAt(pc)
 	}
 	align := b.align()

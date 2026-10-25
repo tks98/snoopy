@@ -25,7 +25,7 @@ func TestFDEStarts(t *testing.T) {
 		t.Errorf("a truncated table: %#x", got)
 	}
 
-	b := &Binary{text: make([]byte, 0x200), textAddr: textAddr, starts: starts}
+	b := &Binary{text: make([]byte, 0x200), textAddr: textAddr, starts: starts, fdes: 1}
 	for pc, want := range map[uint64]*Func{
 		0x1000: {Start: 0x1000, End: 0x1030},
 		0x1045: {Start: 0x1030, End: 0x1100},

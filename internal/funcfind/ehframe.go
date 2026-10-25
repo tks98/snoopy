@@ -88,3 +88,27 @@ func ehFrameHdrStarts(addr uint64, d []byte) []uint64 {
 	}
 	return out
 }
+
+// useFDEs reports whether functions start where fdeStarts says, rather than
+// at call targets with a frame pointer prologue: for an x86-64 binary with
+// the table, where most call targets have no such prologue. With frame
+// pointers (Chrome), the prologues are kept to, as a function's parts that
+// the compiler split off (its cold code) have their own unwind information.
+func (b *Binary) useFDEs() bool {
+	if b.fdes == 0 {
+		b.fdes = -1
+		if !b.arm64 && len(b.fdeStarts()) > 0 {
+			with, all := 0, 0
+			for a := range b.directCallers() {
+				all++
+				if a%x86Align == 0 && b.x86Prologue(a) {
+					with++
+				}
+			}
+			if with < all/2 {
+				b.fdes = 1
+			}
+		}
+	}
+	return b.fdes > 0
+}
