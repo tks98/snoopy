@@ -50,8 +50,9 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
   `.o` and `.go` files with the change.
 - The 5.10 verifier is the strictest one supported. After changing
   `bpf/snoopy.c`, run the integration tests on 5.10, 5.15, 6.1, 6.6 and 6.12
-  (`make integration-vm`), and `tools/loadcheck/run.sh`, which also covers
-  5.10 where vimto can't; CI only runs its own runners' kernels.
+  (`make integration-vm`). The Load check workflow loads every program
+  under 5.10 to 6.12 for such changes (`tools/loadcheck`, also runnable by
+  hand); CI's other jobs only run their runners' kernels.
 - Rules learned the hard way: zero every struct passed to a helper
   (`__builtin_memset`), keep the chunk loop's shape, and truncate 32-bit
   arguments (`(__u32)func_arg(ctx, n)`), whose upper halves are garbage.
