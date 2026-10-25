@@ -276,8 +276,11 @@ For what the verifier of each kernel accepts, `tools/loadcheck/run.sh`
 loads every BPF program in default, `--pid` and `--comm` modes, in the
 kernel's PID namespace and in a new one (the program numbers PIDs
 differently there), under each kernel vimto has downloaded, booting it in QEMU with a small init. It's
-quicker than the tests, and covers 5.10. Run the tests once per kernel
-first, so vimto has the images.
+quicker than the tests, and covers 5.10. It uses the kernels
+`tools/loadcheck/fetch.sh 5.10 5.15 6.1 6.6 6.12` downloads (with Docker,
+from Cilium's CI kernel images), and those vimto has. The Load check
+workflow runs both on x86-64 for every change to the BPF code or how it's
+loaded.
 
 ## Chrome, Electron and other Chromium builds
 

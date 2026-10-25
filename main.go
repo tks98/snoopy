@@ -127,8 +127,8 @@ Usage: sudo snoopy [flags]
 
 Which processes:
   --pid PID          only this process and those it starts
-  --comm NAME        only processes whose name starts with NAME, as in
-                     /proc/<pid>/comm (curl, firefox, chrome)
+  --comm NAME        only processes whose name, as in /proc/<pid>/comm, or
+                     program's file name starts with NAME (curl, firefox, node)
   --container ID     only processes in the container with this ID, or ID
                      prefix; repeatable, or comma-separated. ID=NAME shows
                      NAME for the container's events
@@ -701,11 +701,8 @@ func acceptProcess(cfg config, t *tracer.Tracer) func(pid int) bool {
 	}
 	resolver := procinfo.NewResolver("/proc") // not shared: Resolver isn't safe for concurrent use
 	return func(pid int) bool {
-		if cfg.comm != "" {
-			comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-			if err != nil || !strings.HasPrefix(strings.TrimSuffix(string(comm), "\n"), cfg.comm) {
-				return false
-			}
+		if cfg.comm != "" && !discover.NameMatches(pid, cfg.comm) {
+			return false
 		}
 		if _, ok := cfg.containers.match(resolver.ContainerID(uint32(pid))); !ok {
 			return false
@@ -746,11 +743,8 @@ func holdProcess(cfg config) func(pid int) bool {
 	}
 	resolver := procinfo.NewResolver("/proc") // not shared: Resolver isn't safe for concurrent use
 	return func(pid int) bool {
-		if cfg.comm != "" {
-			comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-			if err != nil || !strings.HasPrefix(strings.TrimSuffix(string(comm), "\n"), cfg.comm) {
-				return false
-			}
+		if cfg.comm != "" && !discover.NameMatches(pid, cfg.comm) {
+			return false
 		}
 		if _, ok := cfg.containers.match(resolver.ContainerID(uint32(pid))); !ok {
 			return false

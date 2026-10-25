@@ -27,8 +27,8 @@ sudo snoopy --lib /usr/bin/node             # also attach to a binary with OpenS
 ```text
 Which processes:
   --pid PID          only this process and those it starts
-  --comm NAME        only processes whose name starts with NAME, as in
-                     /proc/<pid>/comm (curl, firefox, chrome)
+  --comm NAME        only processes whose name, as in /proc/<pid>/comm, or
+                     program's file name starts with NAME (curl, firefox, node)
   --container ID     only processes in the container with this ID, or ID
                      prefix; repeatable, or comma-separated. ID=NAME shows
                      NAME for the container's events

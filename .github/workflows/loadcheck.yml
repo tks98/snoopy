@@ -1,0 +1,39 @@
+name: Load check
+
+# Loads every BPF program under the verifiers of the oldest kernels snoopy
+# supports, in QEMU, when the BPF code or how it's loaded changes. CI's own
+# runners only have recent kernels, and 5.10's verifier is the strictest.
+on:
+  pull_request:
+    paths:
+      - bpf/**
+      - internal/tracer/**
+      - tools/loadcheck/**
+      - .github/workflows/loadcheck.yml
+  push:
+    branches: [main]
+    paths:
+      - bpf/**
+      - internal/tracer/**
+      - tools/loadcheck/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  loadcheck:
+    name: BPF loads on 5.10 to 6.12
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install QEMU, and let it use KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 cpio
+          sudo chmod 666 /dev/kvm
+      - run: tools/loadcheck/fetch.sh 5.10 5.15 6.1 6.6 6.12
+      - run: tools/loadcheck/run.sh

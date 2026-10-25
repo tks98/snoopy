@@ -60,8 +60,29 @@ All of them on x86_64 and arm64. Some details:
 Programs that do their own socket I/O around the TLS library, such as .NET's
 `SslStream` over OpenSSL, are captured without a file descriptor or addresses.
 
+### Languages and runtimes
+
+What common runtimes use for TLS, and whether snoopy sees it, as tested on
+Ubuntu 26.04 (arm64) in October 2026, with each one fetching a page over
+HTTPS:
+
+| Runtime | TLS | Traced |
+| --- | --- | --- |
+| curl | the system's OpenSSL | yes |
+| Python, Ruby, PHP | the system's OpenSSL | yes |
+| Node.js, distribution packages | the system's OpenSSL | yes |
+| Node.js, official builds and `node` images | OpenSSL built into the `node` binary | yes; `--comm node` matches it by its file name, since it calls itself `MainThread` |
+| .NET | the system's OpenSSL, around its own socket I/O | yes, without socket addresses |
+| Go | `crypto/tls` | yes, stripped binaries too |
+| Rust | rustls, or OpenSSL through the `openssl` crate | yes (see above for rustls) |
+| Bun | BoringSSL, built in | yes |
+| Chrome, Firefox, Electron apps | BoringSSL, NSS | yes, HTTP/3 too |
+| Deno | rustls, in a stripped binary | no: rustls is found by its symbols |
+| Java (OpenJDK) | JSSE, written in Java | no |
+| Erlang, Elixir | OTP's `ssl`, written in Erlang | no |
+
 Not supported: rustls under tokio with providers other than aws-lc-rs and
-ring, Java, stripped TLS
+ring, Java, Erlang's `ssl`, stripped TLS
 libraries other than
 BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn, ngtcp2 and quic-go (quiche, for
 example), programs that use OpenSSL only through its BIO layer (e.g.
