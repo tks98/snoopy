@@ -45,7 +45,7 @@ func NewText(w io.Writer, opts Options) *Text {
 	return &Text{
 		w:      w,
 		opts:   opts,
-		dec:    newDecoders(opts.Warn),
+		dec:    newDecoders(opts),
 		dim:    s(color.Faint),
 		title:  s(color.Bold),
 		fn:     s(color.FgHiMagenta, color.Bold),
@@ -112,7 +112,7 @@ func (t *Text) Print(ev *tracer.Event) error {
 	case dc.http1 != nil:
 		t.writeHTTP1(&b, dc.http1)
 	default:
-		t.writeData(&b, ev.Data)
+		t.writeData(&b, dc.data)
 	}
 
 	switch {

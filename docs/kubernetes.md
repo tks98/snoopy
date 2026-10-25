@@ -36,32 +36,44 @@ Or download `kubectl-snoopy_<version>_<os>_<arch>.tar.gz` from the
 ```bash
 kubectl snoopy POD                       # all of the pod's containers
 kubectl snoopy POD -n shop -c app        # one container
+kubectl snoopy deploy/checkout -n shop   # every pod of a deployment
+kubectl snoopy -l app=checkout -n shop   # every pod with these labels
 kubectl snoopy POD --brief               # one line per call
 kubectl snoopy POD --json --port 443     # JSON, port 443 only
 kubectl snoopy POD -- --max-size 65536   # any of snoopy's flags, after --
+kubectl snoopy POD -- --quiet --har - > requests.har   # a HAR file, when you stop it
 kubectl snoopy --cleanup                 # delete snoopy pods left behind
 ```
 
-`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--host`, `--port` and
-`--count` are snoopy's own and are passed on; the rest of snoopy's flags go
+Besides a pod, it takes `KIND/NAME` for a deployment, statefulset, daemonset,
+replicaset, job or service (`deploy/checkout`, `sts/db`, `svc/api`), or
+`-l` with a label selector, and traces the pods those select that are
+running when it starts; pods started later aren't followed. It runs one
+snoopy pod per node, for all of the pods there, at most `--max-nodes` (10)
+of them, and merges their output an event at a time, with their messages
+marked by node. `--count` applies to each snoopy pod.
+
+`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--redact`, `--host`,
+`--port` and `--count` are snoopy's own and are passed on; the rest of snoopy's flags go
 after `--` ([usage.md](usage.md) has them all). kubectl's usual flags
 (`-n`, `--context`, `--kubeconfig`) work as they do for kubectl. Ctrl-C
 stops it.
 
 ## What it does
 
-1. It looks the pod up, and finds its node and its running containers' IDs.
-2. It creates a pod on that node, in the target pod's namespace unless
+1. It looks the pods up, and finds their nodes and their running
+   containers' IDs.
+2. It creates a pod on each of those nodes, in the target pod's namespace unless
    `--debug-namespace` says otherwise, that runs snoopy's image
    (`ghcr.io/tks98/snoopy`, the plugin's own version, or `--image`) with
-   `--container` for each of the containers. That pod is privileged and
+   `--container` for each of the containers there. That pod is privileged and
    shares the node's PID namespace (`hostPID: true`), which snoopy needs to
    load its eBPF program and see the pod's processes, tolerates any taint,
    has no service account token, and may run for `--max-duration` (4 hours)
    at most.
-3. It attaches to that pod, so snoopy's output comes back on stdout and its
-   messages on stderr.
-4. When snoopy stops, or on Ctrl-C, it deletes the pod. `--keep` leaves it,
+3. It attaches to those pods, so snoopy's output comes back on stdout and
+   its messages on stderr.
+4. When snoopy stops, or on Ctrl-C, it deletes them. `--keep` leaves it,
    and `kubectl snoopy --cleanup` deletes the ones left behind (they're
    labeled `app.kubernetes.io/managed-by=kubectl-snoopy`).
 

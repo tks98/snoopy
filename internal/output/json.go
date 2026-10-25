@@ -13,15 +13,16 @@ import (
 
 // JSON prints one JSON object per line (NDJSON).
 type JSON struct {
-	enc *json.Encoder
-	dec decoders
+	enc    *json.Encoder
+	dec    decoders
+	redact bool
 }
 
-// NewJSON returns a printer of NDJSON. Of opts, only Warn applies.
+// NewJSON returns a printer of NDJSON. Of opts, only Warn and Redact apply.
 func NewJSON(w io.Writer, opts Options) *JSON {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	return &JSON{enc: enc, dec: newDecoders(opts.Warn)}
+	return &JSON{enc: enc, dec: newDecoders(opts), redact: opts.Redact}
 }
 
 // jsonEvent is the documented JSON schema; see docs/usage.md.
@@ -49,6 +50,9 @@ type jsonEvent struct {
 	// set when bytes were captured.
 	Data       *string `json:"data,omitempty"`
 	DataBase64 []byte  `json:"data_base64,omitempty"`
+	// Set with --redact, which masks secrets in what's shown, and leaves
+	// data that isn't text out.
+	Redacted bool `json:"redacted,omitempty"`
 	// The HTTP/2 frames in the data. A connection that started before
 	// snoopy is followed from a call that starts with a frame, and its
 	// headers can't be decoded.
@@ -156,12 +160,14 @@ func (j *JSON) Print(ev *tracer.Event) error {
 	if ev.Remote.IsValid() {
 		out.RemoteAddr = ev.Remote.String()
 	}
-	if len(ev.Data) > 0 {
-		if utf8.Valid(ev.Data) {
-			s := string(ev.Data)
+	out.Redacted = j.redact
+	if len(dc.data) > 0 {
+		switch {
+		case utf8.Valid(dc.data):
+			s := string(dc.data)
 			out.Data = &s
-		} else {
-			out.DataBase64 = ev.Data
+		case !j.redact: // HTTP/2's and HTTP/3's headers are compressed in it
+			out.DataBase64 = dc.data
 		}
 	}
 	if dc.isQUIC {

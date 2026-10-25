@@ -47,7 +47,9 @@ type config struct {
 	maxSize    int
 	count      int
 	pcap       string
+	har        string
 	quiet      bool
+	redact     bool
 	noColor    bool
 	verbose    bool
 	version    bool
@@ -138,13 +140,19 @@ Output:
   --full             whole bodies, and binary data as hex dumps (by default,
                      a body's first 2 KiB, and binary data described)
   --hex              payloads as hex dumps
+  --redact           mask what's likely secret: credentials in headers,
+                     secret query parameters and JSON and form fields, and
+                     tokens of well-known kinds, for output to share
   --verbose          also calls that only keep connections going (HTTP/2
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
   --count N          stop after N calls
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
-  --quiet            don't print calls (with --pcap)
+  --har FILE         also write the HTTP requests and responses to a HAR file
+                     when snoopy stops ("-" for stdout), for browsers'
+                     developer tools and other HAR viewers
+  --quiet            don't print calls (with --pcap or --har)
   --no-color         no colors
 
 Capture:
@@ -187,7 +195,9 @@ func flags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, "")
 	fs.IntVar(&c.count, "count", 0, "")
 	fs.StringVar(&c.pcap, "pcap", "", "")
+	fs.StringVar(&c.har, "har", "", "")
 	fs.BoolVar(&c.quiet, "quiet", false, "")
+	fs.BoolVar(&c.redact, "redact", false, "")
 	fs.BoolVar(&c.noColor, "no-color", false, "")
 	fs.BoolVar(&c.verbose, "verbose", false, "")
 	fs.BoolVar(&c.version, "version", false, "")
@@ -218,6 +228,14 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	if len(output) > 1 {
 		slices.Sort(output)
 		return c, fmt.Errorf("%s can't be combined", strings.Join(output, " and "))
+	}
+	// These show data as sent, where HTTP/2's and HTTP/3's headers are
+	// compressed: they can't be redacted.
+	if c.redact && c.hex {
+		return c, errors.New("--redact can't be combined with --hex, which shows data as captured")
+	}
+	if c.redact && c.pcap != "" {
+		return c, errors.New("--redact can't be combined with --pcap, which writes data as captured")
 	}
 	return c, nil
 }
@@ -718,17 +736,37 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append([]func() error{p.Close}, closers...) // flush before closing the file
 	}
 
+	if cfg.har != "" {
+		w := io.Writer(os.Stdout)
+		if cfg.har == "-" {
+			if stdoutUsed {
+				return nil, nil, errors.New("--pcap - and --har - can't both write to stdout")
+			}
+			stdoutUsed = true
+		} else {
+			f, err := os.Create(cfg.har)
+			if err != nil {
+				return nil, nil, err
+			}
+			closers = append(closers, f.Close)
+			w = f
+		}
+		h := output.NewHAR(w, versionString(), output.Options{Redact: cfg.redact})
+		printers = append(printers, h)
+		closers = append([]func() error{h.Close}, closers...) // written before the file is closed
+	}
+
 	if !cfg.quiet && !stdoutUsed {
 		warn := warnOnce()
 		out := newFlushWriter(os.Stdout)
 		closers = append(closers, out.Close)
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(out, output.Options{Warn: warn}))
+			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Warn: warn}))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Warn: warn}))
+			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Warn: warn}))
 		default:
-			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Warn: warn}))
+			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Warn: warn}))
 		}
 	}
 

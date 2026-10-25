@@ -51,6 +51,7 @@ sudo snoopy --pid 1234                      # one process and those it starts
 sudo snoopy --host example.com --port 443   # connections to example.com on port 443
 sudo snoopy --json | jq 'select(.direction == "write") | .data'
 sudo snoopy --quiet --pcap - | tcpdump -r - -nn -A
+sudo snoopy --comm curl --quiet --har requests.har   # for browsers' developer tools
 ```
 
 A body is shown up to its first 2 KiB, binary bodies are described in a line,
@@ -111,7 +112,9 @@ needs no compiler, kernel headers or BCC.
 
 snoopy's output contains whatever the traced programs send: passwords, API
 tokens, cookies and personal data. Only use it on systems you are authorized
-to inspect, and treat its output and pcap files as sensitive.
+to inspect, and treat its output and pcap files as sensitive. `--redact`
+masks credentials, secret fields and recognizable tokens in the output, for
+sharing it ([docs/usage.md](docs/usage.md#sharing-output)).
 
 ## License
 
