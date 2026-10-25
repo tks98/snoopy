@@ -174,7 +174,9 @@ func (b *Binary) x86ReadsArgs(fn *Func, n int) bool {
 	var walk func(ip uint64, read, dead uint8) bool
 	walk = func(ip uint64, read, dead uint8) bool {
 		all := uint8(1)<<n - 1
-		for ; ip >= fn.Start && ip < fn.End && budget > 0; budget-- {
+		// Counted before branches are followed (see arm64ReadsArgs).
+		for ip >= fn.Start && ip < fn.End && budget > 0 {
+			budget--
 			inst, ok := b.decode(ip)
 			if !ok {
 				return false

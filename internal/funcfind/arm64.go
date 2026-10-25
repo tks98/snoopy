@@ -267,7 +267,10 @@ func (b *Binary) arm64ReadsArgs(fn *Func, n int) bool {
 	budget := 512 // instructions to look at, over all paths
 	var walk func(ip uint64, read, dead uint8) bool
 	walk = func(ip uint64, read, dead uint8) bool {
-		for ; ip >= fn.Start && ip < fn.End && budget > 0; budget-- {
+		// Counted before branches are followed, which recursion does:
+		// a branch to itself would recurse forever otherwise.
+		for ip >= fn.Start && ip < fn.End && budget > 0 {
+			budget--
 			inst, ok := b.arm64Decode(ip)
 			if !ok {
 				return false
