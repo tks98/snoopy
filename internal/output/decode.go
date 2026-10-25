@@ -67,15 +67,16 @@ func connOf(ev *tracer.Event) uint64 {
 
 // decoded is what an event's data was found to hold.
 type decoded struct {
-	data    []byte // the event's data, to show as it is: redacted, with Options.Redact
-	notice  bool   // a tracer.FuncQUICPacketSent, which isn't to be printed
-	isQUIC  bool
-	notQUIC bool       // a QUIC packet that doesn't parse as QUIC frames
-	quic    []quicItem // a QUIC packet's frames and the HTTP/3 they complete
-	isHTTP2 bool
-	http2   []http2Frame
-	note    string         // about the HTTP/2 connection
-	http1   []http1Segment // nil if not HTTP/1
+	data     []byte // the event's data, to show as it is: redacted, with Options.Redact
+	notice   bool   // a tracer.FuncQUICPacketSent, which isn't to be printed
+	isQUIC   bool
+	quicConn quicKey    // the QUIC connection, for both directions
+	notQUIC  bool       // a QUIC packet that doesn't parse as QUIC frames
+	quic     []quicItem // a QUIC packet's frames and the HTTP/3 they complete
+	isHTTP2  bool
+	http2    []http2Frame
+	note     string         // about the HTTP/2 connection
+	http1    []http1Segment // nil if not HTTP/1
 }
 
 func (d decoders) decode(ev *tracer.Event) decoded {
@@ -86,7 +87,7 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 	var dc decoded
 	if ev.Function.IsQUIC() {
 		items, ok := d.quic.process(ev)
-		dc = decoded{isQUIC: true, notQUIC: !ok, quic: items}
+		dc = decoded{isQUIC: true, notQUIC: !ok, quic: items, quicConn: d.quic.last}
 	} else {
 		dc.http2, dc.isHTTP2, dc.note = d.h2.process(ev)
 		if !dc.isHTTP2 {

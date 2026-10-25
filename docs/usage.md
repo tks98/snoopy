@@ -53,7 +53,10 @@ Output:
   --count N          stop after N calls
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
-  --quiet            don't print calls (with --pcap)
+  --har FILE         also write the HTTP requests and responses to a HAR file
+                     when snoopy stops ("-" for stdout), for browsers'
+                     developer tools and other HAR viewers
+  --quiet            don't print calls (with --pcap or --har)
   --no-color         no colors
 
 Capture:
@@ -204,6 +207,26 @@ sudo snoopy --quiet --pcap - | tcpdump -r - -nn -A 'port 443'
 ```
 
 QUIC (HTTP/3) packets aren't written to the pcap.
+
+## HAR files
+
+`--har FILE` writes the HTTP requests and responses snoopy sees to a HAR
+1.2 file when it stops, which Chrome's and Firefox's developer tools open
+(Network, then import), as do other HAR viewers:
+
+```bash
+sudo snoopy --comm curl --quiet --har requests.har
+```
+
+Each entry is a request with its response, paired in order on an HTTP/1.x
+connection and by stream on HTTP/2 and HTTP/3, with headers, cookies, the
+query string, bodies decompressed (up to 4 MiB each), and the time from the
+request to the response's end. Entries also say which process made them
+(`_process`, `_pid`, and `_container` if it ran in one). A request whose
+response wasn't seen, or a response whose request was sent before snoopy
+started, is kept with a comment saying so. The file is written when snoopy
+stops, by Ctrl-C or `--count`, not as it goes. `--redact` applies to it as
+to the other outputs.
 
 ## JSON output
 

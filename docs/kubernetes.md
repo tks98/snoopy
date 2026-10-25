@@ -35,6 +35,7 @@ kubectl snoopy -l app=checkout -n shop   # every pod with these labels
 kubectl snoopy POD --brief               # one line per call
 kubectl snoopy POD --json --port 443     # JSON, port 443 only
 kubectl snoopy POD -- --max-size 65536   # any of snoopy's flags, after --
+kubectl snoopy POD -- --quiet --har - > requests.har   # a HAR file, when you stop it
 kubectl snoopy --cleanup                 # delete snoopy pods left behind
 ```
 
