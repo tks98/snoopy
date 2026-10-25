@@ -31,6 +31,14 @@ arch=$(go env GOARCH)
 mkdir -p "$tmp/image/linux/$arch"
 (cd "$root" && CGO_ENABLED=0 go build -trimpath -o "$tmp/image/linux/$arch/snoopy" .)
 cp "$root/Dockerfile" "$tmp/image/"
+# The Dockerfile copies the Java agent's jars too: built if there's a JDK,
+# else empty, which this test (no --java) doesn't mind.
+mkdir -p "$tmp/image/java/out"
+if command -v javac >/dev/null && sh "$root/java/build.sh" >/dev/null 2>&1; then
+	cp "$root"/java/out/snoopy-*.jar "$tmp/image/java/out/"
+else
+	touch "$tmp/image/java/out/snoopy-agent.jar" "$tmp/image/java/out/snoopy-hooks.jar"
+fi
 docker build -q --build-arg "TARGETPLATFORM=linux/$arch" -t "$image" "$tmp/image" >/dev/null
 kind load docker-image "$image" --name "$cluster" >/dev/null
 (cd "$here" && go build -o "$tmp/kubectl-snoopy" .)
