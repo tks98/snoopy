@@ -121,36 +121,25 @@ func (p *process) trigger(pidfd, root int, name string, deadline time.Time) (int
 	if attachDisabled(p.pid) {
 		return -1, fmt.Errorf("process %d runs with -XX:+DisableAttachMechanism, so no agent can be loaded into it; start it with -javaagent instead", p.pid)
 	}
-	// In its working directory, or else its /tmp: made there, not
-	// somewhere a symlink points, and given to its user through the file
-	// itself.
+	// In its /tmp, which the JVM looks in after its working directory: made
+	// there, not somewhere a symlink points, and given to its user through
+	// the file itself. Not in its working directory, which might be one its
+	// user can't write in (/etc, say), but root can.
 	file := fmt.Sprintf(".attach_pid%d", p.nsPID)
-	made := false
-	for _, open := range []func() (int, error){
-		func() (int, error) { return openCwd(p.pid) },
-		func() (int, error) { return openIn(root, "tmp", unix.O_PATH|unix.O_DIRECTORY, 0) },
-	} {
-		dir, err := open()
-		if err != nil {
-			continue
-		}
-		defer unix.Close(dir)
-		fd, err := createIn(dir, file, 0o600)
-		if errors.Is(err, unix.EEXIST) {
-			made = true // someone's, perhaps a JDK's tool: the JVM looks for it all the same
-			break
-		}
-		if err != nil {
-			continue
-		}
+	tmp, err := openIn(root, "tmp", unix.O_PATH|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return -1, fmt.Errorf("process %d's /tmp: %w", p.pid, err)
+	}
+	defer unix.Close(tmp)
+	switch fd, err := createIn(tmp, file, 0o600); {
+	case errors.Is(err, unix.EEXIST):
+		// Someone's, perhaps a JDK tool's: the JVM looks for it all the same.
+	case err != nil:
+		return -1, fmt.Errorf("can't create %s in process %d's /tmp: %w", file, p.pid, err)
+	default:
 		_ = unix.Fchown(fd, p.uid, p.gid)
 		unix.Close(fd)
-		defer unix.Unlinkat(dir, file, 0)
-		made = true
-		break
-	}
-	if !made {
-		return -1, fmt.Errorf("can't create %s in process %d's working directory or /tmp", file, p.pid)
+		defer unix.Unlinkat(tmp, file, 0)
 	}
 	if err := unix.PidfdSendSignal(pidfd, unix.SIGQUIT, nil, 0); err != nil {
 		return -1, fmt.Errorf("process %d: %w", p.pid, err)

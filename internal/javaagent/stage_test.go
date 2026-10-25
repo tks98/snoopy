@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -58,6 +59,27 @@ func TestStageStaysInRoot(t *testing.T) {
 			if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o644 || string(data) != string(want) {
 				t.Errorf("%s: %v, %q, %v", file, fi.Mode(), data, err)
 			}
+		}
+	})
+
+	t.Run("a FIFO in the staging directory", func(t *testing.T) {
+		root := t.TempDir()
+		staged := filepath.Join(root, "tmp", name)
+		if err := os.MkdirAll(staged, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Mkfifo(filepath.Join(staged, AgentJar), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan string, 1)
+		go func() { done <- stageIn(t, root, agent, hooks) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("staging blocked on a FIFO")
+		}
+		if fi, err := os.Lstat(filepath.Join(staged, AgentJar)); err != nil || !fi.Mode().IsRegular() {
+			t.Errorf("%s: %v, %v", AgentJar, fi.Mode(), err)
 		}
 	})
 

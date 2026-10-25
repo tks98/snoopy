@@ -6,7 +6,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// A process's files are reached through /proc/<pid>/root and /proc/<pid>/cwd,
+// A process's files are reached through /proc/<pid>/root,
 // but a path joined onto those is resolved by snoopy, as root: an absolute
 // symlink in it (planted by the process, or by a container's root, which is
 // often root on the host too) points into snoopy's own filesystem. So paths
@@ -22,11 +22,6 @@ const resolveIn = unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS
 // openRoot returns an O_PATH descriptor for process pid's root directory.
 func openRoot(pid int) (int, error) {
 	return unix.Open(fmt.Sprintf("/proc/%d/root", pid), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-}
-
-// openCwd returns an O_PATH descriptor for process pid's working directory.
-func openCwd(pid int) (int, error) {
-	return unix.Open(fmt.Sprintf("/proc/%d/cwd", pid), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 }
 
 // openIn opens path in the filesystem whose root is root, as the process

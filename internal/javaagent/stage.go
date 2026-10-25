@@ -112,10 +112,17 @@ func stage(root int, agent, hooks []byte) (string, error) {
 // which replaces whatever was there (a symlink included) rather than
 // writing through it.
 func stageFile(dir int, name string, data []byte) error {
-	if fd, err := unix.Openat(dir, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0); err == nil {
+	// What's there already, if it's a regular file (O_NONBLOCK: a FIFO
+	// planted there would block opening it).
+	if fd, err := unix.Openat(dir, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0); err == nil {
+		var st unix.Stat_t
+		regular := unix.Fstat(fd, &st) == nil && st.Mode&unix.S_IFMT == unix.S_IFREG
 		f := os.NewFile(uintptr(fd), name)
-		old, err := io.ReadAll(io.LimitReader(f, int64(len(data))+1))
-		same := err == nil && bytes.Equal(old, data)
+		same := false
+		if regular {
+			old, err := io.ReadAll(io.LimitReader(f, int64(len(data))+1))
+			same = err == nil && bytes.Equal(old, data)
+		}
 		if same {
 			err = unix.Fchmod(fd, 0o644)
 		}
@@ -128,6 +135,7 @@ func stageFile(dir int, name string, data []byte) error {
 	if err := unix.Unlinkat(dir, tmp, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 		return err
 	}
+	// The rename below replaces anything but a directory there.
 	fd, err := createIn(dir, tmp, 0o644)
 	if err != nil {
 		return err
