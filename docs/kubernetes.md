@@ -47,11 +47,18 @@ kubectl snoopy --cleanup                 # delete snoopy pods left behind
 
 Besides a pod, it takes `KIND/NAME` for a deployment, statefulset, daemonset,
 replicaset, job or service (`deploy/checkout`, `sts/db`, `svc/api`), or
-`-l` with a label selector, and traces the pods those select that are
-running when it starts; pods started later aren't followed. It runs one
+`-l` with a label selector, and traces the pods those select. It runs one
 snoopy pod per node, for all of the pods there, at most `--max-nodes` (10)
 of them, and merges their output an event at a time, with their messages
-marked by node. `--count` applies to each snoopy pod.
+marked by node.
+
+It also follows them: pods that start later (a rollout, a scale-up) and
+containers that restart (a crash loop, which gives them a new ID) are
+traced as they come, by new snoopy pods, a node's together if they start
+within a couple of seconds of each other, and a snoopy pod whose containers
+are all gone is deleted. A new container's first calls can be missed while
+its snoopy pod starts. `--no-follow` traces only what's running at the
+start; with `--count`, which applies to each snoopy pod, it doesn't follow.
 
 `--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--redact`, `--host`,
 `--port` and `--count` are snoopy's own and are passed on; the rest of snoopy's flags go
