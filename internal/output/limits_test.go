@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/net/http2"
@@ -170,5 +171,183 @@ func TestGRPCZstdLimits(t *testing.T) {
 	_, err = decompressGRPC("zstd", enc.EncodeAll(make([]byte, maxGRPCMessage+1), nil))
 	if err == nil || !strings.Contains(err.Error(), "bytes decompressed, not decoded") {
 		t.Errorf("too large: %v", err)
+	}
+}
+
+// qpackInsert returns an encoder instruction inserting a literal name and
+// value.
+func qpackInsert(name, value string) []byte {
+	b := qpackPrefixInt(0x40, 5, uint64(len(name)))
+	b = append(b, name...)
+	b = append(b, qpackPrefixInt(0, 7, uint64(len(value)))...)
+	return append(b, value...)
+}
+
+// qpackPrefixInt encodes v as a prefixed integer, first holding the bits
+// above the prefix.
+func qpackPrefixInt(first byte, bits uint, v uint64) []byte {
+	limit := uint64(1)<<bits - 1
+	if v < limit {
+		return []byte{first | byte(v)}
+	}
+	b := []byte{first | byte(limit)}
+	for v -= limit; v >= 128; v >>= 7 {
+		b = append(b, byte(v)|0x80)
+	}
+	return append(b, byte(v))
+}
+
+func TestQPACKLimits(t *testing.T) {
+	setCapacity := func(c uint64) []byte { return qpackPrefixInt(0x20, 5, c) }
+	d := qpackDecoder{maxCapacity: 4096, maxKnown: true}
+	if err := d.encoderStream(setCapacity(8192)); err == nil {
+		t.Error("capacity above the advertised maximum accepted")
+	}
+	d = qpackDecoder{}
+	if err := d.encoderStream(setCapacity(1 << 32)); err == nil {
+		t.Error("4 GiB capacity accepted")
+	}
+	// Duplicates fill the table but no more.
+	d = qpackDecoder{}
+	if err := d.encoderStream(append(setCapacity(maxQPACKCapacity), qpackInsert("x-token", "v")...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.encoderStream(make([]byte, 1<<20)); err != nil { // Duplicate the newest entry
+		t.Fatal(err)
+	}
+	if len(d.entries) > maxQPACKCapacity/32 {
+		t.Errorf("%d entries", len(d.entries))
+	}
+	// An instruction that never ends.
+	d = qpackDecoder{}
+	d.encoderStream(setCapacity(maxQPACKCapacity))
+	var err error
+	for i := 0; i < 64 && err == nil; i++ {
+		err = d.encoderStream(append(qpackPrefixInt(0x40, 5, 1<<35), make([]byte, 64<<10)...))
+	}
+	if err == nil || len(d.pending) > maxQPACKInstruction+64<<10 {
+		t.Errorf("%v, %d bytes pending", err, len(d.pending))
+	}
+}
+
+func TestQPACKHeaderListLimit(t *testing.T) {
+	d := newQUICDir(newBodyPool())
+	enc := append([]byte{0x02}, qpackPrefixInt(0x20, 5, maxQPACKCapacity)...) // encoder stream
+	enc = append(enc, qpackInsert("x", strings.Repeat("v", maxQPACKCapacity-100))...)
+	d.streamData(streamFrame{id: 2, data: enc})
+	section := append([]byte{0x02, 0x00}, bytes.Repeat([]byte{0x80}, 300)...) // the entry, 300 times
+	items := d.streamData(streamFrame{id: 0, data: h3Frame(1, section), fin: true})
+	size, cut := 0, false
+	for _, it := range items {
+		for _, h := range it.Headers {
+			size += int(h.Size())
+		}
+		cut = cut || strings.Contains(it.Err, "the rest of its fields aren't shown")
+	}
+	if size == 0 || size > maxHeaderList || !cut {
+		t.Errorf("headers of %d bytes, cut %v: %+v", size, cut, items)
+	}
+}
+
+func TestQUICReassembly(t *testing.T) {
+	// A DATA frame of n bytes, its first byte last and the others in
+	// reverse order: each piece is out of order until the first comes.
+	const n = 15000
+	payload := make([]byte, n)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	frame := h3Frame(0, payload)
+	head := len(frame) - n
+	d := newQUICDir(newBodyPool())
+	for i := len(frame) - 1; i >= head; i-- {
+		if items := d.streamData(streamFrame{id: 0, offset: uint64(i), data: frame[i : i+1]}); items != nil {
+			t.Fatalf("at %d: %+v", i, items)
+		}
+	}
+	start := time.Now()
+	items := d.streamData(streamFrame{id: 0, data: frame[:head], fin: true})
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("reassembly took %v", took)
+	}
+	var got []byte
+	for _, it := range items {
+		got = append(got, it.Data...)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("reassembled %d bytes, not the %d sent", len(got), n)
+	}
+
+	// Empty frames ahead are kept as nothing.
+	d = newQUICDir(newBodyPool())
+	for i := range 100000 {
+		d.streamData(streamFrame{id: 4, offset: uint64(10 + i)})
+	}
+	if s := d.streams[4]; len(s.early) != 0 || s.pending != 0 {
+		t.Errorf("%d empty pieces kept", len(s.early))
+	}
+}
+
+func TestQUICStreamsBounded(t *testing.T) {
+	// Finished streams are forgotten, and their retransmissions ignored.
+	d := newQUICDir(newBodyPool())
+	for i := range 100000 {
+		d.streamData(streamFrame{id: uint64(4 * i), data: h3Frame(7, nil), fin: true})
+	}
+	if len(d.streams) != 0 || len(d.done.ids) > maxQUICDone {
+		t.Errorf("%d streams, %d done kept", len(d.streams), len(d.done.ids))
+	}
+	if items := d.streamData(streamFrame{id: 0, data: h3Frame(7, nil), fin: true}); items != nil {
+		t.Errorf("retransmission: %+v", items)
+	}
+	// Streams left open are given up on, oldest first, but not the
+	// control and QPACK streams.
+	d = newQUICDir(newBodyPool())
+	d.streamData(streamFrame{id: 2, data: []byte{0x00}})
+	var given int
+	for i := range 1000 {
+		for _, it := range d.streamData(streamFrame{id: uint64(4 * i), data: h3Frame(1, nil)[:1]}) {
+			if it.HTTP3 == "(stream given up)" {
+				given++
+			}
+		}
+	}
+	if len(d.streams) > maxQUICStreams || given == 0 || d.streams[2] == nil || d.streams[4*999] == nil {
+		t.Errorf("%d streams, %d given up", len(d.streams), given)
+	}
+	// Out-of-order data is bounded per direction, not just per stream.
+	d = newQUICDir(newBodyPool())
+	chunk := make([]byte, 1200)
+	given = 0
+	h0 := heapInUse()
+	for s := range 300 {
+		for off := 0; off < maxQUICStreamEarly*7/8; off += len(chunk) {
+			if d.streamData(streamFrame{id: uint64(4 * s), offset: uint64(1 + off), data: chunk}) != nil {
+				given++
+			}
+		}
+	}
+	if h := heapInUse(); d.held > maxQUICDirHeld || h > h0+3*maxQUICDirHeld || given != 300-4 {
+		t.Errorf("%d bytes held, heap grew %d MiB, %d streams given up", d.held, (h-h0)>>20, given)
+	}
+	runtime.KeepAlive(d)
+}
+
+func heapInUse() uint64 {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapInuse
+}
+
+func TestQUICBlockedBounded(t *testing.T) {
+	d := newQUICDir(newBodyPool())
+	d.startSeen = true
+	section := append([]byte{0x05, 0x00}, make([]byte, 100<<10)...) // needs entries never inserted
+	for i := range 64 {
+		d.streamData(streamFrame{id: uint64(4 * i), data: h3Frame(1, section)})
+	}
+	if d.blockedBytes > maxBlockedBytes || len(d.blocked) == 0 {
+		t.Errorf("%d blocked sections of %d bytes", len(d.blocked), d.blockedBytes)
 	}
 }

@@ -1,9 +1,12 @@
 package output
 
 import (
+	"cmp"
+	"container/heap"
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -78,6 +81,10 @@ type quicDir struct {
 	maxTableCapacity int64
 	bodies           map[uint64]*bodyDecoder // by stream, for encoded bodies
 	pool             *bodyPool
+	done             doneStreams
+	held             int    // bytes held for streams: their early and buf, with overhead
+	blockedBytes     int    // in blocked
+	clock            uint64 // for evicting the least recently used stream
 }
 
 func newQUICDir(pool *bodyPool) *quicDir {
@@ -93,6 +100,66 @@ func quicKeyOf(ev *tracer.Event) quicKey {
 	return quicKey{pid: ev.PID, fd: -1, conn: ev.ConnID, send: send}
 }
 
+// doneStreams remembers the streams done with, finished or given up, so
+// that retransmitted data doesn't start them over. Each kind of stream (the
+// low two bits of its ID) is opened in order, and streams mostly end in
+// about the order they start, so that's mostly a count of each kind below
+// which all are done.
+type doneStreams struct {
+	below [4]uint64           // stream numbers (ID >> 2) below these are done
+	ids   map[uint64]struct{} // and these, above them
+}
+
+func (s *doneStreams) has(id uint64) bool {
+	if id>>2 < s.below[id&3] {
+		return true
+	}
+	_, ok := s.ids[id]
+	return ok
+}
+
+func (s *doneStreams) add(id uint64) {
+	k := id & 3
+	if id>>2 < s.below[k] {
+		return
+	}
+	if s.ids == nil {
+		s.ids = map[uint64]struct{}{}
+	}
+	s.ids[id] = struct{}{}
+	for {
+		next := s.below[k]<<2 | k
+		if _, ok := s.ids[next]; !ok {
+			break
+		}
+		delete(s.ids, next)
+		s.below[k]++
+	}
+	if len(s.ids) > maxQUICDone {
+		// Streams whose end wasn't seen hold the counts back. Count every
+		// stream up to the last one done as done: one not seen yet below
+		// that is all but certain to have been missed.
+		for id := range s.ids {
+			s.below[id&3] = max(s.below[id&3], id>>2+1)
+		}
+		clear(s.ids)
+	}
+}
+
+// offsetHeap is a min-heap of the offsets of a stream's early data.
+type offsetHeap []uint64
+
+func (h offsetHeap) Len() int           { return len(h) }
+func (h offsetHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h offsetHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *offsetHeap) Push(x any)        { *h = append(*h, x.(uint64)) }
+func (h *offsetHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}
+
 type blockedSection struct {
 	stream uint64
 	block  []byte
@@ -103,7 +170,8 @@ type blockedSection struct {
 type quicStream struct {
 	next     uint64            // offset of the next byte to deliver
 	early    map[uint64][]byte // data that arrived ahead of next, by offset
-	pending  int               // bytes in early
+	earlyAt  offsetHeap        // early's offsets
+	pending  int               // bytes in early, with earlyOverhead for each piece
 	buf      []byte            // delivered bytes not parsed yet
 	uniType  int64             // a unidirectional stream's type once read; -1 before
 	dataLeft uint64            // payload bytes still to come of the current DATA frame
@@ -112,13 +180,34 @@ type quicStream struct {
 	final    uint64 // and is this
 	dataSeen bool   // a DATA frame was read
 	body     bodyInfo
+	lastUsed uint64
+}
+
+// held returns the bytes held for the stream, counted against maxQUICDirHeld.
+func (s *quicStream) held() int {
+	return len(s.buf) + s.pending
 }
 
 const (
 	maxQUICDirs        = 4096
-	maxQUICStreamEarly = 1 << 20 // out-of-order bytes kept per stream
-	maxHTTP3Frame      = 1 << 20 // larger non-DATA frames are given up on
-	maxBlocked         = 64      // header blocks kept waiting for encoder stream data
+	maxQUICStreamEarly = 1 << 20   // out-of-order bytes kept per stream
+	maxHTTP3Frame      = 1 << 20   // larger non-DATA frames are given up on
+	maxBlocked         = 64        // header blocks kept waiting for encoder stream data
+	maxBlockedBytes    = 256 << 10 // and their bytes, per direction
+	// Streams followed at once per direction. Peers allow about 100
+	// requests at a time (MAX_STREAMS), and open a few unidirectional
+	// streams.
+	maxQUICStreams = 256
+	// Bytes held per direction for its streams: out-of-order data and
+	// frames not complete yet. Four streams' worth of maxQUICStreamEarly.
+	maxQUICDirHeld = 4 << 20
+	// Streams remembered as done past the counts in doneStreams; a few
+	// bytes each.
+	maxQUICDone = 4096
+	// What each piece of out-of-order data counts for in pending, besides
+	// its bytes, for the memory it takes to keep: else a peer could send
+	// millions of 1-byte pieces.
+	earlyOverhead = 64
 )
 
 // migrationWindow is how recently a connection must have used a context for
@@ -192,6 +281,7 @@ func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 	}
 	if o != nil && o.maxTableCapacity >= 0 {
 		d.qpack.maxEntries = int(o.maxTableCapacity / 32)
+		d.qpack.maxCapacity, d.qpack.maxKnown = o.maxTableCapacity, true
 	}
 
 	// A decrypted packet's frames end exactly where it does, unless the
@@ -471,11 +561,69 @@ func parseQUICFrames(b []byte) (summaries []string, streams []streamFrame, issue
 // streamData delivers a STREAM frame's data and returns the HTTP/3 frames it
 // completes.
 func (d *quicDir) streamData(sf streamFrame) []quicItem {
+	var items []quicItem
 	s := d.streams[sf.id]
 	if s == nil {
+		if d.done.has(sf.id) {
+			return nil // a retransmission, or the stream was given up
+		}
+		if len(d.streams) >= maxQUICStreams {
+			items = d.evictStreams()
+		}
 		s = &quicStream{early: map[uint64][]byte{}, uniType: -1}
 		d.streams[sf.id] = s
 	}
+	d.clock++
+	s.lastUsed = d.clock
+	before := s.held()
+	items = append(items, d.deliver(sf, s)...)
+	d.held += s.held() - before
+	switch {
+	case s.broken, s.finSeen && s.next >= s.final:
+		d.forget(sf.id, s, errors.New("the stream was given up"))
+	case d.held > maxQUICDirHeld:
+		d.forget(sf.id, s, errors.New("too much data waiting across the connection's streams"))
+		items = append(items, quicItem{HTTP3: "(stream given up)", Stream: sf.id,
+			Err: "too much data waiting across the connection's streams"})
+	}
+	return items
+}
+
+// forget stops following a stream, which is done with: finished, or given
+// up for err, which its body's decoder is told if it's still going.
+func (d *quicDir) forget(id uint64, s *quicStream, err error) {
+	if dec := d.bodies[id]; dec != nil {
+		dec.fail(err)
+		delete(d.bodies, id)
+	}
+	d.held -= s.held()
+	delete(d.streams, id)
+	d.done.add(id)
+}
+
+// evictStreams gives up on the least recently used eighth of the streams,
+// to make room for more, except for the unidirectional streams opened
+// first: the control and QPACK streams, which last as long as the
+// connection.
+func (d *quicDir) evictStreams() []quicItem {
+	ids := make([]uint64, 0, len(d.streams))
+	for id := range d.streams {
+		if id&0x02 == 0 || id >= 16 {
+			ids = append(ids, id)
+		}
+	}
+	slices.SortFunc(ids, func(a, b uint64) int { return cmp.Compare(d.streams[a].lastUsed, d.streams[b].lastUsed) })
+	var items []quicItem
+	for _, id := range ids[:min(len(ids), max(maxQUICStreams/8, 1))] {
+		d.forget(id, d.streams[id], errors.New("given up: too many streams at once"))
+		items = append(items, quicItem{HTTP3: "(stream given up)", Stream: id, Err: "too many streams at once"})
+	}
+	return items
+}
+
+// deliver reassembles a STREAM frame's data and returns the HTTP/3 frames it
+// completes.
+func (d *quicDir) deliver(sf streamFrame, s *quicStream) []quicItem {
 	if s.broken {
 		return nil
 	}
@@ -491,9 +639,13 @@ func (d *quicDir) streamData(sf streamFrame) []quicItem {
 		data, off = data[s.next-off:], s.next
 	}
 	if off > s.next {
+		if len(data) == 0 {
+			return nil // nothing to keep: a FIN alone, noted above
+		}
 		if _, dup := s.early[off]; !dup {
 			s.early[off] = append([]byte(nil), data...)
-			s.pending += len(data)
+			heap.Push(&s.earlyAt, off)
+			s.pending += len(data) + earlyOverhead
 		}
 		if s.pending > maxQUICStreamEarly {
 			s.broken = true
@@ -507,30 +659,15 @@ func (d *quicDir) streamData(sf streamFrame) []quicItem {
 	}
 	s.buf = append(s.buf, data...)
 	s.next += uint64(len(data))
-	for { // data that was waiting for this
-		var next []byte
-		var at uint64
-		found := false
-		for o, e := range s.early {
-			if o <= s.next && o+uint64(len(e)) > s.next {
-				next, at, found = e, o, true
-				break
-			}
-		}
-		for o, e := range s.early {
-			if o+uint64(len(e)) <= s.next {
-				delete(s.early, o)
-				s.pending -= len(e)
-			}
-		}
-		if !found {
-			break
-		}
+	for len(s.earlyAt) > 0 && s.earlyAt[0] <= s.next { // data that was waiting for this
+		at := heap.Pop(&s.earlyAt).(uint64)
+		e := s.early[at]
 		delete(s.early, at)
-		s.pending -= len(next)
-		next = next[s.next-at:]
-		s.buf = append(s.buf, next...)
-		s.next += uint64(len(next))
+		s.pending -= len(e) + earlyOverhead
+		if end := at + uint64(len(e)); end > s.next {
+			s.buf = append(s.buf, e[s.next-at:]...)
+			s.next = end
+		}
 	}
 	items := d.http3(sf.id, s)
 	if dec := d.bodies[sf.id]; dec != nil && s.finSeen && s.next >= s.final {
@@ -624,7 +761,7 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 		s.buf = s.buf[header+int(length):]
 		switch typ {
 		case 0x01: // HEADERS
-			items = append(items, d.headers(id, payload))
+			items = append(items, d.headers(id, payload)...)
 		case 0x04: // SETTINGS
 			settings := http3Settings(payload)
 			if v, ok := settings[0x01]; ok && s.uniType == 0 {
@@ -650,23 +787,37 @@ func (s *quicStream) data(typ string, id uint64, data []byte, dec *bodyDecoder) 
 	return item
 }
 
-func (d *quicDir) headers(id uint64, block []byte) quicItem {
+func (d *quicDir) headers(id uint64, block []byte) []quicItem {
 	fields, err := d.qpack.fieldSection(block)
 	if errors.Is(err, errBlocked) {
-		if len(d.blocked) >= maxBlocked {
+		for len(d.blocked) > 0 && (len(d.blocked) >= maxBlocked || d.blockedBytes+len(block) > maxBlockedBytes) {
+			d.blockedBytes -= len(d.blocked[0].block)
 			d.blocked = append(d.blocked[:0], d.blocked[1:]...)
 		}
-		d.blocked = append(d.blocked, blockedSection{id, append([]byte(nil), block...)})
-		if !d.startSeen {
-			return quicItem{HTTP3: "HEADERS", Stream: id,
-				Err: "headers not decoded: the connection probably started before snoopy"}
+		if len(block) <= maxBlockedBytes {
+			d.blocked = append(d.blocked, blockedSection{id, append([]byte(nil), block...)})
+			d.blockedBytes += len(block)
 		}
-		return quicItem{HTTP3: "HEADERS", Stream: id, Err: "waiting for QPACK encoder stream data"}
+		if !d.startSeen {
+			return []quicItem{{HTTP3: "HEADERS", Stream: id,
+				Err: "headers not decoded: the connection probably started before snoopy"}}
+		}
+		return []quicItem{{HTTP3: "HEADERS", Stream: id, Err: "waiting for QPACK encoder stream data"}}
 	}
+	return d.decodedItems(id, fields, err)
+}
+
+// decodedItems returns the items for a field section that fieldSection
+// returned fields and err for.
+func (d *quicDir) decodedItems(id uint64, fields []hpack.HeaderField, err error) []quicItem {
+	if err != nil && !errors.Is(err, errFieldsCut) {
+		return []quicItem{{HTTP3: "HEADERS", Stream: id, Err: err.Error()}}
+	}
+	items := []quicItem{d.decoded(id, fields)}
 	if err != nil {
-		return quicItem{HTTP3: "HEADERS", Stream: id, Err: err.Error()}
+		items = append(items, quicItem{HTTP3: "HEADERS", Stream: id, Err: err.Error()})
 	}
-	return d.decoded(id, fields)
+	return items
 }
 
 // decoded returns the item for a decoded header block, and starts following
@@ -686,7 +837,7 @@ func (d *quicDir) decoded(id uint64, fields []hpack.HeaderField) quicItem {
 func (d *quicDir) startBody(id uint64, fields []hpack.HeaderField) bodyPart {
 	// Header blocks waiting for QPACK data are decoded late; if the body
 	// went by meanwhile, it's too late to decode it.
-	if s := d.streams[id]; d.bodies[id] != nil || s != nil && s.dataSeen {
+	if s := d.streams[id]; d.bodies[id] != nil || s != nil && s.dataSeen || s == nil && d.done.has(id) {
 		return bodyPart{}
 	}
 	enc := contentEncoding(fields)
@@ -709,16 +860,15 @@ func (d *quicDir) startBody(id uint64, fields []hpack.HeaderField) bodyPart {
 func (d *quicDir) retryBlocked() []quicItem {
 	var items []quicItem
 	still := d.blocked[:0]
+	d.blockedBytes = 0
 	for _, b := range d.blocked {
 		fields, err := d.qpack.fieldSection(b.block)
-		switch {
-		case errors.Is(err, errBlocked):
+		if errors.Is(err, errBlocked) {
 			still = append(still, b)
-		case err != nil:
-			items = append(items, quicItem{HTTP3: "HEADERS", Stream: b.stream, Err: err.Error()})
-		default:
-			items = append(items, d.decoded(b.stream, fields))
+			d.blockedBytes += len(b.block)
+			continue
 		}
+		items = append(items, d.decodedItems(b.stream, fields, err)...)
 	}
 	d.blocked = still
 	return items
