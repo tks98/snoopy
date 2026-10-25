@@ -6,11 +6,13 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
@@ -119,6 +121,15 @@ func (s *grpcStream) message(compressed bool, b []byte) grpcMessage {
 	return m
 }
 
+// grpcZstd is the decoder for zstd messages, shared since making one is
+// costly. Its window is limited as bodies' are, and its output to
+// maxGRPCMessage: a frame's header can otherwise ask for gigabytes.
+// DecodeAll can be used by several goroutines at once.
+var grpcZstd = sync.OnceValues(func() (*zstd.Decoder, error) {
+	return zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true),
+		zstd.WithDecoderMaxWindow(zstdMaxWindow), zstd.WithDecoderMaxMemory(maxGRPCMessage))
+})
+
 // decompressGRPC decompresses a message with one of gRPC's encodings
 // (grpc-encoding), up to maxGRPCMessage bytes.
 func decompressGRPC(encoding string, b []byte) ([]byte, error) {
@@ -133,11 +144,18 @@ func decompressGRPC(encoding string, b []byte) ([]byte, error) {
 			r, err = flate.NewReader(bytes.NewReader(b)), nil
 		}
 	case "zstd":
-		var d *zstd.Decoder
-		if d, err = zstd.NewReader(bytes.NewReader(b)); err == nil {
-			defer d.Close()
-			r = d
+		d, err := grpcZstd()
+		if err != nil {
+			return nil, fmt.Errorf("zstd: %v", err)
 		}
+		out, err := d.DecodeAll(b, nil)
+		if errors.Is(err, zstd.ErrDecoderSizeExceeded) {
+			return nil, fmt.Errorf("more than %d bytes decompressed, not decoded", maxGRPCMessage)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("zstd: %v", err)
+		}
+		return out, nil
 	case "", "identity":
 		return nil, fmt.Errorf("compressed, but the stream has no grpc-encoding")
 	default:
