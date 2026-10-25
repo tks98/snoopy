@@ -523,10 +523,25 @@ func Selected(pid int, comm string) []int {
 	if comm == "" {
 		return pids
 	}
-	return slices.DeleteFunc(pids, func(p int) bool {
-		name, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", p))
-		return err != nil || !strings.HasPrefix(string(name), comm)
-	})
+	return slices.DeleteFunc(pids, func(p int) bool { return !nameMatches("/proc", p, comm) })
+}
+
+// NameMatches reports whether a process's name, as /proc/<pid>/comm shows
+// it, or its program's file name starts with prefix, as Options.Comm is
+// matched: some programs rename themselves (Node.js's official builds call
+// their main thread MainThread, which is what comm shows).
+func NameMatches(pid int, prefix string) bool {
+	return nameMatches("/proc", pid, prefix)
+}
+
+func nameMatches(proc string, pid int, prefix string) bool {
+	dir := filepath.Join(proc, strconv.Itoa(pid))
+	if comm, err := os.ReadFile(filepath.Join(dir, "comm")); err == nil &&
+		strings.HasPrefix(strings.TrimSuffix(string(comm), "\n"), prefix) {
+		return true
+	}
+	exe, err := os.Readlink(filepath.Join(dir, "exe"))
+	return err == nil && strings.HasPrefix(filepath.Base(strings.TrimSuffix(exe, deletedSuffix)), prefix)
 }
 
 // knownFiles returns the known programs that are installed, of those whose
@@ -732,11 +747,8 @@ func allProcessFiles(proc, comm string) (files []candidate, denied int) {
 		if err != nil || pid == self {
 			continue
 		}
-		if comm != "" {
-			name, err := os.ReadFile(filepath.Join(proc, e.Name(), "comm"))
-			if err != nil || !strings.HasPrefix(string(name), comm) {
-				continue
-			}
+		if comm != "" && !nameMatches(proc, pid, comm) {
+			continue
 		}
 		f, err := processFiles(proc, pid)
 		if errors.Is(err, os.ErrPermission) {
