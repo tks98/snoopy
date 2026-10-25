@@ -356,13 +356,18 @@ match them.
 
 Run snoopy on the host, or in a privileged container that shares the host's
 PID namespace, so it can see other containers' processes and their files
-through `/proc`. Each release has an image with just the binary, for amd64
-and arm64:
+through `/proc`. Each release has an image with just the binary and the
+Java agent's jars, for amd64 and arm64. Its tag is the release's version
+without the `v`; `latest`, the default, is the newest release:
 
 ```bash
 docker run --rm -it --privileged --pid=host ghcr.io/tks98/snoopy --brief
-docker run --rm -it --privileged --pid=host ghcr.io/tks98/snoopy:2.6.0 --comm curl
+docker run --rm -it --privileged --pid=host ghcr.io/tks98/snoopy:2.9.1 --comm curl
 ```
+
+Images of releases after 2.9.1 have attested build provenance, which
+`gh attestation verify oci://ghcr.io/tks98/snoopy:VERSION --repo
+tks98/snoopy` checks.
 
 In a container, snoopy finds the host's TLS libraries through
 `/proc/1/root`, and other containers' through their processes, so it traces

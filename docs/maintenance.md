@@ -74,6 +74,8 @@ file, then match what you see:
 `.github/workflows/canary.yml` runs weekly (and from the Actions tab, and on
 PRs that change it) against the latest browsers and Fedora's curl; its
 download script, `.github/canary/fetch.sh`, does what this section describes.
+Its Fedora image is a release pinned by digest, whose updates bring curl's;
+move it to each new Fedora release there.
 When it fails, the job's name says which program, and the sections below say
 how to fix each. The script runs locally too, e.g.
 `spec=$(.github/canary/fetch.sh chrome beta /tmp/chrome)` and then
@@ -279,9 +281,11 @@ kernel's PID namespace and in a new one (the program numbers PIDs
 differently there), under each kernel vimto has downloaded, booting it in QEMU with a small init. It's
 quicker than the tests, and covers 5.10. It uses the kernels
 `tools/loadcheck/fetch.sh 5.10 5.15 6.1 6.6 6.12` downloads (with Docker,
-from Cilium's CI kernel images), and those vimto has. The Load check
-workflow runs both on x86-64 for every change to the BPF code or how it's
-loaded.
+from Cilium's CI kernel images, each by the digest pinned in the script,
+which says how to move one on), and those vimto has. The Load check
+workflow runs both on x86-64 and arm64 for every change to the BPF code or
+how it's loaded; the arm64 runners have no KVM, so QEMU emulates there,
+about half a minute a kernel.
 
 ## Chrome, Electron and other Chromium builds
 
@@ -769,7 +773,10 @@ under another PID).
 
 - **A new JDK:** add it to the `java` job in `.github/workflows/ci.yml`,
   run `javap` as above, and if ASM is older than the JDK, bump `ASM` and its
-  SHA-1s in `java/build.sh` (Maven Central has the `.sha1` files).
+  SHA-256 sums in `java/build.sh`: take them from the downloads, after
+  checking those against Maven Central's `.sha1` files, its only sums. The
+  same goes for the Netty and Conscrypt jars in `javaLibs`
+  (`internal/tracer/integration_test.go`).
 - **A moved method:** match its new name or descriptor in `Agent.Visitor`;
   if the shorter `wrap`/`unwrap` no longer go through the six-argument
   ones, instrument one level only, or engine calls are captured twice.

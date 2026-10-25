@@ -11,41 +11,40 @@ used. [AGENTS.md](AGENTS.md) is the short list for coding agents.
 
 ## Status
 
-On main: version 2, the rewrite on cilium/ebpf with a CO-RE eBPF program
-(#4); exec watching with wolfSSL, Mbed TLS and s2n-tls (#9); and HPACK,
-rustls, Chrome by signature (x86_64 and arm64), HTTP/3 for Chromium and
-Firefox, and compressed bodies (#10); docs on the fragile parts (#12);
-tcpdump-style output and filters (#13); and fixes for a first run: output
-limits, `--pid` following children, connections from before snoopy, the
-`/v2` module path (#14), and install steps that make `sudo snoopy` work
-(#15).
+Released: v2.9.1, the latest of the v2 releases (the first was v2.0.0). A
+`v*` tag runs `release.yml`: GoReleaser publishes the snoopy archives
+(linux amd64 and arm64, with the Java agent's jars), kubectl-snoopy's for
+Linux, macOS and Windows, an SBOM for each, the jars, the krew manifest,
+`checksums.txt` and the image `ghcr.io/tks98/snoopy`, and the workflow
+attests the build provenance of `checksums.txt`'s files and of the image
+(from the release after v2.9.1). `go install
+github.com/tks98/snoopy/v2@latest` installs it too.
 
-Released: v2.0.0, the first release, tagged on #14's merge. GoReleaser
-published linux amd64 and arm64 binaries, and `go install
-github.com/tks98/snoopy/v2@latest` installs it.
+What CI checks, and when:
 
-| Check | Status |
+| Check | When |
 | --- | --- |
-| Lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date | Green in CI |
-| Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
-| Latest Chrome, Electron and Firefox found by signature, and Fedora's curl over HTTP/3 | Weekly in CI (`canary.yml`) |
-| Overhead | Measured by hand with `docs/benchmark/run.sh`; results in [docs/performance.md](docs/performance.md) |
-| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #14 (24 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
-| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | All 32 pass with quic-go support, with `SNOOPY_TEST_RUSTLS=1` and `SNOOPY_TEST_CURL_HTTP3` pointing at a Fedora 44 chroot |
-| Rust, curl and Go tests on x86_64 (Lima, 6.8) | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, `TestCurlHTTP3`, `TestQuicGoHTTP3` and the Go TLS tests pass with quic-go support, cross-built on arm64 since rustup doesn't run in the emulated VM; copy them into the VM, since its shared folder can serve stale files |
-| BPF load on 5.10 to 6.12 | With quic-go support, every program loads in default, `--pid` and `--comm` modes (a QEMU load check; vimto's 5.10 runs fail on an overlayfs xattr) |
-| Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded. With #14, again on the arm64 Chromium and Firefox snaps: `--pid` of Chromium's main process, connections opened before snoopy, and Firefox from a fresh start |
+| gofmt, vet, golangci-lint, unit and race tests, govulncheck, amd64 and arm64 builds, BPF objects up to date (`ci.yml`) | Each pull request |
+| Integration tests on the runners' kernels, x86_64 and arm64, every C client including s2n-tls (built from source), with `SNOOPY_TEST_STRICT=1` so a missing client fails (`ci.yml`) | Each pull request |
+| `TestJSSE` on JDK 17, 21 and 25, x86_64 and arm64 (`ci.yml`) | Each pull request |
+| The kubectl plugin, and a kind cluster end to end (`kubectl-snoopy.yml`) | Each pull request |
+| Every BPF program loads under 5.10, 5.15, 6.1, 6.6 and 6.12, in QEMU, x86_64 and arm64 (`loadcheck.yml`) | Changes to the BPF code or how it's loaded |
+| A snapshot release: GoReleaser's config, the image, krew installing the plugin, reproducible jars and archives (`release-check.yml`) | Changes to the release's configuration |
+| `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, x86_64 and arm64 (`rust.yml`) | Weekly, and changes to those clients |
+| Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, and Fedora's curl over HTTP/3 (`canary.yml`) | Weekly |
+| Overhead (`benchmark.yml`, `docs/benchmark/`) | By hand; results in [docs/performance.md](docs/performance.md) |
+
+Not in CI: the integration tests on 5.10 to 6.12, which took too long
+there (#8); run them with vimto after changing `bpf/snoopy.c` (AGENTS.md,
+[docs/maintenance.md](docs/maintenance.md#older-kernels)). Browsers beyond
+the canary's signature checks are tested by hand (docs/maintenance.md has
+the recipes).
 
 ### To do
 
-1. **Dependabot.** #5 (golangci-lint-action 9) and #7 (goreleaser-action
-   7) are open. Go is at 1.26, with `golang.org/x/arch` 0.32 checked as
-   [docs/maintenance.md](docs/maintenance.md#funcfind-and-golangorgxarch)
-   describes: the arm64 finder gives the same answers on Debian's Chromium
-   155 and Firefox ESR 153 as with 0.30.
-2. **Guard against browser releases.** The list in
-   [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it), the
-   weekly canary job against the latest Chrome, Electron and Firefox first.
+1. **Guard against browser releases.** The rest of the list in
+   [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it); the
+   weekly canary covers finding them by signature, not capturing.
 
 ## Working on it from a Mac
 
@@ -78,8 +77,8 @@ Running other kernels (vimto) needs QEMU. Without KVM it is slow but works:
 `VIMTO_DISABLE_KVM=true make integration-vm KERNEL=5.10` took about a minute
 per kernel here. Nested virtualization in a Mac VM needs an M3 or newer and
 macOS 15; otherwise use `VIMTO_DISABLE_KVM=true` or let CI do it. The
-`ci-kernels` images used so far were x86_64. If arm64 images aren't
-available, run that matrix only in CI.
+`ci-kernels` images come for x86_64 and arm64; `tools/loadcheck` uses
+both.
 
 ## Commands
 
@@ -95,7 +94,8 @@ sudo ./snoopy --verbose    # try it
 
 The integration tests skip clients that aren't installed: curl, python3,
 gnutls-cli, and cc with libnss3-dev for the NSS client in
-`internal/tracer/testdata`. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
+`internal/tracer/testdata`, or with `SNOOPY_TEST_STRICT=1` (CI) fail
+instead. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
 and quinn clients with cargo, and `SNOOPY_TEST_CURL_HTTP3` runs curl's HTTP/3
 from a system that has it (see AGENTS.md). `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
 signature finding against real binaries (see
@@ -122,8 +122,11 @@ signature finding against real binaries (see
 | `java/` | The Java agent (`agent/src`: the ASM transformer and `Hooks`, which writes frames to `/dev/null`), `build.sh`, and the spike's tools |
 | `main.go` | CLI flags and wiring |
 | `java.go` | `--java`: which JVMs, loading the agent into them, stopping it |
-| `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64) |
-| `.github/workflows/release.yml`, `.goreleaser.yaml` | Releases on `v*` tags |
+| `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64), the Java agent per JDK |
+| `.github/workflows/rust.yml`, `canary.yml`, `loadcheck.yml`, `release-check.yml`, `kubectl-snoopy.yml`, `benchmark.yml` | The other checks in the Status table |
+| `.github/workflows/release.yml`, `.goreleaser.yaml`, `Dockerfile` | Releases on `v*` tags, and their attestations |
+| `tools/loadcheck/` | Loads every BPF program under older kernels in QEMU (`fetch.sh`, `run.sh`) |
+| `tools/act.sh` | Runs the workflows' jobs locally with act |
 | `.vimto.toml` | VM settings for kernel-matrix tests (root, 2 GB, loopback up) |
 
 ## How it works, and what to keep in mind when changing it
@@ -196,8 +199,10 @@ signature finding against real binaries (see
   against the bpf2go type.
 - **Stripped Go binaries** are located via `.gopclntab`, using `runtime.text`
   from the pclntab header. With cgo/external linking it isn't the start of
-  `.text`. `checkGoPrologue` refuses to attach unless the function starts with
-  Go's stack check, so a mistake can't plant breakpoints mid-instruction.
+  `.text`. `goBodyOffset` (`internal/discover/inspect.go`) refuses to attach
+  unless the function starts with Go's stack check, so a mistake can't plant
+  breakpoints mid-instruction, and attaches after it, where a call that
+  grows the stack doesn't fire the probe twice.
 - **Deleted or replaced files** in use by a process are attached through
   `/proc/<pid>/map_files/<range>` or `/proc/<pid>/exe`. This needs
   CAP_SYS_ADMIN.
