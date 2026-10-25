@@ -30,6 +30,21 @@ var ErrUnsupported = errors.New("funcfind: unsupported architecture")
 // maxFuncSize bounds how far a function's start or end is searched for.
 const maxFuncSize = 64 << 10
 
+// Binaries come from any process traced, including ones an attacker in a
+// container controls, who can make a sparse file claim sections of any size.
+// Sections are read whole, so how much is read is bounded: maxSectionSize is
+// more than any real program's code or read-only data (Chrome's .text is
+// about 200 MiB), and maxRead bounds the code and data of one binary in all.
+const (
+	maxSectionSize = 512 << 20
+	maxRead        = 1 << 30
+	maxNoteSize    = 1 << 20
+	// maxCallTargets bounds the direct call targets counted, more than
+	// the functions of any real program, which a crafted one could have
+	// one of every few bytes.
+	maxCallTargets = 4 << 20
+)
+
 // Binary is the code and read-only data of an ELF file, indexed for search.
 // Sections are read when first needed, so a binary that doesn't contain the
 // string a search starts from costs little more than reading its data.
@@ -71,6 +86,9 @@ func Open(f *elf.File) (*Binary, error) {
 	if text == nil {
 		return nil, errors.New("funcfind: no .text section")
 	}
+	if !readable(text) {
+		return nil, fmt.Errorf("funcfind: .text can't be read (%d bytes, flags %v)", text.Size, text.Flags)
+	}
 	b := &Binary{f: f, arm64: f.Machine == elf.EM_AARCH64, textAddr: text.Addr, absolute: f.Type == elf.ET_EXEC}
 	for _, p := range f.Progs {
 		if p.Type == elf.PT_LOAD {
@@ -80,15 +98,28 @@ func Open(f *elf.File) (*Binary, error) {
 	return b, nil
 }
 
+// readable reports whether a section's contents can be read whole: it's
+// stored in the file, not compressed (allocated sections never are, and
+// debug/elf can't read those that claim to be with ReadAt), and not
+// implausibly large.
+func readable(s *elf.Section) bool {
+	return s.Type != elf.SHT_NOBITS && s.Flags&elf.SHF_COMPRESSED == 0 && s.Size <= maxSectionSize
+}
+
 func (b *Binary) segments() []segment {
 	if b.data == nil && b.f != nil {
 		b.data = []segment{}
+		total := uint64(len(b.code()))
 		for _, s := range b.f.Sections {
 			if s.Type != elf.SHT_PROGBITS || s.Flags&elf.SHF_ALLOC == 0 || s.Flags&elf.SHF_EXECINSTR != 0 {
 				continue
 			}
+			if !readable(s) || total+s.Size > maxRead {
+				continue
+			}
 			if d, err := s.Data(); err == nil {
 				b.data = append(b.data, segment{s.Addr, d})
+				total += uint64(len(d))
 			}
 		}
 	}
@@ -98,8 +129,16 @@ func (b *Binary) segments() []segment {
 func (b *Binary) code() []byte {
 	if b.text == nil && b.f != nil {
 		b.text, _ = b.f.Section(".text").Data()
+		if b.text == nil {
+			b.text = []byte{} // not read again
+		}
 	}
 	return b.text
+}
+
+// textEnd is the address after the last byte of .text.
+func (b *Binary) textEnd() uint64 {
+	return b.textAddr + uint64(len(b.code()))
 }
 
 // FindString returns the address of the first NUL-terminated string in the
@@ -133,7 +172,7 @@ func (b *Binary) Refs(addr uint64) []uint64 {
 }
 
 func (b *Binary) inText(a uint64) bool {
-	return a >= b.textAddr && a < b.textAddr+uint64(len(b.code()))
+	return a >= b.textAddr && a < b.textEnd()
 }
 
 // directCallers counts the direct call sites of each address.
@@ -187,6 +226,9 @@ func (b *Binary) FuncAt(pc uint64) (*Func, bool) {
 	for b.inText(end) && !b.isBoundary(end) && end-start < maxFuncSize {
 		end += align
 	}
+	// The last function ends with .text, also when its size isn't a
+	// multiple of the alignment.
+	end = min(end, b.textEnd())
 	if pc >= end { // in a function that isn't called directly
 		return nil, false
 	}
@@ -251,7 +293,7 @@ func (b *Binary) FileOffset(addr uint64) (uint64, error) {
 // or nil if it has none.
 func BuildID(f *elf.File) []byte {
 	for _, p := range f.Progs {
-		if p.Type != elf.PT_NOTE {
+		if p.Type != elf.PT_NOTE || p.Filesz > maxNoteSize {
 			continue
 		}
 		data, err := io.ReadAll(p.Open())

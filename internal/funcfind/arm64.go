@@ -44,10 +44,15 @@ func (b *Binary) arm64Decode(a uint64) (arm64asm.Inst, bool) {
 // arm64Refs finds the adrp and add pairs that compute addr, returning the
 // adds' addresses (or the adrp's, for an address at the start of a page).
 func (b *Binary) arm64Refs(addr uint64) []uint64 {
-	return b.arm64RefsIn(b.textAddr, b.textAddr+uint64(len(b.code())), addr)
+	return b.arm64RefsIn(b.textAddr, b.textEnd(), addr)
 }
 
+// arm64RefsIn is arm64Refs for the code in [start, end).
 func (b *Binary) arm64RefsIn(start, end, addr uint64) []uint64 {
+	end = min(end, b.textEnd())
+	if start < b.textAddr || start >= end {
+		return nil
+	}
 	var out []uint64
 	code := b.code()[start-b.textAddr : end-b.textAddr]
 	page, lo := addr&^0xfff, uint32(addr&0xfff)
@@ -84,7 +89,7 @@ func (b *Binary) arm64Callers() map[uint64]int {
 	for i := 0; i+4 <= len(code); i += 4 {
 		if w := binary.LittleEndian.Uint32(code[i:]); w&0xfc000000 == 0x94000000 {
 			t := b.textAddr + uint64(i) + uint64(int64(w&0x3ffffff)<<38>>36)
-			if b.inText(t) {
+			if b.inText(t) && (len(callers) < maxCallTargets || callers[t] > 0) {
 				callers[t]++
 			}
 		}
