@@ -59,6 +59,7 @@ type decoders struct {
 	redact bool
 	filter *HTTPFilter
 	ex     *exchangeTracker // with filter
+	rs     *redactStreams   // with redact
 }
 
 func newDecoders(opts Options) decoders {
@@ -67,6 +68,9 @@ func newDecoders(opts Options) decoders {
 		redact: opts.Redact, filter: opts.Filter}
 	if opts.Filter != nil {
 		d.ex = newExchangeTracker()
+	}
+	if opts.Redact {
+		d.rs = newRedactStreams()
 	}
 	return d
 }
@@ -124,7 +128,7 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 		dc.filteredOut, dc.answers = d.filter.filtered(d.ex, ev, dc, d.redact)
 	}
 	if d.redact {
-		dc = dc.redact()
+		dc = dc.redact(d.rs, connKey(ev, dc), ev.Function.Direction())
 	}
 	return dc
 }

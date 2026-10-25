@@ -245,3 +245,22 @@ func TestHARBounded(t *testing.T) {
 		t.Errorf("an entry past the limit: %+v", e)
 	}
 }
+
+// Redaction in HAR covers the whole of each body, and redirects.
+func TestHARRedactWhole(t *testing.T) {
+	body := `{"user":"bob","password":"SPLITSECRET"}`
+	var out bytes.Buffer
+	h := NewHAR(&out, "test", Options{Redact: true})
+	h.Print(event(tracer.FuncSSLWrite, "POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: "+itoa(len(body))+"\r\n\r\n"+body[:20]))
+	h.Print(event(tracer.FuncSSLWrite, body[20:]))
+	h.Print(event(tracer.FuncSSLRead, "HTTP/1.1 302 Found\r\nLocation: https://app/cb?code=LOCCODE&state=s\r\nContent-Length: 0\r\n\r\n"))
+	h.Close()
+	for _, s := range []string{"SPLITSECRET", "LOCCODE"} {
+		if strings.Contains(out.String(), s) {
+			t.Errorf("%q in the log:\n%s", s, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), `"redirectURL": "https://app/cb?code=[redacted]\u0026state=s"`) {
+		t.Errorf("redirect:\n%s", out.String())
+	}
+}

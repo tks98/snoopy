@@ -305,17 +305,25 @@ chat:
   `Set-Cookie` (keeping the cookies' names and attributes), API key
   headers, and any header whose name says token, secret, password,
   session and the like;
-- query parameters with such names, and `key`, `sig`, `code`;
-- JSON and form fields with such names, in bodies;
+- query parameters and form fields with such names, and `key`, `sig`,
+  `code`, `auth`, `pwd` (so OAuth codes, in redirects too);
+- JSON fields with such names, and `auth`, `pwd` and `pin`, in bodies,
+  also in JSON escaped in a string (as GraphQL variables often are), and
+  numbers that are passwords or PINs;
+- passwords in URLs, as in `postgres://user:[redacted]@host`;
 - tokens of well-known kinds wherever they appear: bearer tokens, JWTs, AWS
-  access keys, GitHub, GitLab, Slack, Stripe, Google, OpenAI and Anthropic
-  keys, and private keys.
+  access keys, GitHub, GitLab, Grafana, Slack (and its webhook URLs),
+  Stripe, Google, OpenAI, Anthropic, npm, Hugging Face and SendGrid keys,
+  webhook signing secrets, and private keys.
 
-It works on what snoopy decodes, in text, `--brief` and JSON. It can't be
-combined with `--hex` or `--pcap`, which show data as sent: there, HTTP/2's
-and HTTP/3's headers are compressed, and can't be masked reliably. It
-catches what's recognizable, not everything a program might consider
-secret, so read output before sharing it anyway.
+It works on what snoopy decodes, in text, `--brief`, JSON and HAR. It can't
+be combined with `--hex` or `--pcap`, which show data as sent: there,
+HTTP/2's and HTTP/3's headers are compressed, and can't be masked
+reliably. A secret split across calls is masked too, but as calls are
+printed as they come, the start of a token in the earlier call shows if
+it's too short to be recognized there on its own (HAR, written at the end,
+masks whole bodies). It catches what's recognizable, not everything a
+program might consider secret, so read output before sharing it anyway.
 
 ## Java
 

@@ -30,6 +30,7 @@ type HAR struct {
 	entries []*harEntry
 	conns   map[harConnKey]*harConn
 	filter  *HTTPFilter
+	redact  bool
 }
 
 // maxHARBody bounds how much of a body a HAR entry keeps, and maxHAREntries
@@ -87,11 +88,13 @@ type harMessage struct {
 
 // NewHAR returns a printer that writes a HAR log to w when it's closed.
 // version is snoopy's, for the log's creator. Of opts, only Redact and
-// Filter apply, the filter to whole entries.
+// Filter apply, both to whole entries: secrets are masked in whole bodies,
+// however they were split across calls.
 func NewHAR(w io.Writer, version string, opts Options) *HAR {
-	filter := opts.Filter
-	opts.Warn, opts.Filter = nil, nil // the filter applies to whole entries
-	return &HAR{w: w, dec: newDecoders(opts), version: version, conns: map[harConnKey]*harConn{}, filter: filter}
+	h := &HAR{w: w, version: version, conns: map[harConnKey]*harConn{}, filter: opts.Filter, redact: opts.Redact}
+	opts.Warn, opts.Filter, opts.Redact = nil, nil, false
+	h.dec = newDecoders(opts)
+	return h
 }
 
 func (h *HAR) Print(ev *tracer.Event) error {
@@ -290,6 +293,18 @@ func (m *harMessage) add(raw []byte, part bodyPart) {
 	m.body = append(m.body, piece...)
 }
 
+// redacted returns a copy of the message with secrets masked, in its whole
+// body.
+func (m harMessage) redacted() *harMessage {
+	m.target = redactTarget(m.target)
+	headers := make([][2]string, len(m.headers))
+	for i, hd := range m.headers {
+		headers[i] = [2]string{hd[0], redactHeader(hd[0], hd[1])}
+	}
+	m.headers, m.body = headers, redactText(m.body)
+	return &m
+}
+
 func opposite(d tracer.Direction) tracer.Direction {
 	if d == tracer.Write {
 		return tracer.Read
@@ -381,6 +396,9 @@ func (h *HAR) Close() error {
 		req, resp := &e.req, &e.resp
 		if h.filter != nil && !h.filter.match(&exchange{method: req.method, path: req.target, status: resp.status}) {
 			continue
+		}
+		if h.redact {
+			req, resp = req.redacted(), resp.redacted()
 		}
 		u := url.URL{Scheme: cmpOr(req.scheme, "https"), Host: req.authority}
 		if u.Host == "" && e.server.IsValid() {
