@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/tks98/snoopy/v2/internal/procinfo"
 )
 
 // TestMain makes the test binary, run with fakeJVMEnv set, a process that
@@ -101,6 +103,17 @@ func TestLoadCancelled(t *testing.T) {
 	// starts its listener when it does, rather than printing a thread dump.
 	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
 		t.Fatal(err)
+	}
+	// Stopped, not just sent SIGSTOP: until it has stopped, SIGQUIT, a lower
+	// number, would be delivered first.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if s, ok := procinfo.ParseStat(stat); err == nil && ok && s.State == 'T' {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the fake JVM didn't stop")
+		}
 	}
 	t.Cleanup(func() { _ = os.Remove(attachFile) })
 	ctx, cancel = context.WithTimeout(context.Background(), 300*time.Millisecond)
