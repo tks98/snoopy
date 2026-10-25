@@ -1,7 +1,7 @@
 #!/bin/bash
-# Loads snoopy's BPF programs under each kernel vimto has downloaded (run
-# `make integration-vm KERNEL=...` once per kernel first), booting each in
-# QEMU with loadcheck as init. Catches what the verifier of an older kernel
+# Loads snoopy's BPF programs under each kernel fetch.sh has downloaded, and
+# each vimto has (`make integration-vm KERNEL=...`), booting each in QEMU with
+# loadcheck as init. Catches what the verifier of an older kernel
 # rejects, and works where vimto doesn't (its 5.10 runs fail on an overlayfs
 # xattr). Needs qemu-system for this machine's architecture, and cpio.
 set -euo pipefail
@@ -20,7 +20,13 @@ esac
 [ -e /dev/kvm ] && qemu+=(-enable-kvm)
 
 failed=0
-for kernel in "${HOME}"/.cache/vimto/*/contents/boot/vmlinuz; do
+shopt -s nullglob
+kernels=("${KERNEL_DIR:-$HOME/.cache/snoopy-kernels}"/*/vmlinuz "$HOME"/.cache/vimto/*/contents/boot/vmlinuz)
+if [ ${#kernels[@]} -eq 0 ]; then
+	echo "no kernels; download some with tools/loadcheck/fetch.sh 5.10 6.1 ..." >&2
+	exit 1
+fi
+for kernel in "${kernels[@]}"; do
 	# QEMU reads stdin with -nographic, so it gets /dev/null.
 	out=$(timeout 600 "${qemu[@]}" -m 1G -smp 1 -nographic -no-reboot -kernel "$kernel" \
 		-initrd "$tmp/initrd.gz" -append "console=$console panic=-1 quiet" < /dev/null 2>&1 || true)
