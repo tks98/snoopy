@@ -70,6 +70,8 @@ func TestFunctionsMatchBPFEnum(t *testing.T) {
 		"FN_RING_QUIC_SEND": FuncRingQUICSend, "FN_RING_QUIC_RECV": FuncRingQUICRecv,
 		"FN_NGTCP2_SEND": FuncNGTCP2Send, "FN_NGTCP2_RECV": FuncNGTCP2Recv,
 		"FN_GO_QUIC_SEND": FuncGoQUICSend, "FN_GO_QUIC_RECV": FuncGoQUICRecv,
+		"FN_JSSE_SOCKET_READ": FuncJSSESocketRead, "FN_JSSE_SOCKET_WRITE": FuncJSSESocketWrite,
+		"FN_JSSE_ENGINE_UNWRAP": FuncJSSEEngineUnwrap, "FN_JSSE_ENGINE_WRAP": FuncJSSEEngineWrap,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("C enum has %d functions, Go has %d", len(names), len(want))

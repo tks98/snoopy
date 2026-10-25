@@ -115,6 +115,7 @@ struct socket {
 
 struct inode {
 	umode_t i_mode;
+	__u32 i_rdev; // dev_t: the device of a device file
 } __attribute__((preserve_access_index));
 
 struct qstr {

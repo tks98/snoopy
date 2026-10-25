@@ -2,6 +2,8 @@ package snoopy.hooks;
 
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -24,9 +26,10 @@ public final class Hooks {
 
     /** "SNPYJV01", the frame's first eight bytes. */
     public static final long MAGIC = 0x3130564a59504e53L;
-    public static final int HEADER = 48;
+    public static final int HEADER = 88; // struct java_frame in bpf/snoopy.c
     static final byte WRITE = 0, READ = 1;
     static final byte SOCKET = 0, ENGINE = 1;
+    static final int AF_INET = 2, AF_INET6 = 10;
 
     static volatile boolean enabled;
     static volatile int maxCapture = 16384;
@@ -49,7 +52,7 @@ public final class Hooks {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> System.err.println(
                     "snoopy agent: " + seq.get() + " frames, " + failed.get() + " not written")));
             // A frame with no payload says the transport is ready.
-            emit(0, WRITE, SOCKET, null, 0, 0, 0, 0, 0);
+            emit(0, WRITE, SOCKET, null, 0, 0, 0, null, 0);
             return true;
         } catch (Throwable t) {
             enabled = false;
@@ -85,12 +88,12 @@ public final class Hooks {
     }
 
     // SSLSocketImpl$AppOutputStream.write(byte[], int, int), on return.
-    public static void socketWrite(Object socket, byte[] b, int off, int len) {
+    public static void socketWrite(Object socket, byte[] b, int off, int len, long start) {
         if (!enabled || len <= 0) {
             return;
         }
         try {
-            socketFrame(socket, WRITE, b, off, len);
+            socketFrame(socket, WRITE, b, off, len, start);
         } catch (Throwable t) {
             // never into the application
         }
@@ -98,24 +101,19 @@ public final class Hooks {
 
     // SSLSocketImpl$AppInputStream.read(byte[], int, int), on return, with
     // what it returned.
-    public static void socketRead(Object socket, byte[] b, int off, int n) {
+    public static void socketRead(Object socket, byte[] b, int off, int n, long start) {
         if (!enabled || n <= 0) {
             return;
         }
         try {
-            socketFrame(socket, READ, b, off, n);
+            socketFrame(socket, READ, b, off, n, start);
         } catch (Throwable t) {
             // never into the application
         }
     }
 
-    static void socketFrame(Object socket, byte dir, byte[] b, int off, int len) {
-        int rport = 0, lport = 0;
-        if (socket instanceof Socket s) {
-            rport = s.getPort();
-            lport = s.getLocalPort();
-        }
-        emit(conn(socket), dir, SOCKET, b, off, len, len, rport, lport);
+    static void socketFrame(Object socket, byte dir, byte[] b, int off, int len, long start) {
+        emit(conn(socket), dir, SOCKET, b, off, len, len, socket instanceof Socket s ? s : null, System.nanoTime() - start);
     }
 
     /**
@@ -140,12 +138,12 @@ public final class Hooks {
 
     // SSLEngineImpl.wrap(ByteBuffer[], int, int, ByteBuffer[], int, int), on
     // return: the sources' bytes it consumed.
-    public static void engineWrap(Object engine, javax.net.ssl.SSLEngineResult r, ByteBuffer[] srcs, int off, int len, int[] pos) {
+    public static void engineWrap(Object engine, javax.net.ssl.SSLEngineResult r, ByteBuffer[] srcs, int off, int len, int[] pos, long start) {
         if (!enabled || r == null || pos == null || r.bytesConsumed() <= 0) {
             return;
         }
         try {
-            engineFrame(engine, WRITE, r.bytesConsumed(), srcs, off, len, pos);
+            engineFrame(engine, WRITE, r.bytesConsumed(), srcs, off, len, pos, start);
         } catch (Throwable t) {
             // never into the application
         }
@@ -153,12 +151,12 @@ public final class Hooks {
 
     // SSLEngineImpl.unwrap(ByteBuffer[], int, int, ByteBuffer[], int, int),
     // on return: the bytes it produced into the destinations.
-    public static void engineUnwrap(Object engine, javax.net.ssl.SSLEngineResult r, ByteBuffer[] dsts, int off, int len, int[] pos) {
+    public static void engineUnwrap(Object engine, javax.net.ssl.SSLEngineResult r, ByteBuffer[] dsts, int off, int len, int[] pos, long start) {
         if (!enabled || r == null || pos == null || r.bytesProduced() <= 0) {
             return;
         }
         try {
-            engineFrame(engine, READ, r.bytesProduced(), dsts, off, len, pos);
+            engineFrame(engine, READ, r.bytesProduced(), dsts, off, len, pos, start);
         } catch (Throwable t) {
             // never into the application
         }
@@ -166,35 +164,46 @@ public final class Hooks {
 
     // engineFrame gathers n bytes from bufs, from the positions they had at
     // entry, without moving them.
-    static void engineFrame(Object engine, byte dir, int n, ByteBuffer[] bufs, int off, int len, int[] pos) {
+    static void engineFrame(Object engine, byte dir, int n, ByteBuffer[] bufs, int off, int len, int[] pos, long start) {
         int cap = Math.min(n, maxCapture);
         byte[] data = new byte[cap];
         int got = 0;
         for (int i = 0; i < len && got < cap; i++) {
             ByteBuffer d = bufs[off + i].duplicate();
             int end = d.position(); // consumed or produced up to here
-            int start = pos[i];
-            int k = Math.min(end - start, cap - got);
+            int from = pos[i];
+            int k = Math.min(end - from, cap - got);
             if (k <= 0) {
                 continue;
             }
-            d.limit(start + k).position(start);
+            d.limit(from + k).position(from);
             d.get(data, got, k);
             got += k;
         }
-        emit(conn(engine), dir, ENGINE, data, 0, got, n, 0, 0);
+        emit(conn(engine), dir, ENGINE, data, 0, got, n, null, System.nanoTime() - start);
     }
 
-    // emit writes one frame: the header, then up to maxCapture bytes of the
-    // payload. Synchronized, so frames keep their order and aren't torn.
-    static synchronized void emit(long conn, byte dir, byte kind, byte[] b, int off, int len, int orig, int rport, int lport) {
+    // emit writes one frame: the header (struct java_frame), then up to
+    // maxCapture bytes of the payload. Synchronized, so frames keep their
+    // order and aren't torn.
+    static synchronized void emit(long conn, byte dir, byte kind, byte[] b, int off, int len, int orig, Socket socket, long latency) {
         int cap = Math.min(len, maxCapture);
         byte[] frame = new byte[HEADER + cap];
         ByteBuffer h = ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN);
         h.putLong(MAGIC).putLong(nonce).putLong(conn).putLong(seq.getAndIncrement());
-        h.put(dir).put(kind).putShort((short) 0);
+        InetAddress local = socket == null ? null : socket.getLocalAddress();
+        InetAddress remote = socket == null ? null : socket.getInetAddress();
+        int family = 0;
+        if (local != null && remote != null && local.getClass() == remote.getClass()) {
+            family = remote instanceof Inet4Address ? AF_INET : AF_INET6;
+        }
+        h.put(dir).put(kind).putShort((short) family);
         h.putInt(orig).putInt(cap);
-        h.putShort((short) rport).putShort((short) lport);
+        h.putShort((short) (family == 0 ? 0 : socket.getLocalPort())).putShort((short) (family == 0 ? 0 : socket.getPort()));
+        if (family != 0) {
+            h.put(local.getAddress()).position(64).put(remote.getAddress());
+        }
+        h.position(80).putLong(Math.max(latency, 0));
         if (cap > 0) {
             System.arraycopy(b, off, frame, HEADER, cap);
         }

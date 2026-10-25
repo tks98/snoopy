@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -38,6 +39,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/tks98/snoopy/v2/internal/discover"
+	"github.com/tks98/snoopy/v2/internal/javaagent"
 )
 
 func requireRoot(t *testing.T) {
@@ -86,6 +88,19 @@ func (l *eventLog) find(match func(*Event) bool) *Event {
 }
 
 // dump logs every event received so far, to show what arrived instead.
+// count returns how many of the events so far match.
+func (l *eventLog) count(match func(*Event) bool) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, ev := range l.events {
+		if match(ev) {
+			n++
+		}
+	}
+	return n
+}
+
 func (l *eventLog) dump(t *testing.T) {
 	t.Helper()
 	l.mu.Lock()
@@ -1507,4 +1522,183 @@ func TestRustls(t *testing.T) {
 	for _, ev := range reads {
 		checkConnection(t, ev, srv.Listener.Addr().String())
 	}
+}
+
+// javaAgent builds snoopy's Java agent with java/build.sh, and returns the
+// agent jar's path.
+func javaAgent(t *testing.T) string {
+	t.Helper()
+	requireTool(t, "javac")
+	requireTool(t, "jar")
+	if out, err := exec.Command("sh", "../../java/build.sh").CombinedOutput(); err != nil {
+		t.Fatalf("build the Java agent: %v: %s", err, out)
+	}
+	jar, err := filepath.Abs("../../java/out/snoopy-agent.jar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return jar
+}
+
+// A JSSE client under test (testdata/java/JSSEClient.java), stopped before
+// its measured requests until go is called.
+type jsseClient struct {
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	out   *bufio.Scanner
+}
+
+func startJSSEClient(t *testing.T, java, url, mode string, body, warm, n int, javaArgs ...string) *jsseClient {
+	t.Helper()
+	// Under sh, which waits for a line before it execs java, so a session
+	// can be registered for the PID first (-javaagent).
+	args := append([]string{"-c", `read x; exec "$@"`, "sh", java}, javaArgs...)
+	args = append(args, "testdata/java/JSSEClient.java", url, mode, fmt.Sprint(body), fmt.Sprint(warm), fmt.Sprint(n))
+	cmd := exec.Command("sh", args...)
+	cmd.Stderr = os.Stderr
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	return &jsseClient{cmd: cmd, stdin: stdin, out: bufio.NewScanner(stdout)}
+}
+
+// exec lets sh exec java, and waits for the client's warm-up requests.
+func (c *jsseClient) exec(t *testing.T) {
+	t.Helper()
+	fmt.Fprintln(c.stdin)
+	if !c.out.Scan() || c.out.Text() != "ready" {
+		t.Fatalf("client didn't get ready: %q %v", c.out.Text(), c.out.Err())
+	}
+}
+
+// run lets the client make its measured requests, and waits for them.
+func (c *jsseClient) run(t *testing.T) {
+	t.Helper()
+	fmt.Fprintln(c.stdin)
+	c.stdin.Close()
+	for c.out.Scan() {
+		if !strings.HasPrefix(c.out.Text(), "served ") {
+			t.Fatalf("client: %q", c.out.Text())
+		}
+	}
+	if err := c.cmd.Wait(); err != nil {
+		t.Fatalf("client: %v", err)
+	}
+}
+
+func javaNonce(t *testing.T) uint64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatal(err)
+	}
+	return binary.LittleEndian.Uint64(b[:])
+}
+
+// SunJSSE, through snoopy's Java agent: SSLSocket and SSLEngine
+// (java.net.http.HttpClient) calls become events like a library's, with
+// the socket's addresses for SSLSocket and none for SSLEngine; the agent is
+// loaded into a JVM that has warmed up, or at its start.
+func TestJSSE(t *testing.T) {
+	requireRoot(t)
+	java := requireTool(t, "java")
+	agent := javaAgent(t)
+	tr, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+	events := runTracer(t, tr)
+	srv, _ := newServer(t)
+	server := netip.MustParseAddrPort(srv.Listener.Addr().String())
+	options := func(nonce uint64) string { return fmt.Sprintf("nonce=%d,max=%d", nonce, MaxCaptureLimit) }
+
+	for _, c := range []struct {
+		name, mode  string
+		body        int
+		startup     bool
+		write, read Function
+	}{
+		{"socket", "socket", 100, false, FuncJSSESocketWrite, FuncJSSESocketRead},
+		{"engine", "engine", 100, false, FuncJSSEEngineWrap, FuncJSSEEngineUnwrap},
+		{"socket, large", "socket", 40000, false, FuncJSSESocketWrite, FuncJSSESocketRead},
+		{"engine, at startup", "engine", 100, true, FuncJSSEEngineWrap, FuncJSSEEngineUnwrap},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			nonce := javaNonce(t)
+			var javaArgs []string
+			if c.startup {
+				javaArgs = []string{"-javaagent:" + agent + "=" + options(nonce)}
+			}
+			client := startJSSEClient(t, java, srv.URL, c.mode, c.body, 200, 2, javaArgs...)
+			pid := uint32(client.cmd.Process.Pid)
+			if err := tr.RegisterJava(pid, nonce); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { tr.UnregisterJava(pid) })
+			client.exec(t)
+			if !c.startup {
+				if out, err := javaagent.Load(int(pid), agent, options(nonce), 10*time.Second); err != nil {
+					t.Fatalf("load the agent: %v: %s", err, out)
+				}
+			}
+			client.run(t)
+
+			for i := range 2 {
+				path := fmt.Sprintf("/jsse/%s/%d", c.mode, i)
+				w := waitFor(t, events, "the write of "+path, func(ev *Event) bool {
+					return ev.PID == pid && ev.Function == c.write && bytes.Contains(ev.Data, []byte(path+" "))
+				})
+				waitFor(t, events, "the read for "+path, func(ev *Event) bool {
+					return ev.PID == pid && ev.Function == c.read && bytes.Contains(ev.Data, []byte("served "+path+" "))
+				})
+				if w.ConnID>>56 != 0x4a || w.FD != -1 || w.Latency <= 0 {
+					t.Errorf("%s: conn %#x, fd %d, latency %v", c.write, w.ConnID, w.FD, w.Latency)
+				}
+				if c.mode == "socket" && (w.Remote != server || !w.Local.IsValid()) {
+					t.Errorf("%s: addresses %s -> %s, want %s", c.write, w.Local, w.Remote, server)
+				}
+				if c.mode == "engine" && w.Remote.IsValid() {
+					t.Errorf("%s: has addresses %s -> %s", c.write, w.Local, w.Remote)
+				}
+				if c.body > DefaultMaxCapture && (w.Size < uint32(c.body) || len(w.Data) != DefaultMaxCapture) {
+					t.Errorf("%s: size %d, captured %d", c.write, w.Size, len(w.Data))
+				}
+			}
+			warm := func(ev *Event) bool { return ev.PID == pid && bytes.Contains(ev.Data, []byte("/warm ")) }
+			if n := events.count(warm); !c.startup && n != 0 {
+				t.Errorf("%d events from before the agent was loaded", n)
+			}
+		})
+	}
+
+	// Frames without the session's nonce are written to /dev/null and that's
+	// all.
+	t.Run("other nonce", func(t *testing.T) {
+		client := startJSSEClient(t, java, srv.URL, "socket", 100, 1, 2)
+		pid := uint32(client.cmd.Process.Pid)
+		if err := tr.RegisterJava(pid, javaNonce(t)); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { tr.UnregisterJava(pid) })
+		client.exec(t)
+		if out, err := javaagent.Load(int(pid), agent, options(javaNonce(t)), 10*time.Second); err != nil {
+			t.Fatalf("load the agent: %v: %s", err, out)
+		}
+		client.run(t)
+		time.Sleep(time.Second)
+		if n := events.count(func(ev *Event) bool { return ev.PID == pid }); n != 0 {
+			t.Errorf("%d events from frames with another nonce", n)
+		}
+	})
 }

@@ -48,6 +48,11 @@ const (
 	FuncNGTCP2Recv
 	FuncGoQUICSend
 	FuncGoQUICRecv
+	// SunJSSE's, as snoopy's Java agent reports them.
+	FuncJSSESocketRead
+	FuncJSSESocketWrite
+	FuncJSSEEngineUnwrap
+	FuncJSSEEngineWrap
 )
 
 // FuncQUICPacketSent isn't a call but a notice: a QUIC packet was sent from
@@ -94,6 +99,11 @@ var functionNames = map[Function]string{
 	FuncNGTCP2Recv:    "ngtcp2_crypto_decrypt",
 	FuncGoQUICSend:    "cipher.AEAD.Seal",
 	FuncGoQUICRecv:    "cipher.AEAD.Open",
+	// Java.
+	FuncJSSESocketRead:   "SSLSocket read",
+	FuncJSSESocketWrite:  "SSLSocket write",
+	FuncJSSEEngineUnwrap: "SSLEngine.unwrap",
+	FuncJSSEEngineWrap:   "SSLEngine.wrap",
 
 	FuncQUICPacketSent: "QUIC packet sent",
 }
@@ -124,6 +134,8 @@ func (f Function) Library() discover.Library {
 		return discover.S2N
 	case FuncNGTCP2Send, FuncNGTCP2Recv:
 		return discover.NGTCP2
+	case FuncJSSESocketRead, FuncJSSESocketWrite, FuncJSSEEngineUnwrap, FuncJSSEEngineWrap:
+		return discover.JSSE
 	case FuncRustlsRead, FuncRustlsWrite, FuncRecordSend, FuncRecordRecv, FuncRingSend, FuncRingRecv,
 		FuncAwsLCQUICSend, FuncAwsLCQUICRecv, FuncRingQUICSend, FuncRingQUICRecv:
 		return discover.Rustls
@@ -172,7 +184,7 @@ func (f Function) Direction() Direction {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
 		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend,
 		FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend, FuncQUICPacketSent, FuncNGTCP2Send,
-		FuncGoQUICSend:
+		FuncGoQUICSend, FuncJSSESocketWrite, FuncJSSEEngineWrap:
 		return Write
 	}
 	return Read

@@ -10,12 +10,12 @@ public class Bench {
         for (int size : new int[] {64, 1024, 4096, 16384}) {
             byte[] b = new byte[size];
             int n = 200_000;
-            for (int i = 0; i < n; i++) Hooks.socketWrite(conn, b, 0, size); // warm up
+            for (int i = 0; i < n; i++) Hooks.socketWrite(conn, b, 0, size, System.nanoTime()); // warm up
             long[] lat = new long[n];
             long t0 = System.nanoTime();
             for (int i = 0; i < n; i++) {
                 long s = System.nanoTime();
-                Hooks.socketWrite(conn, b, 0, size);
+                Hooks.socketWrite(conn, b, 0, size, System.nanoTime());
                 lat[i] = System.nanoTime() - s;
             }
             long total = System.nanoTime() - t0;

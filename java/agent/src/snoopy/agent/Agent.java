@@ -46,7 +46,7 @@ public final class Agent {
         if (args != null) {
             for (String kv : args.split(",")) {
                 String[] p = kv.split("=", 2);
-                if (p.length == 2 && p[0].equals("nonce")) nonce = Long.parseLong(p[1]);
+                if (p.length == 2 && p[0].equals("nonce")) nonce = Long.parseUnsignedLong(p[1]);
                 if (p.length == 2 && p[0].equals("max")) max = Integer.parseInt(p[1]);
             }
         }
@@ -122,7 +122,7 @@ public final class Agent {
     static final class SocketAdvice extends AdviceAdapter {
         final String owner;
         final boolean read;
-        int buf, off, len, n;
+        int buf, off, len, n, start;
 
         SocketAdvice(MethodVisitor mv, int access, String name, String desc, String owner, boolean read) {
             super(Opcodes.ASM9, mv, access, name, desc);
@@ -145,6 +145,9 @@ public final class Agent {
             storeLocal(len);
             push(0);
             storeLocal(n);
+            start = newLocal(Type.LONG_TYPE);
+            mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false);
+            storeLocal(start);
         }
 
         @Override
@@ -161,8 +164,9 @@ public final class Agent {
             loadLocal(buf);
             loadLocal(off);
             loadLocal(read ? n : len);
+            loadLocal(start);
             mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS, read ? "socketRead" : "socketWrite",
-                    "(Ljava/lang/Object;[BII)V", false);
+                    "(Ljava/lang/Object;[BIIJ)V", false);
         }
     }
 
@@ -170,7 +174,7 @@ public final class Agent {
     // return passes them with the result to Hooks.
     static final class EngineAdvice extends AdviceAdapter {
         final boolean wrap;
-        int pos;
+        int pos, start;
 
         EngineAdvice(MethodVisitor mv, int access, String name, String desc, boolean wrap) {
             super(Opcodes.ASM9, mv, access, name, desc);
@@ -191,6 +195,9 @@ public final class Agent {
             loadArg(first() + 2);
             mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS, "positions", "([Ljava/nio/ByteBuffer;II)[I", false);
             storeLocal(pos);
+            start = newLocal(Type.LONG_TYPE);
+            mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false);
+            storeLocal(start);
         }
 
         @Override
@@ -205,8 +212,9 @@ public final class Agent {
             loadArg(first() + 1);
             loadArg(first() + 2);
             loadLocal(pos);
+            loadLocal(start);
             mv.visitMethodInsn(Opcodes.INVOKESTATIC, HOOKS, wrap ? "engineWrap" : "engineUnwrap",
-                    "(Ljava/lang/Object;Ljavax/net/ssl/SSLEngineResult;[Ljava/nio/ByteBuffer;II[I)V", false);
+                    "(Ljava/lang/Object;Ljavax/net/ssl/SSLEngineResult;[Ljava/nio/ByteBuffer;II[IJ)V", false);
         }
     }
 }
