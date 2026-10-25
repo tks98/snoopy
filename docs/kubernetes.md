@@ -46,8 +46,8 @@ snoopy pod per node, for all of the pods there, at most `--max-nodes` (10)
 of them, and merges their output an event at a time, with their messages
 marked by node. `--count` applies to each snoopy pod.
 
-`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--host`, `--port` and
-`--count` are snoopy's own and are passed on; the rest of snoopy's flags go
+`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--redact`, `--host`,
+`--port` and `--count` are snoopy's own and are passed on; the rest of snoopy's flags go
 after `--` ([usage.md](usage.md) has them all). kubectl's usual flags
 (`-n`, `--context`, `--kubeconfig`) work as they do for kubectl. Ctrl-C
 stops it.

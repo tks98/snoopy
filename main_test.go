@@ -46,6 +46,8 @@ func TestParseFlags(t *testing.T) {
 		{"--port", "0"},
 		{"--port", "https"},
 		{"--count", "-1"},
+		{"--redact", "--hex"},
+		{"--redact", "--pcap", "out.pcap"},
 		{"extra"},
 		{"--nope"},
 	} {
