@@ -902,7 +902,9 @@ func startPerProcess(t *testing.T, comm string) (*Tracer, *eventLog) {
 
 // Per process, the probes are on the processes traced only: curl's calls
 // are seen, and openssl's, through the same libssl, never reach the BPF
-// program.
+// program. Only this test's curl is traced: run counts are the whole
+// machine's, and the calls of a curl something else runs meanwhile (another
+// test suite, on a shared machine) would count too.
 func TestPerProcess(t *testing.T) {
 	requireRoot(t)
 	curl := requireTool(t, "curl")
@@ -912,7 +914,26 @@ func TestPerProcess(t *testing.T) {
 		t.Skipf("BPF statistics: %v", err)
 	}
 	defer stats.Close()
-	tr, events := startPerProcess(t, "curl")
+	tr, err := New(Options{Comm: "curl", PerProcess: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.PerProcess() {
+		tr.Close()
+		t.Skip("no BTF, so probes are per file")
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+	ours := func(pid int) bool {
+		return discover.NameMatches(pid, "curl") && discover.IsDescendant(pid, os.Getpid())
+	}
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil, true), ours, ours, func(discover.Target, []string, error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := runTracer(t, tr)
+	t.Cleanup(stop)
 
 	srv, port := newServer(t)
 	cmd := exec.Command("sh", "-c", `"$0" -sk --http1.1 "$1"; :`, curl, srv.URL+"/per-process")
