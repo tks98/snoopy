@@ -36,8 +36,8 @@ kubectl snoopy POD -- --max-size 65536   # any of snoopy's flags, after --
 kubectl snoopy --cleanup                 # delete snoopy pods left behind
 ```
 
-`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--host`, `--port` and
-`--count` are snoopy's own and are passed on; the rest of snoopy's flags go
+`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--redact`, `--host`,
+`--port` and `--count` are snoopy's own and are passed on; the rest of snoopy's flags go
 after `--` ([usage.md](usage.md) has them all). kubectl's usual flags
 (`-n`, `--context`, `--kubeconfig`) work as they do for kubectl. Ctrl-C
 stops it.
