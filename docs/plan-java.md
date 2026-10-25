@@ -3,9 +3,10 @@
 Reviewed against `main` at `0434edb99cca338b30ffa7b45a3243168abd6063` on
 2026-10-24. This is a proposed implementation, not a claim of Java support.
 
-Status, 2026-10-25: step 0 is in #54; steps 1 to 6 in #55, with
-[java-spike.md](java-spike.md) for step 1's results. What's supported is in
-[usage.md](usage.md#java).
+Status, 2026-10-25: step 0 is in #54; steps 1 to 6 in #55, released in
+2.9.0, with [java-spike.md](java-spike.md) for step 1's results. What's
+supported is in [usage.md](usage.md#java); what isn't yet is
+[below](#gaps-after-290).
 
 ## Recommendation
 
@@ -319,3 +320,63 @@ attach behavior remain feasibility questions to resolve in the stages above.
 The review revision checked tagged OpenJDK sources and current repository
 code; it did not execute either transport or attach prototype. No runtime
 performance or native-provider compatibility claims have been validated yet.
+
+## Gaps after 2.9.0
+
+What `--java` doesn't do yet, or does only partly, roughly by how much
+it's likely to matter.
+
+**Capture**
+
+- **Writes that throw part way.** The hooks run at normal returns only, so
+  an `SSLSocket` write or an engine call that throws after moving some
+  bytes captures nothing of it, and nothing says bytes are missing. The
+  plan's loss and discontinuity policy isn't built.
+- **The agent's own losses aren't reported.** It counts frames it couldn't
+  write, and numbers every frame, but user space doesn't check the numbers
+  or show the count, so a gap is silent (the ring buffer's own losses are
+  reported as for any library).
+- **Order between threads on one connection.** A connection's frames are
+  written in order, but the hook runs after JSSE has let go of its own
+  lock, so two threads calling `wrap` on the same engine one right after
+  the other could have their frames swap. HttpClient and the JDK's server
+  don't do that; the frames' sequence numbers could fix it if something
+  does.
+- **SSLEngine has no addresses.** Its events have no socket, so `--host` and
+  `--port` don't match them; that's HttpClient, the JDK's HTTPS server,
+  Netty without tcnative and most servers. Tying an engine to its channel
+  (JDK HttpClient, Netty) is the plan's follow-up.
+- **Connections from before the agent.** As for native programs, an
+  HTTP/2 connection that was open when the agent loaded shows frames and
+  bodies, not headers.
+- **Virtual threads:** events carry the carrier thread's ID, not the
+  virtual thread's.
+
+**Which JVMs**
+
+- **HotSpot 17, 21 and 25 only.** Not JDK 8 or 11, OpenJ9, GraalVM native
+  images (no JSSE classes to instrument, and no attach), Android, or other
+  JSSE providers (Bouncy Castle's). No canary for JDK 26 and later yet: a
+  new JDK has to be added to CI's `java` job by hand.
+- **Kernels without BTF** are untested. The frames still need the session's
+  nonce, but the null-device check is skipped.
+- **`--java` takes `--pid` or `--container`, not `--comm`,** and with
+  `--pid`, not JVMs that the process starts later.
+- **Dynamic loading may go away.** JDK 21 and later warn when an agent is
+  loaded into a running JVM (JEP 451), and say a future release will
+  refuse unless the JVM was started with `-XX:+EnableDynamicAgentLoading`.
+  When that happens, `--java` needs that flag or `-javaagent` at startup,
+  and snoopy should say so.
+
+**Footprint**
+
+- **The agent can't be unloaded.** It stops capturing when snoopy stops,
+  but its hooks stay until the JVM exits, and the JVM prints its
+  dynamic-agent warning, and with class data sharing a note that sharing
+  is limited to boot classes, on its stderr when it's loaded.
+- **Jars are left in the JVM's `/tmp`** (`/tmp/.snoopy-java-*`, one
+  directory per agent build), on purpose, since the JVM keeps reading them.
+  A container with a read-only root needs a writable `/tmp`.
+- **Rootless containers** were tested with a user namespace made by
+  `unshare`, not with Podman itself.
+
