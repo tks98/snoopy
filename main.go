@@ -47,6 +47,7 @@ type config struct {
 	maxSize    int
 	count      int
 	pcap       string
+	har        string
 	quiet      bool
 	redact     bool
 	noColor    bool
@@ -148,7 +149,10 @@ Output:
   --count N          stop after N calls
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
-  --quiet            don't print calls (with --pcap)
+  --har FILE         also write the HTTP requests and responses to a HAR file
+                     when snoopy stops ("-" for stdout), for browsers'
+                     developer tools and other HAR viewers
+  --quiet            don't print calls (with --pcap or --har)
   --no-color         no colors
 
 Capture:
@@ -191,6 +195,7 @@ func flags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, "")
 	fs.IntVar(&c.count, "count", 0, "")
 	fs.StringVar(&c.pcap, "pcap", "", "")
+	fs.StringVar(&c.har, "har", "", "")
 	fs.BoolVar(&c.quiet, "quiet", false, "")
 	fs.BoolVar(&c.redact, "redact", false, "")
 	fs.BoolVar(&c.noColor, "no-color", false, "")
@@ -729,6 +734,26 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		}
 		printers = append(printers, p)
 		closers = append([]func() error{p.Close}, closers...) // flush before closing the file
+	}
+
+	if cfg.har != "" {
+		w := io.Writer(os.Stdout)
+		if cfg.har == "-" {
+			if stdoutUsed {
+				return nil, nil, errors.New("--pcap - and --har - can't both write to stdout")
+			}
+			stdoutUsed = true
+		} else {
+			f, err := os.Create(cfg.har)
+			if err != nil {
+				return nil, nil, err
+			}
+			closers = append(closers, f.Close)
+			w = f
+		}
+		h := output.NewHAR(w, versionString(), output.Options{Redact: cfg.redact})
+		printers = append(printers, h)
+		closers = append([]func() error{h.Close}, closers...) // written before the file is closed
 	}
 
 	if !cfg.quiet && !stdoutUsed {
