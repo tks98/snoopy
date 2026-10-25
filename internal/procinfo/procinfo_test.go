@@ -1,6 +1,7 @@
 package procinfo
 
 import (
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -77,7 +78,13 @@ func fakeProc(t *testing.T) string {
 	must(os.WriteFile(filepath.Join(pid, "net", "tcp"), []byte(tcp4), 0o644))
 	must(os.WriteFile(filepath.Join(pid, "net", "tcp6"), []byte(tcp6), 0o644))
 	must(os.WriteFile(filepath.Join(pid, "cgroup"), []byte("0::/system.slice/docker-"+id+".scope\n"), 0o644))
+	must(os.WriteFile(filepath.Join(pid, "stat"), []byte(stat(100)), 0o644))
 	return root
+}
+
+// stat returns a /proc/<pid>/stat for a process that started at start.
+func stat(start int) string {
+	return fmt.Sprintf("42 (a) b) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 %d 1000 100\n", start)
 }
 
 func TestResolver(t *testing.T) {
@@ -101,5 +108,29 @@ func TestResolver(t *testing.T) {
 	}
 	if got := r.ContainerID(43); got != "" {
 		t.Errorf("container ID for missing process: %q", got)
+	}
+}
+
+// A PID that's another process's by now, outside a container, isn't taken
+// for the first's.
+func TestResolverReusedPID(t *testing.T) {
+	proc := fakeProc(t)
+	r := NewResolver(proc)
+	r.recheck = 0
+	if got := r.ContainerID(42); got != id {
+		t.Fatalf("container ID %q", got)
+	}
+	pid := filepath.Join(proc, "42")
+	if err := os.WriteFile(filepath.Join(pid, "cgroup"), []byte("0::/user.slice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.ContainerID(42); got != id {
+		t.Errorf("the same process: container ID %q", got)
+	}
+	if err := os.WriteFile(filepath.Join(pid, "stat"), []byte(stat(200)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.ContainerID(42); got != "" {
+		t.Errorf("another process: container ID %q", got)
 	}
 }

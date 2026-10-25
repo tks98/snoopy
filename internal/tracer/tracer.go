@@ -3,6 +3,7 @@
 package tracer
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -61,6 +63,9 @@ type Options struct {
 	// It needs BTF, to tell forks from threads; without, probes are per
 	// file.
 	PerProcess bool
+	// Java makes the frames of snoopy's Java agent count (see RegisterJava).
+	// Without it, the BPF program doesn't look for them in every write.
+	Java bool
 
 	// ignoreKernelBTF loads the program as if the kernel had no BTF (tests).
 	ignoreKernelBTF bool
@@ -70,15 +75,23 @@ type Options struct {
 type Tracer struct {
 	opts       Options
 	objs       snoopyObjects
-	mu         sync.Mutex // guards links and procs: Attach may run while Run does
-	links      []link.Link
-	procs      map[int]*procLinks // per process, the links of each
-	everyone   map[procFile]bool  // per process, files attached to for every process
+	mu         sync.Mutex              // guards links, procs and files: Attach may run while Run does
+	links      []link.Link             // the tracepoints'
+	procs      map[int]*procLinks      // per process, the links of each
+	files      map[procFile]*fileLinks // the files attached to for every process
 	perProcess bool
 	reader     *ringbuf.Reader
 	clock      func(monoNs uint64) time.Time
 	haveBTF    bool
 	names      map[uint32]string // process names, when the kernel can't tell
+	// tracedFull is set once traced_tgids was found full, which is said once.
+	tracedFull atomic.Bool
+	closing    sync.WaitGroup // closeLater's
+	// attaching is held to read while attaching, and by closeLater to
+	// write, for each link it closes: the kernel does both one at a time,
+	// and attaching to a new process before it's done matters more.
+	attaching sync.RWMutex
+	closed    atomic.Bool // Close was called
 }
 
 // procLinks are the probes attached for one process.
@@ -92,6 +105,26 @@ type procFile struct {
 	dev, ino uint64
 	lib      discover.Library
 }
+
+// fileLinks are the probes attached to a file for every process. They're
+// kept until no process can use the file any more (see DetachUnused), but
+// not longer: each holds the file, and many programs are run once (a Go
+// program that's built, run and deleted, a container's libraries).
+type fileLinks struct {
+	links []link.Link // nil while it's being attached to
+	fd    int         // the file, opened with O_PATH, to tell when it's deleted
+	dev   uint64
+	ino   uint64
+	// The root filesystem it's on, if it's another's than snoopy's (a
+	// container's), and it can only be reached through that: no process
+	// can map it once none has that root.
+	root    fileKey
+	hasRoot bool
+	user    int // a process that maps it, while it's deleted
+}
+
+// fileKey identifies a file or directory.
+type fileKey struct{ dev, ino uint64 }
 
 // New loads the eBPF program into the kernel. Call Attach and AttachSyscalls
 // to start collecting data, then Run to receive it.
@@ -153,9 +186,10 @@ func New(opts Options) (*Tracer, error) {
 		"max_capture":  uint32(opts.MaxCapture),
 		// Without BTF the kernel only knows thread names, so the process
 		// name is filtered on in user space instead.
-		"filter_comm": opts.Comm != "" && btfErr == nil && !perProcess,
-		"targ_comm":   comm,
-		"have_btf":    btfErr == nil,
+		"filter_comm":  opts.Comm != "" && btfErr == nil && !perProcess,
+		"targ_comm":    comm,
+		"have_btf":     btfErr == nil,
+		"java_enabled": opts.Java,
 	} {
 		if err := spec.Variables[name].Set(value); err != nil {
 			return nil, fmt.Errorf("set %s: %w", name, err)
@@ -164,7 +198,7 @@ func New(opts Options) (*Tracer, error) {
 	spec.Maps["events"].MaxEntries = uint32(opts.RingBufferSize)
 
 	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{},
-		procs: map[int]*procLinks{}, everyone: map[procFile]bool{}}
+		procs: map[int]*procLinks{}, files: map[procFile]*fileLinks{}}
 	t.perProcess = perProcess
 	if err := spec.LoadAndAssign(&t.objs, &loadOpts); err != nil {
 		var ve *ebpf.VerifierError
@@ -174,14 +208,25 @@ func New(opts Options) (*Tracer, error) {
 		return nil, permissionHint(fmt.Errorf("load BPF program: %w", err))
 	}
 
+	if opts.PID != 0 || perProcess || opts.Java {
+		// Processes traced or registered are forgotten when they exit.
+		l, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_exit", Program: t.objs.SchedProcessExit})
+		if err != nil {
+			t.objs.Close()
+			return nil, fmt.Errorf("raw tracepoint sched_process_exit: %w", err)
+		}
+		t.links = append(t.links, l)
+	}
 	if opts.PID != 0 {
 		if err := t.TracePID(uint32(opts.PID)); err != nil {
+			closeLinks(t.links)
 			t.objs.Close()
 			return nil, err
 		}
 	}
 	t.reader, err = ringbuf.NewReader(t.objs.Events)
 	if err != nil {
+		closeLinks(t.links)
 		t.objs.Close()
 		return nil, fmt.Errorf("open ring buffer: %w", err)
 	}
@@ -189,19 +234,52 @@ func New(opts Options) (*Tracer, error) {
 }
 
 // TracePID adds a process to those traced, with Options.PID set: a process
-// that it started, for example.
+// that it started, for example. The BPF program forgets it when it exits.
+// When too many are traced at once, it says so the first time only.
 func (t *Tracer) TracePID(pid uint32) error {
-	if err := t.objs.TracedTgids.Update(pid, uint8(1), ebpf.UpdateAny); err != nil {
+	err := t.objs.TracedTgids.Update(pid, uint8(1), ebpf.UpdateAny)
+	if errors.Is(err, unix.E2BIG) {
+		if t.tracedFull.Swap(true) {
+			return nil
+		}
+		return fmt.Errorf("trace pid %d: %d processes, the most there can be, are traced already; until some exit, new ones are traced only if they descend from one that is",
+			pid, t.objs.TracedTgids.MaxEntries())
+	}
+	if err != nil {
 		return fmt.Errorf("trace pid %d: %w", pid, err)
 	}
+	// If it exited before it was added, the BPF program didn't see it go.
+	if procGone(int(pid)) {
+		_ = t.objs.TracedTgids.Delete(pid)
+	}
 	return nil
+}
+
+// procGone reports whether a process has exited: it's gone from /proc, or
+// it's a zombie without threads left.
+func procGone(pid int) bool {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true
+	}
+	i := bytes.LastIndexByte(stat, ')') // the command name may contain anything
+	if i < 0 {
+		return true
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	// state is field 3, num_threads 20.
+	return len(fields) < 18 || fields[0] == "Z" && fields[17] == "1" || fields[0] == "X"
 }
 
 // RegisterJava makes the frames of snoopy's Java agent in process pid (as
 // snoopy sees it, in its PID namespace) count, those carrying nonce, the session's secret: the agent
 // writes them to /dev/null, and they become events like a TLS library's
 // calls. Register before loading the agent, so its first calls are seen.
+// It needs Options.Java. The session ends when the process exits.
 func (t *Tracer) RegisterJava(pid uint32, nonce uint64) error {
+	if !t.opts.Java {
+		return errors.New("register java session: the tracer was made without Options.Java")
+	}
 	s := snoopyJavaSession{Nonce: nonce, Fd: -1}
 	if err := t.objs.JavaSessions.Update(pid, &s, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("register java session for pid %d: %w", pid, err)
@@ -307,53 +385,107 @@ type cProbe struct {
 // Attach attaches probes to a target and returns the names of the functions
 // it attached to. Per process, they're for process pid only, unless it's
 // zero; attaching to a target of the process again does nothing and returns
-// the names it did the first time, and to one attached to for every process,
-// does nothing and returns none.
+// the names it did the first time. Attaching to a file attached to for every
+// process does nothing and returns none.
 func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
 	if !t.perProcess {
 		pid = 0
 	}
+	var traceErr error
 	if pid != 0 {
-		if err := t.TracePID(uint32(pid)); err != nil {
-			return nil, err
-		}
+		// Attached to even if it can't be added: a process descending from
+		// one traced still is.
+		traceErr = t.TracePID(uint32(pid))
 	}
-	key, err := targetKey(target)
+	// The file inspected, held onto: cilium/ebpf opens it again by path to
+	// read its symbols, and the kernel looks the path up for each probe, by
+	// when something else (a FIFO, which would block) could be there.
+	fd, err := discover.OpenPath(target.Path)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(traceErr, err)
 	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return nil, errors.Join(traceErr, &os.PathError{Op: "stat", Path: target.Path, Err: err})
+	}
+	key := procFile{dev: uint64(st.Dev), ino: st.Ino, lib: target.Library}
+
+	t.mu.Lock()
+	var p *procLinks
+	var f *fileLinks
 	if pid != 0 {
-		t.mu.Lock()
-		p := t.procLocked(pid)
+		p = t.procLocked(pid)
 		var funcs []string
-		attached := p == nil || t.everyone[key] // or it's gone
+		attached := p == nil || t.files[key] != nil // or it's gone
 		if !attached {
 			funcs, attached = p.files[key]
 		}
-		t.mu.Unlock()
 		if attached {
-			return funcs, nil
+			t.mu.Unlock()
+			unix.Close(fd)
+			return funcs, traceErr
 		}
-	}
-	funcs, err := t.attach(target, pid)
-	if len(funcs) > 0 {
-		t.mu.Lock()
-		if pid == 0 {
-			t.everyone[key] = true
-		} else if p := t.procs[pid]; p != nil {
-			p.files[key] = funcs
+	} else {
+		if t.files[key] != nil {
+			// Already, through another path, or before its mtime changed,
+			// which makes it new to the Watcher.
+			t.mu.Unlock()
+			unix.Close(fd)
+			return nil, nil
 		}
-		t.mu.Unlock()
+		f = &fileLinks{fd: fd, dev: key.dev, ino: key.ino}
+		f.root, f.hasRoot = otherRoot(target.Path, key.dev)
+		t.files[key] = f // taken, while it's attached to
 	}
-	return funcs, err
+	t.mu.Unlock()
+
+	t.attaching.RLock()
+	funcs, links, err := t.attach(target, fd, pid)
+	t.attaching.RUnlock()
+	var stale []link.Link
+	t.mu.Lock()
+	switch {
+	case len(funcs) == 0:
+		stale = links
+		if f != nil {
+			delete(t.files, key)
+		}
+	case f != nil:
+		f.links = links
+	case t.procs[pid] == p:
+		p.files[key] = funcs
+		p.links = append(p.links, links...)
+	default:
+		stale = links // it exited meanwhile, and DetachExited closed the rest
+	}
+	t.mu.Unlock()
+	closeLinks(stale)
+	if f == nil || len(funcs) == 0 {
+		unix.Close(fd)
+	}
+	return funcs, errors.Join(traceErr, err)
 }
 
-func targetKey(target discover.Target) (procFile, error) {
-	var st unix.Stat_t
-	if err := unix.Stat(target.Path, &st); err != nil {
-		return procFile{}, &os.PathError{Op: "stat", Path: target.Path, Err: err}
+// otherRoot returns the root filesystem of the process whose
+// /proc/<pid>/root a path is under, if the file there, on device dev, is
+// on it, and it's another filesystem than snoopy's root: a container's,
+// say, whose files have new device numbers in each container.
+func otherRoot(path string, dev uint64) (fileKey, bool) {
+	rest, ok := strings.CutPrefix(path, "/proc/")
+	if !ok {
+		return fileKey{}, false
 	}
-	return procFile{dev: uint64(st.Dev), ino: st.Ino, lib: target.Library}, nil
+	pid, _, ok := strings.Cut(rest, "/root/")
+	if !ok {
+		return fileKey{}, false
+	}
+	var root, own unix.Stat_t
+	if unix.Stat("/proc/"+pid+"/root", &root) != nil || unix.Stat("/", &own) != nil ||
+		uint64(root.Dev) != dev || root.Dev == own.Dev {
+		return fileKey{}, false
+	}
+	return fileKey{uint64(root.Dev), root.Ino}, true
 }
 
 // procLocked returns the links of a process, new if it has none or the PID
@@ -396,34 +528,214 @@ func procStart(pid int) (uint64, bool) {
 
 // DetachExited closes the probes of processes that have exited.
 func (t *Tracer) DetachExited() {
+	var stale []link.Link
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	for pid, p := range t.procs {
 		if start, ok := procStart(pid); !ok || start != p.start {
-			closeLinks(p.links)
+			stale = append(stale, p.links...)
 			delete(t.procs, pid)
 		}
 	}
+	t.mu.Unlock()
+	t.closeLater(stale)
 }
 
-func closeLinks(links []link.Link) {
-	for _, l := range links {
-		_ = l.Close()
+// DetachUnused closes the probes attached for every process to files that
+// no process can use any more: deleted ones that none maps, and those on a
+// container's root filesystem once no process has it as its root (another
+// container from the same image has its own, with new device numbers). A
+// file that's still there stays attached to: the Watcher returns each file
+// once only.
+func (t *Tracer) DetachUnused() {
+	t.mu.Lock()
+	var deleted, rooted []*fileLinks
+	for _, f := range t.files {
+		if f.links == nil {
+			continue // being attached to
+		}
+		var st unix.Stat_t
+		switch {
+		case f.hasRoot:
+			rooted = append(rooted, f)
+		case unix.Fstat(f.fd, &st) == nil && st.Nlink == 0:
+			deleted = append(deleted, f)
+		}
 	}
+	t.mu.Unlock()
+	if len(deleted) == 0 && len(rooted) == 0 {
+		return
+	}
+
+	unused := map[*fileLinks]bool{}
+	if len(rooted) > 0 {
+		roots := liveRoots()
+		for _, f := range rooted {
+			if !roots[f.root] {
+				unused[f] = true
+			}
+		}
+	}
+	// For deleted files, the process last seen to map one is looked at
+	// first; only if it doesn't any more, every process is.
+	want := map[fileKey]bool{}
+	for _, f := range deleted {
+		key := fileKey{f.dev, f.ino}
+		if f.user == 0 || !mapsDeleted(f.user, map[fileKey]bool{key: true}, nil) {
+			want[key] = true
+		}
+	}
+	if len(want) > 0 {
+		users := map[fileKey]int{}
+		dirs, _ := os.ReadDir("/proc")
+		for _, d := range dirs {
+			if pid, err := strconv.Atoi(d.Name()); err == nil {
+				mapsDeleted(pid, want, users)
+			}
+		}
+		t.mu.Lock()
+		for _, f := range deleted {
+			if key := (fileKey{f.dev, f.ino}); want[key] {
+				f.user = users[key]
+				if f.user == 0 {
+					unused[f] = true
+				}
+			}
+		}
+		t.mu.Unlock()
+	}
+	if len(unused) == 0 {
+		return
+	}
+
+	var stale []link.Link
+	t.mu.Lock()
+	for key, f := range t.files {
+		if unused[f] {
+			stale = append(stale, f.links...)
+			unix.Close(f.fd)
+			delete(t.files, key)
+		}
+	}
+	t.mu.Unlock()
+	t.closeLater(stale)
 }
 
-func (t *Tracer) attach(target discover.Target, pid int) ([]string, error) {
-	// The file inspected, held onto: cilium/ebpf opens it again by path to
-	// read its symbols, and the kernel looks the path up for each probe, by
-	// when something else (a FIFO, which would block) could be there.
-	fd, err := discover.OpenPath(target.Path)
+// liveRoots returns the root directories of the processes running.
+func liveRoots() map[fileKey]bool {
+	roots := map[fileKey]bool{}
+	dirs, _ := os.ReadDir("/proc")
+	for _, d := range dirs {
+		if _, err := strconv.Atoi(d.Name()); err != nil {
+			continue
+		}
+		var st unix.Stat_t
+		if unix.Stat("/proc/"+d.Name()+"/root", &st) == nil {
+			roots[fileKey{uint64(st.Dev), st.Ino}] = true
+		}
+	}
+	return roots
+}
+
+// mapsDeleted reports whether process pid maps one of the deleted files in
+// want, and if users isn't nil, records it as their user.
+func mapsDeleted(pid int, want map[fileKey]bool, users map[fileKey]int) bool {
+	f, err := os.Open(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
-		return nil, err
+		return false
 	}
-	defer unix.Close(fd)
+	defer f.Close()
+	found := false
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		// address perms offset dev inode path, and " (deleted)" after the
+		// path of a file that's deleted.
+		line := sc.Bytes()
+		if !bytes.HasSuffix(line, []byte(" (deleted)")) {
+			continue
+		}
+		fields := strings.Fields(string(line))
+		if len(fields) < 6 {
+			continue
+		}
+		major, minor, ok := strings.Cut(fields[3], ":")
+		maj, err1 := strconv.ParseUint(major, 16, 32)
+		mnr, err2 := strconv.ParseUint(minor, 16, 32)
+		ino, err3 := strconv.ParseUint(fields[4], 10, 64)
+		if !ok || err1 != nil || err2 != nil || err3 != nil {
+			continue
+		}
+		key := fileKey{unix.Mkdev(uint32(maj), uint32(mnr)), ino}
+		if want[key] {
+			found = true
+			if users == nil {
+				return true
+			}
+			users[key] = pid
+		}
+	}
+	return found
+}
+
+// closeLater closes links in the background, a few at a time, and not
+// while attaching: closing many takes seconds, and the kernel attaches and
+// detaches uprobes one at a time, so closing would hold up attaching to new
+// processes, and short-lived ones would be missed. Close closes what's left
+// at once.
+func (t *Tracer) closeLater(links []link.Link) {
+	if len(links) == 0 {
+		return
+	}
+	t.closing.Add(1)
+	go func() {
+		defer t.closing.Done()
+		for len(links) > 0 && !t.closed.Load() {
+			n := min(len(links), closeBatch)
+			t.attaching.Lock()
+			closeLinks(links[:n])
+			t.attaching.Unlock()
+			links = links[n:]
+		}
+		closeLinks(links)
+	}()
+}
+
+// closeBatch is how many links closeLater closes at once.
+const closeBatch = 8
+
+// maxClosing bounds how many links are closed at once. Closing a uprobe's
+// takes the kernel tens of milliseconds, mostly waiting for RCU grace
+// periods, which closes at the same time share.
+const maxClosing = 1024
+
+// closeLinks closes links, concurrently.
+func closeLinks(links []link.Link) {
+	if len(links) <= 1 {
+		for _, l := range links {
+			_ = l.Close()
+		}
+		return
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxClosing)
+	for _, l := range links {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = l.Close()
+			<-sem
+		}()
+	}
+	wg.Wait()
+}
+
+// attach attaches to a target, the file at fd, and returns the names of the
+// functions it attached to and the links, those it made before an error
+// too.
+func (t *Tracer) attach(target discover.Target, fd, pid int) (attached []string, links []link.Link, err error) {
 	ex, err := link.OpenExecutable(fmt.Sprintf("/proc/self/fd/%d", fd))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var probes []cProbe
@@ -482,10 +794,9 @@ func (t *Tracer) attach(target discover.Target, pid int) ([]string, error) {
 	case discover.Rustls:
 		return t.attachRustls(ex, target.Rust, pid)
 	default:
-		return nil, fmt.Errorf("unsupported library %v", target.Library)
+		return nil, nil, fmt.Errorf("unsupported library %v", target.Library)
 	}
 
-	var attached []string
 	for _, p := range probes {
 		// Not limited to Options.PID unless per process, since its
 		// descendants are traced too: the BPF program filters on
@@ -509,9 +820,9 @@ func (t *Tracer) attach(target discover.Target, pid int) ([]string, error) {
 				continue // e.g. SSL_read_ex before OpenSSL 1.1.1
 			}
 			if err != nil {
-				return attached, fmt.Errorf("%s: %w", p.symbol, err)
+				return attached, links, fmt.Errorf("%s: %w", p.symbol, err)
 			}
-			t.addLinkFor(pid, ret)
+			links = append(links, ret)
 		}
 
 		entry, err := ex.Uprobe(p.symbol, p.prog, opts)
@@ -519,23 +830,23 @@ func (t *Tracer) attach(target discover.Target, pid int) ([]string, error) {
 			continue
 		}
 		if err != nil {
-			return attached, fmt.Errorf("%s: %w", p.symbol, err)
+			return attached, links, fmt.Errorf("%s: %w", p.symbol, err)
 		}
-		t.addLinkFor(pid, entry)
+		links = append(links, entry)
 		attached = append(attached, p.symbol)
 	}
 	if len(attached) == 0 {
-		return nil, errors.New("none of the expected functions were found")
+		return nil, links, errors.New("none of the expected functions were found")
 	}
-	return attached, nil
+	return attached, links, nil
 }
 
 // attachRustls attaches to rustls's Reader::read and Writer::write, found by
 // their mangled names, at their file offsets, or to where its crypto
 // provider encrypts and decrypts records.
-func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo, pid int) ([]string, error) {
+func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo, pid int) (attached []string, links []link.Link, err error) {
 	if ri == nil {
-		return nil, errors.New("missing rustls function information")
+		return nil, nil, errors.New("missing rustls function information")
 	}
 	type probe struct {
 		name      string
@@ -559,33 +870,32 @@ func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo, pid in
 			{"ring::aead open (ring 0.16)", ri.Ring016Opens, t.objs.Ring016OpenEnter, false},
 		}
 	}
-	var attached []string
 	for _, p := range probes {
 		for _, off := range p.offsets {
 			opts := &link.UprobeOptions{Address: off, PID: pid}
 			if !p.entryOnly {
 				ret, err := ex.Uretprobe("", t.objs.TlsReturn, opts)
 				if err != nil {
-					return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
+					return attached, links, fmt.Errorf("%s at %#x: %w", p.name, off, err)
 				}
-				t.addLinkFor(pid, ret)
+				links = append(links, ret)
 			}
 			entry, err := ex.Uprobe("", p.prog, opts)
 			if err != nil {
-				return attached, fmt.Errorf("%s at %#x: %w", p.name, off, err)
+				return attached, links, fmt.Errorf("%s at %#x: %w", p.name, off, err)
 			}
-			t.addLinkFor(pid, entry)
+			links = append(links, entry)
 		}
 		if len(p.offsets) > 0 {
 			attached = append(attached, p.name)
 		}
 	}
-	return attached, nil
+	return attached, links, nil
 }
 
-func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo, pid int) ([]string, error) {
+func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo, pid int) (attached []string, links []link.Link, err error) {
 	if gi == nil {
-		return nil, errors.New("missing Go function information")
+		return nil, nil, errors.New("missing Go function information")
 	}
 	type goProbe struct {
 		name    string
@@ -605,7 +915,6 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo, pid int) ([]
 			goProbe{"cipher.AEAD.Seal (QUIC)", gi.Seals[i], t.objs.GoAeadSealEnter, nil},
 			goProbe{"cipher.AEAD.Open (QUIC)", gi.Opens[i], t.objs.GoAeadOpenEnter, t.objs.GoAeadOpenReturn})
 	}
-	var attached []string
 	for _, fn := range probes {
 		// Return probes go on each RET instruction rather than using a
 		// uretprobe, which would corrupt the goroutine's stack.
@@ -617,9 +926,9 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo, pid int) ([]
 				Address: fn.f.Offset, Offset: ret, PID: pid,
 			})
 			if err != nil {
-				return attached, fmt.Errorf("%s+%#x: %w", fn.name, ret, err)
+				return attached, links, fmt.Errorf("%s+%#x: %w", fn.name, ret, err)
 			}
-			t.addLinkFor(pid, l)
+			links = append(links, l)
 		}
 		// The entry probe goes after the stack check: when the stack has to
 		// grow, runtime.morestack restarts the function from the top, and a
@@ -628,14 +937,14 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo, pid int) ([]
 			Address: fn.f.Offset, Offset: fn.f.Body, PID: pid,
 		})
 		if err != nil {
-			return attached, fmt.Errorf("%s+%#x: %w", fn.name, fn.f.Body, err)
+			return attached, links, fmt.Errorf("%s+%#x: %w", fn.name, fn.f.Body, err)
 		}
-		t.addLinkFor(pid, l)
+		links = append(links, l)
 		if !slices.Contains(attached, fn.name) {
 			attached = append(attached, fn.name)
 		}
 	}
-	return attached, nil
+	return attached, links, nil
 }
 
 // AttachSyscalls attaches the syscall tracepoint that tells snoopy which
@@ -862,6 +1171,7 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 				if t.perProcess {
 					t.DetachExited()
 				}
+				t.DetachUnused()
 			case pid := <-pids:
 				inspect(pid, false)
 			case p := <-held:
@@ -1115,35 +1425,30 @@ func (t *Tracer) counter(index uint32) (uint64, error) {
 	return total, nil
 }
 
-// Close detaches all probes and unloads the program.
+// addLink keeps a link until Close.
 func (t *Tracer) addLink(l link.Link) {
-	t.addLinkFor(0, l)
-}
-
-// addLinkFor keeps a link with those of process pid, or if it's zero, with
-// those that stay until Close.
-func (t *Tracer) addLinkFor(pid int, l link.Link) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if pid != 0 {
-		if p := t.procs[pid]; p != nil {
-			p.links = append(p.links, l)
-			return
-		}
-	}
 	t.links = append(t.links, l)
 }
 
+// Close detaches all probes and unloads the program.
 func (t *Tracer) Close() error {
+	t.closed.Store(true)
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	var errs []error
-	for _, l := range t.links {
-		errs = append(errs, l.Close())
-	}
+	links := t.links
 	for _, p := range t.procs {
-		closeLinks(p.links)
+		links = append(links, p.links...)
 	}
-	errs = append(errs, t.reader.Close(), t.objs.Close())
-	return errors.Join(errs...)
+	for _, f := range t.files {
+		if f.links != nil { // else Attach has its fd
+			links = append(links, f.links...)
+			unix.Close(f.fd)
+		}
+	}
+	t.links, t.procs, t.files = nil, map[int]*procLinks{}, map[procFile]*fileLinks{}
+	t.mu.Unlock()
+	closeLinks(links)
+	t.closing.Wait()
+	return errors.Join(t.reader.Close(), t.objs.Close())
 }

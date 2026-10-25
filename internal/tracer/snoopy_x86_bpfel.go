@@ -190,6 +190,7 @@ const (
 	snoopyProgS2nRecvEnter          = "s2n_recv_enter"
 	snoopyProgS2nSendEnter          = "s2n_send_enter"
 	snoopyProgSchedProcessExec      = "sched_process_exec"
+	snoopyProgSchedProcessExit      = "sched_process_exit"
 	snoopyProgSchedProcessFork      = "sched_process_fork"
 	snoopyProgSslReadEnter          = "ssl_read_enter"
 	snoopyProgSslReadExEnter        = "ssl_read_ex_enter"
@@ -202,6 +203,7 @@ const (
 	snoopyVarFilterComm             = "filter_comm"
 	snoopyVarFilterTgids            = "filter_tgids"
 	snoopyVarHaveBtf                = "have_btf"
+	snoopyVarJavaEnabled            = "java_enabled"
 	snoopyVarMaxCapture             = "max_capture"
 	snoopyVarPidnsDev               = "pidns_dev"
 	snoopyVarPidnsIno               = "pidns_ino"
@@ -283,6 +285,7 @@ type snoopyProgramSpecs struct {
 	S2nRecvEnter          *ebpf.ProgramSpec `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.ProgramSpec `ebpf:"s2n_send_enter"`
 	SchedProcessExec      *ebpf.ProgramSpec `ebpf:"sched_process_exec"`
+	SchedProcessExit      *ebpf.ProgramSpec `ebpf:"sched_process_exit"`
 	SchedProcessFork      *ebpf.ProgramSpec `ebpf:"sched_process_fork"`
 	SslReadEnter          *ebpf.ProgramSpec `ebpf:"ssl_read_enter"`
 	SslReadExEnter        *ebpf.ProgramSpec `ebpf:"ssl_read_ex_enter"`
@@ -323,6 +326,7 @@ type snoopyVariableSpecs struct {
 	FilterComm        *ebpf.VariableSpec `ebpf:"filter_comm"`
 	FilterTgids       *ebpf.VariableSpec `ebpf:"filter_tgids"`
 	HaveBtf           *ebpf.VariableSpec `ebpf:"have_btf"`
+	JavaEnabled       *ebpf.VariableSpec `ebpf:"java_enabled"`
 	MaxCapture        *ebpf.VariableSpec `ebpf:"max_capture"`
 	PidnsDev          *ebpf.VariableSpec `ebpf:"pidns_dev"`
 	PidnsIno          *ebpf.VariableSpec `ebpf:"pidns_ino"`
@@ -396,6 +400,7 @@ type snoopyVariables struct {
 	FilterComm        *ebpf.Variable `ebpf:"filter_comm"`
 	FilterTgids       *ebpf.Variable `ebpf:"filter_tgids"`
 	HaveBtf           *ebpf.Variable `ebpf:"have_btf"`
+	JavaEnabled       *ebpf.Variable `ebpf:"java_enabled"`
 	MaxCapture        *ebpf.Variable `ebpf:"max_capture"`
 	PidnsDev          *ebpf.Variable `ebpf:"pidns_dev"`
 	PidnsIno          *ebpf.Variable `ebpf:"pidns_ino"`
@@ -439,6 +444,7 @@ type snoopyPrograms struct {
 	S2nRecvEnter          *ebpf.Program `ebpf:"s2n_recv_enter"`
 	S2nSendEnter          *ebpf.Program `ebpf:"s2n_send_enter"`
 	SchedProcessExec      *ebpf.Program `ebpf:"sched_process_exec"`
+	SchedProcessExit      *ebpf.Program `ebpf:"sched_process_exit"`
 	SchedProcessFork      *ebpf.Program `ebpf:"sched_process_fork"`
 	SslReadEnter          *ebpf.Program `ebpf:"ssl_read_enter"`
 	SslReadExEnter        *ebpf.Program `ebpf:"ssl_read_ex_enter"`
@@ -484,6 +490,7 @@ func (p *snoopyPrograms) Close() error {
 		p.S2nRecvEnter,
 		p.S2nSendEnter,
 		p.SchedProcessExec,
+		p.SchedProcessExit,
 		p.SchedProcessFork,
 		p.SslReadEnter,
 		p.SslReadExEnter,
