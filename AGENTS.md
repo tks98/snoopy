@@ -32,7 +32,9 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
 
 - Integration tests skip the clients that aren't installed (`curl`,
   `python3`, `gnutls-cli`, the NSS, wolfSSL, Mbed TLS and s2n-tls dev
-  files). `SNOOPY_TEST_RUSTLS=1` adds the rustls and quinn tests, which
+  files). With `SNOOPY_TEST_STRICT=1`, as in CI, a missing tool, library or
+  download fails a test instead of skipping it. `SNOOPY_TEST_RUSTLS=1` adds
+  the rustls and quinn tests (CI runs them weekly, rust.yml), which
   build with cargo. `SNOOPY_TEST_CURL_HTTP3` (with cargo too) adds curl's
   HTTP/3, given the root of a system whose curl has it: `/` on Fedora, or a
   Fedora root filesystem to chroot into, since Ubuntu's curl doesn't.

@@ -26,7 +26,8 @@ sudo snoopy --lib /usr/bin/node             # also attach to a binary with OpenS
 
 ```text
 Which processes:
-  --pid PID          only this process and those it starts
+  --pid PID          only this process and those it starts, until they've
+                     all exited
   --comm NAME        only processes whose name, as in /proc/<pid>/comm, or
                      program's file name starts with NAME (curl, firefox, node)
   --container ID     only processes in the container with this ID, or ID
@@ -44,6 +45,7 @@ Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
                      or host name at either end
   --port PORT        only connections with this port at either end
+                     (calls whose peer isn't known are left out, counted)
 
 Output:
   --brief            one line per call, like tcpdump
@@ -57,13 +59,14 @@ Output:
   --verbose          also calls that only keep connections going (HTTP/2
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
-  --count N          stop after N calls
+  --count N          stop after N calls (0, the default: don't)
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
   --har FILE         also write the HTTP requests and responses to a HAR file
                      when snoopy stops ("-" for stdout), for browsers'
                      developer tools and other HAR viewers
-  --quiet            don't print calls (with --pcap or --har)
+  --quiet            don't print calls (with --pcap or --har; without them,
+                     snoopy only counts the calls)
   --no-color         no colors
 
 Capture:
@@ -295,6 +298,12 @@ started has no method or path to match. With `--har`, whole entries are
 kept or left out; `--pcap` isn't filtered. The summary at the end says how
 many calls were left out.
 
+`--host` and `--port` need a call's peer address. Calls whose peer isn't
+known (SSLEngine's, with `--java`, and those whose socket couldn't be
+found, as on kernels without BTF) are left out: snoopy warns once and says
+how many when it stops. QUIC packets on a socket that isn't connected, like
+quinn's, get their connection's peer from its other packets.
+
 ## Sharing output
 
 `--redact` masks what's likely secret, so output can go into an issue or a
@@ -305,17 +314,25 @@ chat:
   `Set-Cookie` (keeping the cookies' names and attributes), API key
   headers, and any header whose name says token, secret, password,
   session and the like;
-- query parameters with such names, and `key`, `sig`, `code`;
-- JSON and form fields with such names, in bodies;
+- query parameters and form fields with such names, and `key`, `sig`,
+  `code`, `auth`, `pwd` (so OAuth codes, in redirects too);
+- JSON fields with such names, and `auth`, `pwd` and `pin`, in bodies,
+  also in JSON escaped in a string (as GraphQL variables often are), and
+  numbers that are passwords or PINs;
+- passwords in URLs, as in `postgres://user:[redacted]@host`;
 - tokens of well-known kinds wherever they appear: bearer tokens, JWTs, AWS
-  access keys, GitHub, GitLab, Slack, Stripe, Google, OpenAI and Anthropic
-  keys, and private keys.
+  access keys, GitHub, GitLab, Grafana, Slack (and its webhook URLs),
+  Stripe, Google, OpenAI, Anthropic, npm, Hugging Face and SendGrid keys,
+  webhook signing secrets, and private keys.
 
-It works on what snoopy decodes, in text, `--brief` and JSON. It can't be
-combined with `--hex` or `--pcap`, which show data as sent: there, HTTP/2's
-and HTTP/3's headers are compressed, and can't be masked reliably. It
-catches what's recognizable, not everything a program might consider
-secret, so read output before sharing it anyway.
+It works on what snoopy decodes, in text, `--brief`, JSON and HAR. It can't
+be combined with `--hex` or `--pcap`, which show data as sent: there,
+HTTP/2's and HTTP/3's headers are compressed, and can't be masked
+reliably. A secret split across calls is masked too, but as calls are
+printed as they come, the start of a token in the earlier call shows if
+it's too short to be recognized there on its own (HAR, written at the end,
+masks whole bodies). It catches what's recognizable, not everything a
+program might consider secret, so read output before sharing it anyway.
 
 ## Java
 
@@ -347,22 +364,30 @@ before snoopy started shows its frames and bodies but not its headers. The JVM n
 signalling it), and a writable `/tmp`, where it makes its attach socket and
 snoopy puts the agent's jars (`/tmp/.snoopy-java-*`, kept for later runs);
 a container with a read-only root needs a tmpfs there. For a container,
-give `--pid` the JVM's PID as the host sees it. The agent can't be unloaded: when snoopy stops, it stops
-capturing and stays in the JVM, idle, until it exits. `SSLEngine` calls
-have no socket, so they show no addresses, and `--host` and `--port` don't
-match them.
+give `--pid` the JVM's PID as the host sees it. The agent can't be unloaded: when snoopy stops, it tells
+every agent it loaded to stop capturing, which then stays in the JVM, idle,
+until it exits. That takes 3 seconds at most; a second Ctrl-C exits at
+once, leaving the agents capturing for no one until a later `snoopy
+--java` stops them. `SSLEngine` calls have no socket, so they show no
+addresses: `--host` and `--port` leave them out, and snoopy warns that it
+does and says how many it left out when it stops.
 
 ## Containers and Kubernetes
 
 Run snoopy on the host, or in a privileged container that shares the host's
 PID namespace, so it can see other containers' processes and their files
-through `/proc`. Each release has an image with just the binary, for amd64
-and arm64:
+through `/proc`. Each release has an image with just the binary and the
+Java agent's jars, for amd64 and arm64. Its tag is the release's version
+without the `v`; `latest`, the default, is the newest release:
 
 ```bash
 docker run --rm -it --privileged --pid=host ghcr.io/tks98/snoopy --brief
-docker run --rm -it --privileged --pid=host ghcr.io/tks98/snoopy:2.6.0 --comm curl
+docker run --rm -it --privileged --pid=host ghcr.io/tks98/snoopy:2.9.1 --comm curl
 ```
+
+Images of releases after 2.9.1 have attested build provenance, which
+`gh attestation verify oci://ghcr.io/tks98/snoopy:VERSION --repo
+tks98/snoopy` checks.
 
 In a container, snoopy finds the host's TLS libraries through
 `/proc/1/root`, and other containers' through their processes, so it traces

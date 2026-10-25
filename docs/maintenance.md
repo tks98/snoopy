@@ -74,6 +74,8 @@ file, then match what you see:
 `.github/workflows/canary.yml` runs weekly (and from the Actions tab, and on
 PRs that change it) against the latest browsers and Fedora's curl; its
 download script, `.github/canary/fetch.sh`, does what this section describes.
+Its Fedora image is a release pinned by digest, whose updates bring curl's;
+move it to each new Fedora release there.
 When it fails, the job's name says which program, and the sections below say
 how to fix each. The script runs locally too, e.g.
 `spec=$(.github/canary/fetch.sh chrome beta /tmp/chrome)` and then
@@ -279,9 +281,11 @@ kernel's PID namespace and in a new one (the program numbers PIDs
 differently there), under each kernel vimto has downloaded, booting it in QEMU with a small init. It's
 quicker than the tests, and covers 5.10. It uses the kernels
 `tools/loadcheck/fetch.sh 5.10 5.15 6.1 6.6 6.12` downloads (with Docker,
-from Cilium's CI kernel images), and those vimto has. The Load check
-workflow runs both on x86-64 for every change to the BPF code or how it's
-loaded.
+from Cilium's CI kernel images, each by the digest pinned in the script,
+which says how to move one on), and those vimto has. The Load check
+workflow runs both on x86-64 and arm64 for every change to the BPF code or
+how it's loaded; the arm64 runners have no KVM, so QEMU emulates there,
+about half a minute a kernel.
 
 ## Chrome, Electron and other Chromium builds
 
@@ -769,7 +773,10 @@ under another PID).
 
 - **A new JDK:** add it to the `java` job in `.github/workflows/ci.yml`,
   run `javap` as above, and if ASM is older than the JDK, bump `ASM` and its
-  SHA-1s in `java/build.sh` (Maven Central has the `.sha1` files).
+  SHA-256 sums in `java/build.sh`: take them from the downloads, after
+  checking those against Maven Central's `.sha1` files, its only sums. The
+  same goes for the Netty and Conscrypt jars in `javaLibs`
+  (`internal/tracer/integration_test.go`).
 - **A moved method:** match its new name or descriptor in `Agent.Visitor`;
   if the shorter `wrap`/`unwrap` no longer go through the six-argument
   ones, instrument one level only, or engine calls are captured twice.
@@ -809,9 +816,17 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   them as not its own, so `sched_process_fork` reports new processes of
   traced ones, and they get their own (held with ptrace, like execs, until
   then). Links are kept per process (`procLinks`, with its start time against
-  PID reuse) and closed every 5 s once it has exited. A file attached to for
+  PID reuse) and closed every 5 s once it has exited. `sched_process_exit`
+  deletes a process's `traced_tgids` and `java_sessions` entries when its
+  last thread exits, so the maps don't fill up over days (with BTF, from
+  `signal->live`; without, when the main thread exits). A file attached to for
   everyone (`--lib`) isn't attached to again per process, which would show
-  its calls twice. The BPF program still filters too: on `traced_tgids`,
+  its calls twice. Links made for everyone are kept per file (`fileLinks`,
+  with an O_PATH descriptor) and released by `DetachUnused` every 5 s once
+  the file is deleted and no process maps it, or its root filesystem (a
+  container's) has no process left. Detaching costs the kernel tens of ms
+  per uprobe, so it's done in the background, in batches, and at exit all at
+  once. The BPF program still filters too: on `traced_tgids`,
   with BTF adding a process whose parent, or one of its parents up to 8
   levels, is in it (`is_traced_tgid`), and on the name. Without BTF the
   probes are per file, and user space scans `/proc` for new children of
@@ -827,8 +842,9 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   this way, extracted to temporary files and deleted; `TestJavaNativeTLS`
   loads them at start and five seconds later.
 
-- **Java agent frames:** `note_java_frame`, first thing in `sys_enter` for
-  `write`, picks up the agent's frames for a session in `java_sessions`
+- **Java agent frames:** with `--java` only (`java_enabled`, which the
+  verifier drops the code for otherwise), `note_java_frame`, first thing in
+  `sys_enter` for `write`, picks up the agent's frames for a session in `java_sessions`
   (by PID as snoopy sees it, like `traced_tgids`), and returns before the
   socket tracking. `struct java_frame` must match `Hooks.header` in
   `java/agent/src/snoopy/hooks/Hooks.java` (88 bytes, little-endian), and

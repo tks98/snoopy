@@ -54,6 +54,7 @@ func main() {
 		{"default", tracer.Options{}},
 		{"--pid", tracer.Options{PID: 1, PerProcess: true}},
 		{"--comm", tracer.Options{Comm: "curl", PerProcess: true}},
+		{"--java --pid", tracer.Options{PID: 1, PerProcess: true, Java: true}},
 	} {
 		t, err := tracer.New(tc.opts)
 		if err != nil {

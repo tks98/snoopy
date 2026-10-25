@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"bytes"
 	"debug/elf"
 	"encoding/json"
 	"errors"
@@ -37,12 +38,17 @@ var Progress func(msg string)
 
 // boringSSLCacheVersion is part of cached results' names: bump it when
 // findBoringSSL would answer differently, so that older answers aren't used.
-const boringSSLCacheVersion = 5
+const boringSSLCacheVersion = 6
 
 // cachedFindBoringSSL is findBoringSSL with its results kept by build ID in
 // the user's cache directory, so a large program (Chrome is 300 MB) is
 // analyzed once. Later runs attach to it right away, which matters for
 // programs found as they start.
+//
+// A build ID is only a claim, which a program in a container can copy from
+// another (a host's Chrome, say) to leave wrong offsets for it. So each
+// entry keeps the first bytes of every function it found, and is used only
+// for a file that has the same bytes at the same offsets.
 func cachedFindBoringSSL(path string, f *elf.File) (map[string]uint64, error) {
 	var file string
 	if id := funcfind.BuildID(f); id != nil {
@@ -51,10 +57,10 @@ func cachedFindBoringSSL(path string, f *elf.File) (map[string]uint64, error) {
 		}
 	}
 	if file != "" {
-		var offsets map[string]uint64
-		if data, err := os.ReadFile(file); err == nil && json.Unmarshal(data, &offsets) == nil &&
-			offsets["SSL_read"] != 0 && offsets["SSL_write"] != 0 {
-			return offsets, nil
+		var cached boringSSLCache
+		if data, err := os.ReadFile(file); err == nil && json.Unmarshal(data, &cached) == nil &&
+			cached.Offsets["SSL_read"] != 0 && cached.Offsets["SSL_write"] != 0 && cached.matches(f) {
+			return cached.Offsets, nil
 		}
 	}
 	offsets, err := findBoringSSL(f, func() {
@@ -63,11 +69,57 @@ func cachedFindBoringSSL(path string, f *elf.File) (map[string]uint64, error) {
 		}
 	})
 	if err == nil && file != "" {
-		if data, err := json.Marshal(offsets); err == nil && os.MkdirAll(filepath.Dir(file), 0o755) == nil {
+		cached := boringSSLCache{Offsets: offsets, Starts: map[string][]byte{}}
+		for name, off := range offsets {
+			if b, ok := bytesAt(f, off, cacheCheckLen); ok {
+				cached.Starts[name] = b
+			}
+		}
+		if data, err := json.Marshal(cached); err == nil && os.MkdirAll(filepath.Dir(file), 0o755) == nil {
 			_ = os.WriteFile(file, data, 0o644) // a cache: failing only costs time
 		}
 	}
 	return offsets, err
+}
+
+// cacheCheckLen is how many of a function's first bytes a cache entry
+// keeps, to tell its file from another with the same build ID.
+const cacheCheckLen = 32
+
+type boringSSLCache struct {
+	Offsets map[string]uint64
+	Starts  map[string][]byte // each function's first cacheCheckLen bytes
+}
+
+// matches reports whether f has each function's first bytes where the
+// entry says.
+func (c boringSSLCache) matches(f *elf.File) bool {
+	if len(c.Starts) != len(c.Offsets) {
+		return false
+	}
+	for name, off := range c.Offsets {
+		b, ok := bytesAt(f, off, cacheCheckLen)
+		if !ok || !bytes.Equal(b, c.Starts[name]) {
+			return false
+		}
+	}
+	return true
+}
+
+// bytesAt reads n bytes at file offset off, from the loadable segment that
+// has them.
+func bytesAt(f *elf.File, off uint64, n int) ([]byte, bool) {
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_LOAD || off < p.Off || off+uint64(n) > p.Off+p.Filesz {
+			continue
+		}
+		b := make([]byte, n)
+		if _, err := p.ReadAt(b, int64(off-p.Off)); err != nil {
+			return nil, false
+		}
+		return b, true
+	}
+	return nil, false
 }
 
 // findBoringSSL locates SSL_read and SSL_write in a program that links

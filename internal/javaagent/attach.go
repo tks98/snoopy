@@ -1,6 +1,5 @@
 // Package javaagent loads snoopy's Java agent into a running HotSpot JVM,
-// through its attach mechanism, without a JDK on the tracing side (spike;
-// see docs/plan-java.md).
+// through its attach mechanism, without a JDK on the tracing side.
 //
 // The attach mechanism, as OpenJDK's Linux client uses it: the JVM listens
 // on a Unix socket, /tmp/.java_pid<pid> in its own mount and PID
@@ -14,6 +13,7 @@ package javaagent
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -25,12 +25,27 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tks98/snoopy/v2/internal/procinfo"
 	"golang.org/x/sys/unix"
 )
 
 // Load loads the agent jar into process pid, passing it options, and
 // returns the JVM's answer. jar is a path as the JVM sees it.
 func Load(pid int, jar, options string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return LoadContext(ctx, pid, jar, options)
+}
+
+// LoadContext is Load, until ctx is done: then it stops waiting for the
+// JVM and returns ctx's error, and a JVM it hasn't signalled yet isn't.
+// Without a deadline in ctx, it waits 10 s at most.
+func LoadContext(ctx context.Context, pid int, jar, options string) (string, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
+		defer cancel()
+	}
 	// The process, held onto: a signal goes to it, not to one that took its
 	// PID.
 	pidfd, err := unix.PidfdOpen(pid, 0)
@@ -47,11 +62,10 @@ func Load(pid int, jar, options string, timeout time.Duration) (string, error) {
 		return "", err
 	}
 	defer unix.Close(root)
-	deadline := time.Now().Add(timeout)
 	name := fmt.Sprintf("tmp/.java_pid%d", p.nsPID)
 	sock, err := openSocket(root, name)
 	if err != nil {
-		if sock, err = p.trigger(pidfd, root, name, deadline); err != nil {
+		if sock, err = p.trigger(ctx, pidfd, root, name); err != nil {
 			return "", err
 		}
 	}
@@ -64,8 +78,11 @@ func Load(pid int, jar, options string, timeout time.Duration) (string, error) {
 	if options != "" {
 		arg += "=" + options
 	}
-	return request(p, sock, deadline, "load", "instrument", "false", arg)
+	return request(ctx, p, sock, "load", "instrument", "false", arg)
 }
+
+// defaultTimeout bounds LoadContext given a context without a deadline.
+const defaultTimeout = 10 * time.Second
 
 type process struct {
 	pid, nsPID  int
@@ -100,10 +117,8 @@ func inspect(pid int) (*process, error) {
 	if err != nil {
 		return nil, err
 	}
-	if i := bytes.LastIndexByte(stat, ')'); i >= 0 {
-		if f := strings.Fields(string(stat[i+1:])); len(f) > 19 {
-			p.start = f[19]
-		}
+	if s, ok := procinfo.ParseStat(stat); ok && s.Complete {
+		p.start = strconv.FormatUint(s.Start, 10)
 	}
 	return p, nil
 }
@@ -112,14 +127,14 @@ func inspect(pid int) (*process, error) {
 // its root: it creates the attach file, owned by the JVM's user, and sends
 // SIGQUIT, which a JVM that doesn't handle it (-Xrs) would die of. It
 // returns the socket, as openSocket does.
-func (p *process) trigger(pidfd, root int, name string, deadline time.Time) (int, error) {
+func (p *process) trigger(ctx context.Context, pidfd, root int, name string) (int, error) {
 	if !p.catchesQuit {
 		return -1, fmt.Errorf("process %d doesn't handle SIGQUIT, so it isn't a JVM that can be attached to", p.pid)
 	}
 	// A JVM that doesn't attach answers SIGQUIT with a thread dump on its
 	// stdout: not worth causing to find out.
 	if attachDisabled(p.pid) {
-		return -1, fmt.Errorf("process %d runs with -XX:+DisableAttachMechanism, so no agent can be loaded into it; start it with -javaagent instead", p.pid)
+		return -1, fmt.Errorf("process %d runs with -XX:+DisableAttachMechanism, so no agent can be loaded into it; start it without that option to trace it with --java", p.pid)
 	}
 	// In its /tmp, which the JVM looks in after its working directory: made
 	// there, not somewhere a symlink points, and given to its user through
@@ -131,6 +146,7 @@ func (p *process) trigger(pidfd, root int, name string, deadline time.Time) (int
 		return -1, fmt.Errorf("process %d's /tmp: %w", p.pid, err)
 	}
 	defer unix.Close(tmp)
+	signalled := false
 	switch fd, err := createIn(tmp, file, 0o600); {
 	case errors.Is(err, unix.EEXIST):
 		// Someone's, perhaps a JDK tool's: the JVM looks for it all the same.
@@ -139,21 +155,63 @@ func (p *process) trigger(pidfd, root int, name string, deadline time.Time) (int
 	default:
 		_ = unix.Fchown(fd, p.uid, p.gid)
 		unix.Close(fd)
-		defer func() { _ = unix.Unlinkat(tmp, file, 0) }() // once the JVM has seen it
+		defer func() {
+			// Once the JVM has seen it: one signalled that finds it gone
+			// prints a thread dump instead. So when this gives up early,
+			// the JVM is given a moment, and if it hasn't taken the signal
+			// even then (it's stopped, say), the file stays, for it to
+			// start its listener when it does.
+			if signalled && ctx.Err() != nil {
+				time.Sleep(quitGrace)
+				if quitPending(p.pid) {
+					return
+				}
+			}
+			_ = unix.Unlinkat(tmp, file, 0)
+		}()
+	}
+	if err := ctx.Err(); err != nil {
+		return -1, err
 	}
 	if err := unix.PidfdSendSignal(pidfd, unix.SIGQUIT, nil, 0); err != nil {
 		return -1, fmt.Errorf("process %d: %w", p.pid, err)
 	}
+	signalled = true
 	for wait := 20 * time.Millisecond; ; wait = min(2*wait, 500*time.Millisecond) {
 		if sock, err := openSocket(root, name); err == nil {
 			return sock, nil
 		}
-		if time.Now().After(deadline) {
-			return -1, fmt.Errorf("process %d didn't start its attach listener (is attaching disabled, -XX:+DisableAttachMechanism?)", p.pid)
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return -1, fmt.Errorf("process %d didn't start its attach listener (is attaching disabled, -XX:+DisableAttachMechanism?)", p.pid)
+			}
+			return -1, ctx.Err()
+		case <-time.After(wait):
 		}
-		time.Sleep(wait)
 	}
 }
+
+// quitPending reports whether process pid has a SIGQUIT pending: sent, and
+// not yet taken by any of its threads.
+func quitPending(pid int) bool {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		if v, ok := strings.CutPrefix(line, "ShdPnd:"); ok {
+			mask, _ := strconv.ParseUint(strings.TrimSpace(v), 16, 64)
+			return mask&(1<<(syscall.SIGQUIT-1)) != 0
+		}
+	}
+	return false
+}
+
+// quitGrace is how long a JVM signalled to attach has to find the attach
+// file before it's removed, when attaching is given up on before it
+// answered.
+const quitGrace = 200 * time.Millisecond
 
 // openSocket returns an O_PATH descriptor for the socket at name in the
 // filesystem whose root is root, or an error if there's none.
@@ -172,13 +230,18 @@ func openSocket(root int, name string) (int, error) {
 
 // request sends a command with its arguments, and returns the output of a
 // command that succeeded.
-func request(p *process, sock int, deadline time.Time, cmd string, args ...string) (string, error) {
+func request(ctx context.Context, p *process, sock int, cmd string, args ...string) (string, error) {
 	c, err := dialAs(sock, p.uid, p.gid)
 	if err != nil {
 		return "", err
 	}
 	defer c.Close()
-	_ = c.SetDeadline(deadline)
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.SetDeadline(deadline)
+	}
+	// Cancelling stops the wait for the answer.
+	stop := context.AfterFunc(ctx, func() { _ = c.SetDeadline(time.Now()) })
+	defer stop()
 	var req bytes.Buffer
 	for _, s := range append([]string{"1", cmd}, append(args, "", "", "")[:3]...) {
 		req.WriteString(s)
@@ -189,6 +252,9 @@ func request(p *process, sock int, deadline time.Time, cmd string, args ...strin
 	}
 	r := bufio.NewReader(io.LimitReader(c, 1<<20))
 	status, err := r.ReadString('\n')
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 	if err != nil {
 		return "", fmt.Errorf("attach listener: %w", err)
 	}

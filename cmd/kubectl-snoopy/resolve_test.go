@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -102,14 +103,15 @@ func TestByNode(t *testing.T) {
 func TestMerger(t *testing.T) {
 	var out bytes.Buffer
 	m := newMerger(&out, true)
+	m.idle = time.Hour
 	a, b := m.stream(), m.stream()
-	a.Write([]byte("event a1\nline two"))
-	b.Write([]byte("event b1\n\nevent b2"))
-	a.Write([]byte("\n\nevent a2\n\n"))
+	a.Write([]byte("12:00:00.000001 event a1\nline two"))
+	b.Write([]byte("12:00:00.000002 event b1\n\n12:00:00.000003 event b2"))
+	a.Write([]byte("\n\n12:00:00.000004 event a2\n\n"))
 	b.Write([]byte(" continued\n\n"))
 	a.Flush()
 	b.Flush()
-	want := "event b1\n\nevent a1\nline two\n\nevent a2\n\nevent b2 continued\n\n"
+	want := "12:00:00.000002 event b1\n\n12:00:00.000001 event a1\nline two\n\n12:00:00.000004 event a2\n\n12:00:00.000003 event b2 continued\n\n"
 	if out.String() != want {
 		t.Errorf("got %q, want %q", out.String(), want)
 	}

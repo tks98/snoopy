@@ -155,6 +155,9 @@ const volatile bool have_btf = false;
 // kernel's.
 const volatile __u64 pidns_dev = 0;
 const volatile __u64 pidns_ino = 0;
+// Whether user space registers Java agents' sessions (--java). Without, the
+// verifier drops looking for their frames in every write.
+const volatile bool java_enabled = false;
 
 struct active_call {
 	__u64 start_ns;
@@ -275,11 +278,11 @@ struct {
 
 // With --pid, the processes to trace: the one given and those it starts.
 // User space adds them as it finds them, and so does is_traced_tgid, with
-// BTF, at a process's first call.
+// BTF, at a process's first call; sched_process_exit deletes them.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
-	__type(key, __u32); // tgid
+	__type(key, __u32); // TGID as snoopy sees it (ns_pid_tgid)
 	__type(value, __u8);
 } traced_tgids SEC(".maps");
 
@@ -507,8 +510,13 @@ static __always_inline bool track_conn(__u64 pid_tgid, __u64 conn, __s32 fd)
 	struct conn_info info;
 	__builtin_memset(&info, 0, sizeof(info));
 	info.fd = fd;
-	if (have_btf)
+	if (have_btf) {
 		resolve_socket(fd, &info);
+		// Not a socket: a file the library read during the call, whose
+		// number can be reused for another connection's socket.
+		if (!info.file)
+			return false;
+	}
 
 	// Once a socket is closed (e.g. reset by the peer), the kernel releases
 	// its port and skc_num reads 0, yet buffered data can still be read.
@@ -568,7 +576,18 @@ static __always_inline int output_last_chunk(const struct event_header *h, const
 // still the same socket. Without BTF, there's no telling.
 static __always_inline bool conn_info_live(struct conn_info *info)
 {
-	return !have_btf || !info->file || (__u64)socket_file(info->fd) == info->file;
+	return !have_btf || (info->file && (__u64)socket_file(info->fd) == info->file);
+}
+
+// Reports whether a connection's socket is known, and still open.
+static __always_inline bool conn_known(__u64 pid_tgid, __u64 conn)
+{
+	struct conn_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.conn = conn;
+	struct conn_info *info = bpf_map_lookup_elem(&conn_infos, &key);
+	return info && conn_info_live(info);
 }
 
 // The flags to submit a call's records with: no wakeup if this CPU woke the
@@ -883,10 +902,43 @@ static __always_inline int record_fd(__u64 fd)
 	struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
 	if (!call)
 		return 0;
+	// Only sockets: OpenSSL may open, read and close a file inside a call
+	// (Node.js's does, in SSL_write), whose number a socket gets later.
+	if (have_btf && !socket_file((__s32)fd))
+		return 0;
 	call->fd = (__s32)fd;
 	track_conn(pid_tgid, call->conn, call->fd);
 	propagate_fd(pid_tgid, &dk, depth - 1, call->fd);
 	return 0;
+}
+
+// Without BTF, there's no telling a socket from a file, but a descriptor a
+// TLS call closes isn't its connection's socket: forget it if it was taken
+// for one, as a file the call opened, read and closed would be.
+static __always_inline void forget_closed_fd(__s32 fd)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	__u32 depth = get_depth(&dk);
+	struct call_key key;
+	for (int i = 0; i < MAX_DEPTH; i++) {
+		if ((__u32)i >= depth)
+			break;
+		call_key_at(&key, &dk, i);
+		struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
+		if (!call || call->fd != fd)
+			continue;
+		call->fd = -1;
+		struct conn_key ck;
+		__builtin_memset(&ck, 0, sizeof(ck));
+		ck.tgid = pid_tgid >> 32;
+		ck.conn = call->conn;
+		struct conn_info *info = bpf_map_lookup_elem(&conn_infos, &ck);
+		if (info && info->fd == fd)
+			bpf_map_delete_elem(&conn_infos, &ck);
+	}
 }
 
 // Syscalls a TLS library may use to move data over its socket. They all take
@@ -897,6 +949,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #if defined(__TARGET_ARCH_x86)
 #define SYS_MMAP 9
 #define SYS_WRITE 1
+#define SYS_CLOSE 3
 #define SYSCALL_FD(regs) ((regs)->di)
 #define SYSCALL_ARG1(regs) ((regs)->si)
 #define SYSCALL_ARG2(regs) ((regs)->dx)
@@ -916,6 +969,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #elif defined(__TARGET_ARCH_arm64)
 #define SYS_MMAP 222
 #define SYS_WRITE 64
+#define SYS_CLOSE 57
 #define SYSCALL_FD(regs) ((regs)->orig_x0)
 #define SYSCALL_ARG1(regs) ((regs)->user_regs.regs[1])
 #define SYSCALL_ARG2(regs) ((regs)->user_regs.regs[2])
@@ -1177,6 +1231,8 @@ static __always_inline void note_packet_send(__u64 pid_tgid, __s32 fd, long id, 
 	if (!found)
 		return;
 	__u64 conn = *found;
+	// Sent: a later send from the same buffer isn't this packet's.
+	bpf_map_delete_elem(&sealed_packets, &key);
 	if (name)
 		emit_packet_sent(pid_tgid, conn, fd, buf, name);
 	if (track_conn(pid_tgid, conn, fd))
@@ -1207,7 +1263,7 @@ struct {
 
 static __always_inline void note_udp443(__u64 pid_tgid, __s32 fd, long id)
 {
-	if (!have_btf || !IS_DATAGRAM_IO(id))
+	if (!have_btf || !IS_DATAGRAM_IO(id) || !should_trace(pid_tgid))
 		return;
 	__u32 tgid = (pidns_ino ? ns_pid_tgid() : pid_tgid) >> 32; // user space reads these
 	if (!tgid)
@@ -1360,9 +1416,6 @@ static __always_inline void note_library_load(struct pt_regs *regs)
 		return;
 	if (!(prot & PROT_EXEC) || (__s32)fd < 0)
 		return;
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	if (!should_trace(pid_tgid))
-		return;
 	struct file *file = file_at((__s32)fd);
 	if (!file)
 		return;
@@ -1370,6 +1423,9 @@ static __always_inline void note_library_load(struct pt_regs *regs)
 	__builtin_memset(name, 0, sizeof(name));
 	if (bpf_probe_read_kernel_str(name, sizeof(name), BPF_CORE_READ(file, f_path.dentry, d_name.name)) <= 0 ||
 	    !tls_library_name(name))
+		return;
+	// After the name, which rules out nearly every mapping more cheaply.
+	if (!should_trace(bpf_get_current_pid_tgid()))
 		return;
 	__u64 ns = ns_pid_tgid();
 	if (!ns)
@@ -1385,8 +1441,9 @@ static __always_inline void note_library_load(struct pt_regs *regs)
 // The agent (java/agent) writes what SunJSSE's application calls read and
 // wrote as frames, a struct java_frame and the payload, to a descriptor for
 // /dev/null, on the calling thread; they're picked up here, before the
-// write goes anywhere. A process's frames count only once user space has
-// registered its session (java_sessions, by PID as snoopy sees it), with
+// write goes anywhere, with --java (java_enabled). A process's frames count
+// only once user space has registered its session (java_sessions, by PID as
+// snoopy sees it), with
 // the nonce the agent was started with, and, with BTF, only on the null
 // device; the first one fixes the descriptor. They're kept out of the
 // socket tracking below.
@@ -1404,7 +1461,7 @@ struct java_frame {
 	__u64 magic;
 	__u64 nonce;
 	__u64 conn;	  // the agent's ID for the SSLSocket or SSLEngine
-	__u64 seq;	  // the agent's frame count, for spotting gaps
+	__u64 seq;	  // the connection's frame count, for spotting gaps
 	__u8 dir;	  // JAVA_READ, or 0 for writes
 	__u8 kind;	  // JAVA_KIND_*
 	__u16 family;	  // AF_INET, AF_INET6, or 0 if the addresses are unknown
@@ -1426,9 +1483,43 @@ struct java_session {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, __u32); // host TGID
+	__type(key, __u32); // TGID as snoopy sees it (ns_pid_tgid), as user space gives it
 	__type(value, struct java_session);
 } java_sessions SEC(".maps");
+
+// sched:sched_process_exit(struct task_struct *p), raised by each thread as
+// it exits, in its own context. Once a process's last thread does, its
+// entries in traced_tgids and java_sessions go: nothing else deletes them,
+// and a reused PID would be taken for the process.
+SEC("raw_tracepoint/sched_process_exit")
+int sched_process_exit(struct bpf_raw_tracepoint_args *ctx)
+{
+	if (!filter_tgids && !java_enabled)
+		return 0;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (have_btf) {
+		// signal->live counts the threads that haven't begun to exit; the
+		// last one took it to 0 before this tracepoint.
+		struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+		struct signal_struct *sig = BPF_CORE_READ(task, signal);
+		atomic_t live;
+		__builtin_memset(&live, 0, sizeof(live));
+		if (!sig || bpf_core_read(&live, sizeof(live), &sig->live) || live.counter)
+			return 0;
+	} else if ((__u32)pid_tgid != pid_tgid >> 32) {
+		// Without BTF, the main thread's exit is the best sign of the
+		// process's (user space adds back one that goes on without it).
+		return 0;
+	}
+	__u32 tgid = (pidns_ino ? ns_pid_tgid() : pid_tgid) >> 32;
+	if (!tgid)
+		return 0;
+	if (filter_tgids)
+		bpf_map_delete_elem(&traced_tgids, &tgid);
+	if (java_enabled)
+		bpf_map_delete_elem(&java_sessions, &tgid);
+	return 0;
+}
 
 static __always_inline bool null_device(__s32 fd)
 {
@@ -1513,20 +1604,24 @@ int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 		note_library_load((struct pt_regs *)ctx->args[0]);
 		return 0;
 	}
+	if (!have_btf && id == SYS_CLOSE) {
+		__u64 fd = 0;
+		if (!bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD((struct pt_regs *)ctx->args[0])))
+			forget_closed_fd((__s32)fd);
+		return 0;
+	}
 	if (!IS_SOCKET_IO_SYSCALL(id))
 		return 0;
 
 	struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
-	if (id == SYS_WRITE && note_java_frame(regs))
+	if (java_enabled && id == SYS_WRITE && note_java_frame(regs))
 		return 0;
 	__u64 fd = 0;
 	if (bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD(regs)))
 		return 0;
 	note_thread_fd(fd, id, regs);
 	note_quic_proc_io((__s32)fd, id, regs);
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	if (should_trace(pid_tgid))
-		note_udp443(pid_tgid, (__s32)fd, id);
+	note_udp443(bpf_get_current_pid_tgid(), (__s32)fd, id);
 	return record_fd(fd);
 }
 
@@ -1698,9 +1793,12 @@ int BPF_UPROBE(rustls_read_enter, const void *self, void *buf)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid))
 		return 0;
+	__u64 conn = rust_conn(self);
 	struct io_thread *rt = io_thread(pid_tgid);
-	__s32 fd = rt ? rt->last_fd : -1;
-	return enter_call_fd(ctx, FN_RUSTLS_READ, RET_RUST_RESULT, rust_conn(self), buf, 0, fd);
+	// The thread's last receive is only a guess at the connection's socket,
+	// which may be another connection's: not one to replace a known one.
+	__s32 fd = rt && !conn_known(pid_tgid, conn) ? rt->last_fd : -1;
+	return enter_call_fd(ctx, FN_RUSTLS_READ, RET_RUST_RESULT, conn, buf, 0, fd);
 }
 
 SEC("uprobe/rustls_write")

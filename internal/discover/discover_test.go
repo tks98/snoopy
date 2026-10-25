@@ -76,7 +76,7 @@ func le32(words ...uint32) []byte {
 }
 
 // buildGoFixture compiles testdata/gotls for the given architecture.
-func buildGoFixture(t *testing.T, goarch string, strip bool) string {
+func buildGoFixture(t testing.TB, goarch string, strip bool) string {
 	t.Helper()
 	ldflags := ""
 	if strip {
@@ -85,7 +85,7 @@ func buildGoFixture(t *testing.T, goarch string, strip bool) string {
 	return buildFixture(t, "./testdata/gotls", ldflags, "GOARCH="+goarch, "CGO_ENABLED=0")
 }
 
-func buildFixture(t *testing.T, pkg, ldflags string, env ...string) string {
+func buildFixture(t testing.TB, pkg, ldflags string, env ...string) string {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("builds a Go program")
@@ -648,7 +648,7 @@ func TestNeeded(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "environ"), []byte("HOME=/root\x00"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w := &Watcher{proc: proc, seen: map[fileID][]Target{}, roots: map[fileID]bool{}}
+	w := newWatcher(proc, false)
 	var libs []string
 	for _, target := range w.Needed(7) {
 		libs = append(libs, filepath.Base(target.Path)+" "+target.Library.String())
@@ -690,7 +690,7 @@ func TestWatcherPerProcess(t *testing.T) {
 		return out
 	}
 	for _, perProcess := range []bool{false, true} {
-		w := &Watcher{proc: proc, perProcess: perProcess, seen: map[fileID][]Target{}, roots: map[fileID]bool{}}
+		w := newWatcher(proc, perProcess)
 		first, second := paths(w.Needed(7)), paths(w.Needed(8))
 		if len(first) == 0 {
 			t.Fatal("no libssl found for curl")

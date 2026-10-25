@@ -1,6 +1,5 @@
 package snoopy.hooks;
 
-import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -20,9 +19,6 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
  * a TLS read or write into a frame written to a descriptor for /dev/null,
  * where snoopy's write tracepoint reads it. Nothing here may throw into the
  * application.
- *
- * Spike: the frame format and its registration are not final (see
- * docs/plan-java.md).
  */
 public final class Hooks {
     private Hooks() {}
@@ -38,8 +34,6 @@ public final class Hooks {
     static volatile int maxCapture = 16384;
     static long nonce;
     static FileOutputStream out;
-    static final AtomicLong seq = new AtomicLong();
-    static final AtomicLong failed = new AtomicLong();
     static final AtomicLong nextConn = new AtomicLong(1);
 
     /** Opens the transport and starts copying; true if it's ready. */
@@ -66,25 +60,14 @@ public final class Hooks {
         enabled = false;
     }
 
-    /** The transport's descriptor number, for registering it (spike: by reflection). */
-    public static int fd() {
-        try {
-            FileDescriptor d = out.getFD();
-            var f = FileDescriptor.class.getDeclaredField("fd");
-            f.setAccessible(true);
-            return f.getInt(d);
-        } catch (Throwable t) {
-            return -1;
-        }
-    }
-
-    // A connection: the agent's ID for it, and what its frames' headers say
-    // of its addresses.
+    // A connection: the agent's ID for it, what its frames' headers say of
+    // its addresses, and the sequence number of its next frame.
     static final class Conn {
         final WeakReference<Object> owner;
         final long id;
         final short family, lport, rport;
         final byte[] laddr, raddr;
+        long seq; // with the connection locked, in emit
 
         Conn(Object owner, long id) {
             this.owner = new WeakReference<>(owner);
@@ -109,22 +92,34 @@ public final class Hooks {
         }
     }
 
-    static final Map<Object, Conn> conns = new WeakHashMap<>();
+    // The connections, by their sockets and engines, in shards by identity
+    // hash, each with its own lock, so that a server's many connections
+    // don't all wait on one.
+    static final int SHARDS = 64;
+    @SuppressWarnings("unchecked")
+    static final Map<Object, Conn>[] conns = new Map[SHARDS];
+    static {
+        for (int i = 0; i < SHARDS; i++) {
+            conns[i] = new WeakHashMap<>();
+        }
+    }
     // The connections seen last, by identity hash: most calls find theirs
     // here, without a lock.
-    static final AtomicReferenceArray<Conn> recent = new AtomicReferenceArray<>(256);
+    static final AtomicReferenceArray<Conn> recent = new AtomicReferenceArray<>(4096);
 
     static Conn conn(Object owner) {
-        int slot = System.identityHashCode(owner) & (recent.length() - 1);
+        int h = System.identityHashCode(owner);
+        int slot = h & (recent.length() - 1);
         Conn c = recent.get(slot);
         if (c != null && c.owner.get() == owner) {
             return c;
         }
-        synchronized (conns) {
-            c = conns.get(owner);
+        Map<Object, Conn> shard = conns[(h >>> 12) & (SHARDS - 1)];
+        synchronized (shard) {
+            c = shard.get(owner);
             if (c == null) {
                 c = new Conn(owner, nextConn.getAndIncrement());
-                conns.put(owner, c);
+                shard.put(owner, c);
             }
         }
         recent.set(slot, c);
@@ -266,17 +261,20 @@ public final class Hooks {
     }
 
     // emit writes a frame of n bytes and gives it back. A connection's
-    // frames are written one at a time, in order; /dev/null writes are
-    // atomic, so different connections' go at once.
+    // frames are written one at a time, in order, numbered from 0; /dev/null
+    // writes are atomic, so different connections' go at once. One that
+    // can't be written is lost.
     static void emit(Conn c, byte[] f, int n) {
         Object lock = c == null ? Hooks.class : c;
         try {
             synchronized (lock) {
-                ByteBuffer.wrap(f, 24, 8).order(ByteOrder.LITTLE_ENDIAN).putLong(seq.getAndIncrement());
+                if (c != null) {
+                    ByteBuffer.wrap(f, 24, 8).order(ByteOrder.LITTLE_ENDIAN).putLong(c.seq++);
+                }
                 out.write(f, 0, n);
             }
         } catch (Throwable t) {
-            failed.incrementAndGet();
+            // never into the application
         } finally {
             giveFrame(f);
         }
