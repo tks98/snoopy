@@ -1689,6 +1689,47 @@ func TestJSSE(t *testing.T) {
 		})
 	}
 
+	// Told to stop, the agent writes nothing more, while its session is
+	// still there.
+	t.Run("disabled", func(t *testing.T) {
+		nonce := javaNonce(t)
+		client := startJSSEClient(t, java, srv.URL, "socket", 100, 1, 2)
+		pid := uint32(client.cmd.Process.Pid)
+		if err := tr.RegisterJava(pid, nonce); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { tr.UnregisterJava(pid) })
+		client.exec(t)
+		for _, opts := range []string{options(nonce), "disable"} {
+			if out, err := javaagent.Load(int(pid), agent, opts, 10*time.Second); err != nil {
+				t.Fatalf("load the agent with %s: %v: %s", opts, err, out)
+			}
+		}
+		client.run(t)
+		time.Sleep(time.Second)
+		if n := events.count(func(ev *Event) bool { return ev.PID == pid }); n != 0 {
+			t.Errorf("%d events after the agent was told to stop", n)
+		}
+	})
+
+	// A JVM that can't be attached to is told apart without a signal (it
+	// would answer with a thread dump), and one with fewer signal handlers
+	// (-Xrs) can be attached to; both go on as before.
+	for _, c := range []struct{ flag, want string }{
+		{"-XX:+DisableAttachMechanism", "DisableAttachMechanism"},
+		{"-Xrs", ""},
+	} {
+		t.Run(c.flag, func(t *testing.T) {
+			client := startJSSEClient(t, java, srv.URL, "socket", 100, 1, 1, c.flag)
+			client.exec(t)
+			_, err := javaagent.Load(client.cmd.Process.Pid, agent, options(1), 2*time.Second)
+			if c.want == "" && err != nil || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
+				t.Errorf("error %v, want %q", err, c.want)
+			}
+			client.run(t)
+		})
+	}
+
 	// Frames without the session's nonce are written to /dev/null and that's
 	// all.
 	t.Run("other nonce", func(t *testing.T) {

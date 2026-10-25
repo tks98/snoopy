@@ -68,6 +68,11 @@ Output:
 
 Capture:
   --max-size BYTES   bytes to capture per call (default 16384, at most 1048576)
+  --java             also Java's own TLS (SunJSSE) in the --pid JVM, by
+                     loading snoopy's agent into it (it stays loaded,
+                     idle, after snoopy stops)
+  --java-agent DIR   the directory with the agent's jars (default: next to
+                     snoopy, or java/out in a source tree)
   --lib PATH         also attach to this library or program, e.g. one with
                      OpenSSL linked in statically (repeatable)
   --no-scan          only attach to system libraries and --lib, not to what
@@ -310,6 +315,27 @@ combined with `--hex` or `--pcap`, which show data as sent: there, HTTP/2's
 and HTTP/3's headers are compressed, and can't be masked reliably. It
 catches what's recognizable, not everything a program might consider
 secret, so read output before sharing it anyway.
+
+## Java
+
+Java programs whose TLS is native (Netty's tcnative, Conscrypt) are traced
+like any other program. Java's own TLS, SunJSSE, has no native library to
+attach to, so with `--java` snoopy loads a small agent into the JVM given
+with `--pid`, which reports what `SSLSocket` and `SSLEngine` read and wrote
+(through `java.net.http.HttpClient` too):
+
+```sh
+java/build.sh                              # builds the agent into java/out (needs JDK 21+)
+sudo ./snoopy --java --pid "$(pgrep -f my-service.jar)"
+```
+
+This is experimental: tested with HotSpot 21 and 25 on Linux, for JVMs on
+the host. The JVM needs attaching left on, which it is by default
+(`-XX:+DisableAttachMechanism` turns it off; snoopy checks before
+signalling it). The agent can't be unloaded: when snoopy stops, it stops
+capturing and stays in the JVM, idle, until it exits. `SSLEngine` calls
+have no socket, so they show no addresses, and `--host` and `--port` don't
+match them.
 
 ## Containers and Kubernetes
 

@@ -49,8 +49,6 @@ public final class Hooks {
             nonce = sessionNonce;
             maxCapture = max;
             enabled = true;
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> System.err.println(
-                    "snoopy agent: " + seq.get() + " frames, " + failed.get() + " not written")));
             // A frame with no payload says the transport is ready.
             emit(0, WRITE, SOCKET, null, 0, 0, 0, null, 0);
             return true;

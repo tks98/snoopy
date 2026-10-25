@@ -209,6 +209,13 @@ func (t *Tracer) RegisterJava(pid uint32, nonce uint64) error {
 	return nil
 }
 
+// JavaReady reports whether process pid's agent has written a frame for its
+// session: its first says it's ready.
+func (t *Tracer) JavaReady(pid uint32) bool {
+	var s snoopyJavaSession
+	return t.objs.JavaSessions.Lookup(pid, &s) == nil && s.Fd >= 0
+}
+
 // UnregisterJava stops counting process pid's agent frames.
 func (t *Tracer) UnregisterJava(pid uint32) {
 	_ = t.objs.JavaSessions.Delete(pid)

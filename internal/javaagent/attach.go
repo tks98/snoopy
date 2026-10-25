@@ -98,7 +98,12 @@ func inspect(pid int) (*process, error) {
 // doesn't handle it (-Xrs) would die of.
 func (p *process) trigger(sock string, deadline time.Time) error {
 	if !p.catchesQuit {
-		return fmt.Errorf("process %d doesn't handle SIGQUIT, so it isn't a JVM that can be attached to (or runs with -Xrs)", p.pid)
+		return fmt.Errorf("process %d doesn't handle SIGQUIT, so it isn't a JVM that can be attached to", p.pid)
+	}
+	// A JVM that doesn't attach answers SIGQUIT with a thread dump on its
+	// stdout: not worth causing to find out.
+	if attachDisabled(p.pid) {
+		return fmt.Errorf("process %d runs with -XX:+DisableAttachMechanism, so no agent can be loaded into it; start it with -javaagent instead", p.pid)
 	}
 	name := fmt.Sprintf(".attach_pid%d", p.nsPID)
 	var file string
@@ -172,4 +177,41 @@ func request(sock string, deadline time.Time, cmd string, args ...string) (strin
 		return msg, fmt.Errorf("%s failed: %s", cmd, msg)
 	}
 	return msg, nil
+}
+
+func statOwner(fi os.FileInfo) (int, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
+}
+
+// attachDisabled reports whether a JVM was started with attaching turned
+// off, on its command line or in the variables the java launcher and the
+// JVM read options from.
+func attachDisabled(pid int) bool {
+	disabled := false
+	scan := func(file, prefix string) {
+		data, _ := os.ReadFile(fmt.Sprintf("/proc/%d/%s", pid, file))
+		for _, arg := range bytes.Split(data, []byte{0}) {
+			s, ok := strings.CutPrefix(string(arg), prefix)
+			if !ok {
+				continue
+			}
+			for _, opt := range strings.Fields(s) {
+				switch opt {
+				case "-XX:+DisableAttachMechanism":
+					disabled = true
+				case "-XX:-DisableAttachMechanism":
+					disabled = false
+				}
+			}
+		}
+	}
+	// JAVA_TOOL_OPTIONS and JDK_JAVA_OPTIONS come before the command line.
+	scan("environ", "JAVA_TOOL_OPTIONS=")
+	scan("environ", "JDK_JAVA_OPTIONS=")
+	scan("cmdline", "")
+	return disabled
 }

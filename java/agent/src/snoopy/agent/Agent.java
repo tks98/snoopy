@@ -40,35 +40,51 @@ public final class Agent {
         start(args, inst);
     }
 
+    // Whether the transformer is in: a JVM keeps the agent's classes when
+    // it's loaded again (by a later snoopy), and this once loaded.
+    static boolean installed;
+
+    // Options: nonce=N (the session's, unsigned), max=N (bytes captured per
+    // call), or disable, which stops capturing (the instrumentation stays,
+    // doing nothing, until the JVM exits).
     static synchronized void start(String args, Instrumentation inst) throws Exception {
         long nonce = 0;
         int max = 16384;
+        boolean disable = false;
         if (args != null) {
             for (String kv : args.split(",")) {
                 String[] p = kv.split("=", 2);
                 if (p.length == 2 && p[0].equals("nonce")) nonce = Long.parseUnsignedLong(p[1]);
                 if (p.length == 2 && p[0].equals("max")) max = Integer.parseInt(p[1]);
+                if (p[0].equals("disable")) disable = true;
             }
         }
         // Hooks is the bootstrap loader's; java.base has to read its module
         // to call it.
         Class<?> hooks = Class.forName("snoopy.hooks.Hooks", true, null);
-        Module base = Object.class.getModule();
-        inst.redefineModule(base, Set.of(hooks.getModule()), Map.of(), Map.of(), Set.of(), Map.of());
-
-        inst.addTransformer(new Transformer(), true);
-        List<Class<?>> loaded = new ArrayList<>();
-        for (Class<?> c : inst.getAllLoadedClasses()) {
-            if (TARGETS.contains(c.getName().replace('.', '/'))) {
-                loaded.add(c);
+        if (disable) {
+            hooks.getMethod("disable").invoke(null);
+            return;
+        }
+        if (!installed) {
+            Module base = Object.class.getModule();
+            inst.redefineModule(base, Set.of(hooks.getModule()), Map.of(), Map.of(), Set.of(), Map.of());
+            inst.addTransformer(new Transformer(), true);
+            List<Class<?>> loaded = new ArrayList<>();
+            for (Class<?> c : inst.getAllLoadedClasses()) {
+                if (TARGETS.contains(c.getName().replace('.', '/'))) {
+                    loaded.add(c);
+                }
             }
+            if (!loaded.isEmpty()) {
+                inst.retransformClasses(loaded.toArray(new Class<?>[0]));
+            }
+            installed = true;
         }
-        if (!loaded.isEmpty()) {
-            inst.retransformClasses(loaded.toArray(new Class<?>[0]));
+        if (!(boolean) hooks.getMethod("enable", long.class, int.class).invoke(null, nonce, max)) {
+            // The load succeeds, but no ready frame comes: snoopy says so.
+            System.err.println("snoopy agent: can't open /dev/null, so nothing is captured");
         }
-        boolean ok = (boolean) hooks.getMethod("enable", long.class, int.class).invoke(null, nonce, max);
-        System.err.println("snoopy agent: " + (ok ? "enabled" : "transport failed") + ", fd "
-                + hooks.getMethod("fd").invoke(null) + ", retransformed " + loaded.size() + " loaded classes");
     }
 
     static final class Transformer implements ClassFileTransformer {
