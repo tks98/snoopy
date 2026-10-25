@@ -66,7 +66,7 @@ func (b *Binary) x86Callers() map[uint64]int {
 	for i := 0; i+5 <= len(code); i++ {
 		if code[i] == 0xe8 {
 			t := b.textAddr + uint64(i) + 5 + uint64(int64(int32(binary.LittleEndian.Uint32(code[i+1:]))))
-			if b.inText(t) {
+			if b.inText(t) && (len(callers) < maxCallTargets || callers[t] > 0) {
 				callers[t]++
 			}
 		}
@@ -77,6 +77,9 @@ func (b *Binary) x86Callers() map[uint64]int {
 // x86Prologue reports whether the code at a opens with a frame pointer
 // prologue.
 func (b *Binary) x86Prologue(a uint64) bool {
+	if !b.inText(a) {
+		return false
+	}
 	code := b.code()[a-b.textAddr:]
 	return bytes.HasPrefix(code, prologue) || bytes.HasPrefix(code, prologueEndbr)
 }
@@ -84,8 +87,11 @@ func (b *Binary) x86Prologue(a uint64) bool {
 // insts decodes the instructions of fn, calling visit with each one and its
 // address, until visit returns false. Undecodable bytes are skipped.
 func (b *Binary) insts(fn *Func, visit func(ip uint64, inst x86asm.Inst) bool) {
-	text := b.code()
-	body := text[fn.Start-b.textAddr : min(fn.End, b.textAddr+uint64(len(text)))-b.textAddr]
+	end := min(fn.End, b.textEnd())
+	if fn.Start < b.textAddr || fn.Start >= end {
+		return
+	}
+	body := b.code()[fn.Start-b.textAddr : end-b.textAddr]
 	for off := 0; off < len(body); {
 		inst, err := decodeX86(body[off:])
 		if err != nil {
@@ -168,7 +174,9 @@ func (b *Binary) x86ReadsArgs(fn *Func, n int) bool {
 	var walk func(ip uint64, read, dead uint8) bool
 	walk = func(ip uint64, read, dead uint8) bool {
 		all := uint8(1)<<n - 1
-		for ; ip >= fn.Start && ip < fn.End && budget > 0; budget-- {
+		// Counted before branches are followed (see arm64ReadsArgs).
+		for ip >= fn.Start && ip < fn.End && budget > 0 {
+			budget--
 			inst, ok := b.decode(ip)
 			if !ok {
 				return false

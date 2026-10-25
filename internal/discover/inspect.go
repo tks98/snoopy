@@ -81,7 +81,16 @@ type GoFunc struct {
 }
 
 // Inspect reports which supported TLS implementations a file contains.
-func Inspect(path string) ([]Target, error) {
+//
+// A panic in the analysis, a bug in it or in debug/elf that a crafted file
+// sets off, is reported as a problem with the file: snoopy inspects the
+// files of every process it traces, and one mustn't take it down.
+func Inspect(path string) (targets []Target, err error) {
+	defer func() {
+		if perr := recovered(recover()); perr != nil {
+			targets, err = []Target{{Path: path, Problem: perr}}, nil
+		}
+	}()
 	f, file, err := openELF(path)
 	if err != nil {
 		return nil, err
@@ -92,7 +101,6 @@ func Inspect(path string) ([]Target, error) {
 		return nil, errWrongArc
 	}
 
-	var targets []Target
 	gi, err := inspectGo(file, f)
 	if errors.Is(err, errQUICGoAEADs) {
 		// Nothing to attach to, but worth saying.
@@ -112,7 +120,12 @@ func Inspect(path string) ([]Target, error) {
 		targets = append(targets, t)
 	}
 
-	if ri := inspectRustls(f); ri != nil {
+	// The analyses by signature are the most involved, and each is kept
+	// from losing the others' targets if it fails.
+	var ri *RustInfo
+	if err := guard(func() { ri = inspectRustls(f) }); err != nil {
+		targets = append(targets, Target{Path: path, Library: Rustls, Problem: err})
+	} else if ri != nil {
 		t := Target{Path: path, Library: Rustls, Rust: ri}
 		t.Note, t.Limits = ri.describe()
 		targets = append(targets, t)
@@ -124,12 +137,23 @@ func Inspect(path string) ([]Target, error) {
 			targets = append(targets, Target{Path: path, Library: rs.lib})
 		}
 	}
-	if offsets, err := findFreebl(f); err == nil {
-		targets = append(targets, Target{Path: path, Library: NSS, Offsets: offsets, Note: "freebl, for QUIC"})
+	var freebl map[string]uint64
+	var freeblErr error
+	if err := guard(func() { freebl, freeblErr = findFreebl(f) }); err != nil {
+		targets = append(targets, Target{Path: path, Library: NSS, Problem: err})
+	} else if freeblErr == nil {
+		targets = append(targets, Target{Path: path, Library: NSS, Offsets: freebl, Note: "freebl, for QUIC"})
 	}
 	if !defined["SSL_read"] {
-		offsets, err := cachedFindBoringSSL(path, f)
+		var offsets map[string]uint64
+		var err error
+		if perr := guard(func() { offsets, err = cachedFindBoringSSL(path, f) }); perr != nil {
+			err = perr
+		}
+		var panicked *errPanic
 		switch {
+		case errors.As(err, &panicked):
+			targets = append(targets, Target{Path: path, Library: OpenSSL, Problem: err})
 		case err == nil:
 			t := Target{Path: path, Library: OpenSSL, Offsets: offsets, Note: "BoringSSL found by signature"}
 			if offsets["EVP_AEAD_CTX_seal"] == 0 && hasQUICStack(f) {
@@ -167,10 +191,10 @@ func definedFuncs(f *elf.File) map[string]bool {
 			}
 		}
 	}
-	if syms, err := f.DynamicSymbols(); err == nil {
+	if syms, err := dynamicSymbols(f); err == nil {
 		add(syms)
 	}
-	if syms, err := f.Symbols(); err == nil {
+	if syms, err := symbols(f); err == nil {
 		add(syms)
 	}
 	return out
@@ -252,9 +276,15 @@ func FindGoFunc(f *elf.File, name string) (GoFunc, error) {
 		return GoFunc{}, err
 	}
 
+	// The bounds come from the file's symbols or pclntab, which say
+	// anything in a crafted file.
+	if end <= start || end-start > maxGoFuncSize {
+		return GoFunc{}, fmt.Errorf("%s at %#x: implausible size %#x", name, start, end-start)
+	}
 	var text *elf.Section
 	for _, s := range f.Sections {
-		if s.Flags&elf.SHF_EXECINSTR != 0 && s.Addr <= start && end <= s.Addr+s.Size {
+		if s.Flags&elf.SHF_EXECINSTR != 0 && s.Type == elf.SHT_PROGBITS && s.ReaderAt != nil &&
+			s.Addr <= start && end-s.Addr <= s.Size {
 			text = s
 			break
 		}
@@ -293,7 +323,7 @@ func goFuncBounds(f *elf.File, name string) (start, end uint64, err error) {
 }
 
 func symtabBounds(f *elf.File, name string) (start, end uint64, err error) {
-	syms, err := f.Symbols()
+	syms, err := symbols(f)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -321,7 +351,7 @@ func pclntabBounds(f *elf.File, name string) (start, end uint64, err error) {
 	} else if ts, ok := moduledataTextStart(f, pcln.Addr, data); ok {
 		textStart = ts
 	}
-	table, err := gosym.NewTable(nil, gosym.NewLineTable(data, textStart))
+	table, err := goTable(data, textStart)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -330,6 +360,29 @@ func pclntabBounds(f *elf.File, name string) (start, end uint64, err error) {
 		return 0, 0, errNoFunc
 	}
 	return fn.Entry, fn.End, nil
+}
+
+// maxGoFuncs bounds the functions of a pclntab read, many more than the
+// largest Go programs have (Kubernetes' have about 100,000): gosym makes a
+// Func and a Sym of each, so a crafted pclntab claiming one every 16 bytes
+// would take gigabytes.
+const maxGoFuncs = 2 << 20
+
+// goTable reads a pclntab, if it has no more than maxGoFuncs functions.
+func goTable(pclntab []byte, textStart uint64) (*gosym.Table, error) {
+	// magic uint32; pad1, pad2, minLC, ptrSize uint8; nfunc int, in all
+	// versions since Go 1.2
+	if len(pclntab) < 16 || pclntab[7] != 4 && pclntab[7] != 8 {
+		return nil, errNoFunc
+	}
+	nfunc := binary.LittleEndian.Uint64(pclntab[8:])
+	if pclntab[7] == 4 {
+		nfunc = uint64(binary.LittleEndian.Uint32(pclntab[8:]))
+	}
+	if nfunc > maxGoFuncs {
+		return nil, fmt.Errorf("pclntab claims %d functions", nfunc)
+	}
+	return gosym.NewTable(nil, gosym.NewLineTable(pclntab, textStart))
 }
 
 // pclntabTextStart returns the address of runtime.text recorded in a Go
@@ -595,7 +648,7 @@ var (
 )
 
 func inspectRustls(f *elf.File) *RustInfo {
-	syms, err := f.Symbols()
+	syms, err := symbols(f)
 	if err != nil {
 		return nil
 	}
