@@ -30,17 +30,21 @@ type HAR struct {
 	entries []*harEntry
 	conns   map[harConnKey]*harConn
 	filter  *HTTPFilter
+	redact  bool
 }
 
 // maxHARBody bounds how much of a body a HAR entry keeps, and maxHAREntries
-// how many entries; later ones are counted, not kept.
+// how many entries; later ones are followed, to pair what follows, but not
+// kept.
 const (
 	maxHARBody    = 4 << 20
 	maxHAREntries = 100000
 	maxHARConns   = 4096
 )
 
+// harConnKey is a connection (see connKey).
 type harConnKey struct {
+	pid  uint32
 	tcp  uint64  // the TLS connection (connOf), for HTTP/1.x and HTTP/2
 	quic quicKey // for HTTP/3
 }
@@ -51,7 +55,7 @@ type harConnKey struct {
 type harConn struct {
 	queue   []*harEntry
 	current map[tracer.Direction]*harEntry
-	streams map[uint64]*harEntry
+	streams streams[*harEntry]
 }
 
 type harEntry struct {
@@ -64,6 +68,7 @@ type harEntry struct {
 	container  string
 	server     netip.AddrPort
 	conn       string
+	kept       bool // in HAR.entries
 }
 
 type harMessage struct {
@@ -83,11 +88,13 @@ type harMessage struct {
 
 // NewHAR returns a printer that writes a HAR log to w when it's closed.
 // version is snoopy's, for the log's creator. Of opts, only Redact and
-// Filter apply, the filter to whole entries.
+// Filter apply, both to whole entries: secrets are masked in whole bodies,
+// however they were split across calls.
 func NewHAR(w io.Writer, version string, opts Options) *HAR {
-	filter := opts.Filter
-	opts.Warn, opts.Filter = nil, nil // the filter applies to whole entries
-	return &HAR{w: w, dec: newDecoders(opts), version: version, conns: map[harConnKey]*harConn{}, filter: filter}
+	h := &HAR{w: w, version: version, conns: map[harConnKey]*harConn{}, filter: opts.Filter, redact: opts.Redact}
+	opts.Warn, opts.Filter, opts.Redact = nil, nil, false
+	h.dec = newDecoders(opts)
+	return h
 }
 
 func (h *HAR) Print(ev *tracer.Event) error {
@@ -95,16 +102,13 @@ func (h *HAR) Print(ev *tracer.Event) error {
 	if dc.notice {
 		return nil
 	}
-	key := harConnKey{tcp: connOf(ev)}
-	if dc.isQUIC {
-		key = harConnKey{quic: dc.quicConn}
-	}
+	key := connKey(ev, dc)
 	c := h.conns[key]
 	if c == nil {
 		if len(h.conns) >= maxHARConns {
 			clear(h.conns) // what's open on them stays as it is in its entries
 		}
-		c = &harConn{current: map[tracer.Direction]*harEntry{}, streams: map[uint64]*harEntry{}}
+		c = &harConn{current: map[tracer.Direction]*harEntry{}}
 		h.conns[key] = c
 	}
 	dir := ev.Function.Direction()
@@ -134,10 +138,16 @@ func (h *HAR) Print(ev *tracer.Event) error {
 				h.http1Message(c, ev, dir, s.msg)
 			case s.inBody || s.body.Encoding != "":
 				if e := c.current[dir]; e != nil {
-					e.side(dir).add(s.raw, s.body)
+					e.add(dir, s.raw, s.body)
 					e.end = ev.Time
 				}
 			}
+		}
+	}
+	// A response's end ends its exchange.
+	for _, end := range streamEnds(dc) {
+		if e := c.streams.get(end.id); e != nil && (end.reset || dir != e.reqDir) {
+			c.streams.finish(end.id)
 		}
 	}
 	return nil
@@ -158,8 +168,17 @@ func (h *HAR) newEntry(ev *tracer.Event, version string, reqDir tracer.Direction
 	}
 	if len(h.entries) < maxHAREntries {
 		h.entries = append(h.entries, e)
+		e.kept = true
 	}
 	return e
+}
+
+// add adds bytes of a message's body, sent in direction dir, if the entry
+// is kept.
+func (e *harEntry) add(dir tracer.Direction, raw []byte, part bodyPart) {
+	if e.kept {
+		e.side(dir).add(raw, part)
+	}
 }
 
 // side returns the message of the exchange that bytes sent in direction
@@ -173,18 +192,15 @@ func (e *harEntry) side(dir tracer.Direction) *harMessage {
 
 func (h *HAR) http1Message(c *harConn, ev *tracer.Event, dir tracer.Direction, m *httpMessage) {
 	if strings.HasPrefix(m.startLine, "HTTP/") { // a response
-		var e *harEntry
-		for len(c.queue) > 0 && e == nil {
-			e, c.queue = c.queue[0], c.queue[1:]
-		}
 		version, status, _ := strings.Cut(m.startLine, " ")
 		code, reason, _ := strings.Cut(status, " ")
 		n, _ := strconv.Atoi(code)
 		if n >= 100 && n < 200 && n != 101 {
-			if e != nil { // an interim response; the final one is still to come
-				c.queue = append([]*harEntry{e}, c.queue...)
-			}
-			return
+			return // an interim response; the final one is still to come
+		}
+		var e *harEntry
+		if len(c.queue) > 0 {
+			e, c.queue = c.queue[0], c.queue[1:]
 		}
 		if e == nil {
 			e = h.newEntry(ev, version, opposite(dir))
@@ -204,6 +220,9 @@ func (h *HAR) http1Message(c *harConn, ev *tracer.Event, dir tracer.Direction, m
 		}
 	}
 	c.queue = append(c.queue, e)
+	if len(c.queue) > maxQueued {
+		c.queue = c.queue[1:]
+	}
 	c.current[dir] = e
 }
 
@@ -225,13 +244,13 @@ func (h *HAR) headers(c *harConn, ev *tracer.Event, dir tracer.Direction, stream
 		}
 		headers = append(headers, [2]string{f.Name, f.Value})
 	}
-	e := c.streams[stream]
+	e := c.streams.get(stream)
 	switch {
 	case method != "":
 		e = h.newEntry(ev, version, dir)
 		e.req = harMessage{seen: true, method: method, target: path, authority: authority, scheme: cmpOr(scheme, "https"),
 			version: version, headers: headers}
-		c.streams[stream] = e
+		c.streams.set(stream, e)
 	case status != "":
 		n, _ := strconv.Atoi(status)
 		if n >= 100 && n < 200 && n != 101 {
@@ -239,7 +258,7 @@ func (h *HAR) headers(c *harConn, ev *tracer.Event, dir tracer.Direction, stream
 		}
 		if e == nil {
 			e = h.newEntry(ev, version, opposite(dir))
-			c.streams[stream] = e
+			c.streams.set(stream, e)
 		}
 		e.resp = harMessage{seen: true, status: n, version: version, headers: headers}
 		e.end = ev.Time
@@ -251,11 +270,11 @@ func (h *HAR) headers(c *harConn, ev *tracer.Event, dir tracer.Direction, stream
 }
 
 func (h *HAR) data(c *harConn, ev *tracer.Event, dir tracer.Direction, stream uint64, data []byte, part bodyPart) {
-	e := c.streams[stream]
+	e := c.streams.get(stream)
 	if e == nil {
 		return
 	}
-	e.side(dir).add(data, part)
+	e.add(dir, data, part)
 	e.end = ev.Time
 }
 
@@ -272,6 +291,18 @@ func (m *harMessage) add(raw []byte, part bodyPart) {
 		m.truncated = true
 	}
 	m.body = append(m.body, piece...)
+}
+
+// redacted returns a copy of the message with secrets masked, in its whole
+// body.
+func (m harMessage) redacted() *harMessage {
+	m.target = redactTarget(m.target)
+	headers := make([][2]string, len(m.headers))
+	for i, hd := range m.headers {
+		headers[i] = [2]string{hd[0], redactHeader(hd[0], hd[1])}
+	}
+	m.headers, m.body = headers, redactText(m.body)
+	return &m
 }
 
 func opposite(d tracer.Direction) tracer.Direction {
@@ -365,6 +396,9 @@ func (h *HAR) Close() error {
 		req, resp := &e.req, &e.resp
 		if h.filter != nil && !h.filter.match(&exchange{method: req.method, path: req.target, status: resp.status}) {
 			continue
+		}
+		if h.redact {
+			req, resp = req.redacted(), resp.redacted()
 		}
 		u := url.URL{Scheme: cmpOr(req.scheme, "https"), Host: req.authority}
 		if u.Host == "" && e.server.IsValid() {

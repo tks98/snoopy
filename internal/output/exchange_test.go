@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/tks98/snoopy/v2/internal/tracer"
 )
@@ -114,5 +115,90 @@ func TestHTTPFilterHAR(t *testing.T) {
 	l := readHAR(t, out.Bytes())
 	if len(l.Log.Entries) != 1 || !strings.HasSuffix(l.Log.Entries[0].Request.URL, "/b") {
 		t.Errorf("entries:\n%s", out.String())
+	}
+}
+
+// Two processes whose connection handles have the same value (Go's are heap
+// addresses, the Java agent numbers connections from 1) have exchanges of
+// their own.
+func TestHTTPFilterProcesses(t *testing.T) {
+	a := event(tracer.FuncGoWrite, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
+	a.PID = 100
+	b := event(tracer.FuncGoWrite, "POST /b HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+	b.PID = 200
+	bResp := event(tracer.FuncGoRead, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+	bResp.PID = 200
+	evs := []*tracer.Event{a, b, bResp}
+
+	d := newDecoders(Options{Filter: &HTTPFilter{Methods: []string{"POST"}}})
+	var shown []int
+	for i, ev := range evs {
+		if !d.decode(ev).filteredOut {
+			shown = append(shown, i)
+		}
+	}
+	if !equalInts(shown, []int{1, 2}) {
+		t.Errorf("--method POST: shown %v, want [1 2]", shown)
+	}
+	d = newDecoders(Options{Filter: &HTTPFilter{Status: []StatusRange{{500, 599}}}})
+	for i, ev := range evs {
+		if dc := d.decode(ev); !dc.filteredOut && (i != 2 || dc.answers != "for POST /b") {
+			t.Errorf("--status 5xx: event %d shown, %q", i, dc.answers)
+		}
+	}
+
+	var out bytes.Buffer
+	h := NewHAR(&out, "test", Options{})
+	for _, ev := range evs {
+		h.Print(ev)
+	}
+	h.Close()
+	l := readHAR(t, out.Bytes())
+	if len(l.Log.Entries) != 2 || l.Log.Entries[0].Response.Status != 0 || l.Log.Entries[1].Response.Status != 500 {
+		t.Errorf("HAR:\n%s", out.String())
+	}
+}
+
+// What's kept of a connection's streams is bounded: finished ones are let
+// go, and open ones beyond maxConnStreams.
+func TestExchangeStreamsBounded(t *testing.T) {
+	ex := newExchangeTracker()
+	req := &tracer.Event{Function: tracer.FuncSSLWrite, ConnID: 1}
+	resp := &tracer.Event{Function: tracer.FuncSSLRead, ConnID: 1}
+	fields := func(kv ...string) (out []hpack.HeaderField) {
+		for i := 0; i < len(kv); i += 2 {
+			out = append(out, hpack.HeaderField{Name: kv[i], Value: kv[i+1]})
+		}
+		return out
+	}
+	conn := func() *exConn { return ex.conns[harConnKey{tcp: 1}] }
+	for i := uint32(1); i < 20000; i += 2 {
+		ex.touched(req, decoded{isHTTP2: true, http2: []http2Frame{{Type: "HEADERS", Stream: i, Flags: []string{"END_STREAM"},
+			Headers: fields(":method", "GET", ":path", "/x")}}})
+		ex.touched(resp, decoded{isHTTP2: true, http2: []http2Frame{{Type: "HEADERS", Stream: i,
+			Headers: fields(":status", "200")}}})
+		// The response's last DATA, in two calls.
+		ex.touched(resp, decoded{isHTTP2: true, http2: []http2Frame{{Type: "DATA", Stream: i, Flags: []string{"END_STREAM"}}}})
+		if got := ex.touched(resp, decoded{isHTTP2: true, http2: []http2Frame{{Type: "DATA", Stream: i, Continued: true}}}); len(got) != 1 {
+			t.Fatalf("stream %d: the rest of its DATA wasn't followed", i)
+		}
+	}
+	if n := len(conn().streams.m); n > keepFinished {
+		t.Errorf("%d finished streams kept", n)
+	}
+	// Streams that never finish.
+	for i := uint32(1 << 20); i < 1<<20+3*maxConnStreams; i += 2 {
+		ex.touched(req, decoded{isHTTP2: true, http2: []http2Frame{{Type: "HEADERS", Stream: i,
+			Headers: fields(":method", "GET", ":path", "/x")}}})
+	}
+	if n := len(conn().streams.m); n > maxConnStreams {
+		t.Errorf("%d open streams kept", n)
+	}
+	// HTTP/1.x requests that aren't answered.
+	for i := 0; i < 3*maxQueued; i++ {
+		ex.touched(req, decoded{http1: []http1Segment{{msg: &httpMessage{startLine: "GET / HTTP/1.1"}}}})
+	}
+	if n := len(conn().queue); n > maxQueued {
+		t.Errorf("%d requests queued", n)
 	}
 }
