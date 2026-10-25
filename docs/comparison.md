@@ -37,9 +37,11 @@ snoopy is or isn't the better choice. Corrections are welcome.
 - **For a cluster-wide view with a UI**, metrics, and history, use Pixie or
   Kubeshark. snoopy is a command line tool for looking at one machine at a
   time.
-- **Java** isn't covered by snoopy, nor by the other eBPF tools here: its
-  TLS is written in Java and JIT-compiled, not a native library. Use
-  mitmproxy, or a Java agent.
+- **Java**'s own TLS is written in Java and JIT-compiled, not a native
+  library, so the other eBPF tools here don't see it. snoopy does with
+  `--java`, by loading a small agent of its own into the JVM, which is
+  code in your process rather than only probes; if that's not acceptable,
+  use mitmproxy. Java with netty-tcnative or Conscrypt is traced as is.
 
 ## Where snoopy is different
 

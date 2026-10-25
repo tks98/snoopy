@@ -3,6 +3,10 @@
 Reviewed against `main` at `0434edb99cca338b30ffa7b45a3243168abd6063` on
 2026-10-24. This is a proposed implementation, not a claim of Java support.
 
+Status, 2026-10-25: step 0 is in #54; steps 1 to 6 in #55, with
+[java-spike.md](java-spike.md) for step 1's results. What's supported is in
+[usage.md](usage.md#java).
+
 ## Recommendation
 
 First test agentless capture of native Java TLS providers (Netty tcnative

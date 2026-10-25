@@ -80,7 +80,7 @@ HTTPS:
 | Deno | rustls, in a stripped binary | no: rustls is found by its symbols |
 | Java with Netty's netty-tcnative (gRPC-Java and Netty, when it's there) | BoringSSL in a JNI library, extracted to a temporary file | yes, found when the JVM loads it, however late |
 | Java with Conscrypt | BoringSSL in a JNI library, stripped | yes, found by signature |
-| Java (OpenJDK), otherwise | JSSE, written in Java | no ([plan-java.md](plan-java.md)) |
+| Java (OpenJDK), otherwise | JSSE, written in Java | with `--java`, through snoopy's agent ([below](#java-and-jsse)) |
 | Erlang, Elixir | OTP's `ssl`, written in Erlang | no |
 
 A TLS library a process loads after it started, such as the ones a JVM
@@ -91,7 +91,7 @@ thread that loaded it is held until snoopy has attached to it, so its first
 connection isn't missed.
 
 Not supported: rustls under tokio with providers other than aws-lc-rs and
-ring, Java's own JSSE, Erlang's `ssl`, stripped TLS
+ring, Erlang's `ssl`, stripped TLS
 libraries other than
 BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn, ngtcp2 and quic-go (quiche, for
 example), programs that use OpenSSL only through its BIO layer (e.g.
@@ -185,11 +185,51 @@ their socket. An encryption context's memory is often reused for the next
 connection, so what's known about a context's socket is only trusted while
 its fd still refers to the same socket.
 
+## Java and JSSE
+
+Java's own TLS, SunJSSE, is Java code that the JIT compiles: there's no
+library to put uprobes on, and its functions move as the JIT pleases. So
+with `--java`, snoopy has the JVM tell it instead, through a small
+`java.lang.instrument` agent (`java/agent`):
+
+1. snoopy checks the process maps `libjvm.so`, copies the agent's two jars
+   into its `/tmp` (so a JVM in a container can read them), and registers a
+   session for it with the BPF program: its PID and a random nonce.
+2. It loads the agent with HotSpot's attach mechanism, in Go
+   (`internal/javaagent`), with no JDK needed where snoopy runs: an attach
+   file, a SIGQUIT, and a request over the JVM's attach socket. For a JVM
+   that isn't root's, the socket is connected to as the JVM's user, on a
+   thread of its own, since the JVM checks who connects, and in a user
+   namespace root is no one.
+3. The agent instruments, with ASM, the methods where application data
+   goes in and out of SunJSSE: `SSLSocketImpl`'s `AppInputStream.read` and
+   `AppOutputStream.write`, and `SSLEngineImpl`'s `wrap` and `unwrap` (the
+   six-argument ones, which the others call). On each call's return, the
+   added code copies what was read or written (for the engine, what `wrap`
+   consumed from its sources and `unwrap` produced into its destinations,
+   from their positions at entry, without moving them) into a frame, a
+   header and the bytes, and writes it to `/dev/null`.
+4. The BPF program's `sys_enter` sees each write of a registered process:
+   one that starts with the frame's magic and the session's nonce, and with
+   BTF, is to the null device, is turned into events like a library call's,
+   and kept out of the socket tracking. User space doesn't tell them apart
+   from any other library's from there.
+
+`SSLSocket` events carry the socket's addresses, from the agent. `SSLEngine`
+isn't tied to a socket (it's what `java.net.http.HttpClient`, Netty without
+tcnative and most servers use), so its events have none.
+
+When snoopy stops, it tells the agent to stop capturing. The agent can't be
+unloaded: its hooks stay in the JVM, checking a flag and doing nothing else,
+until it exits, and a later snoopy turns them on again with a new nonce.
+
 ## The code
 
 The eBPF program is `bpf/snoopy.c`. It is compiled with `bpf2go` into the
 `internal/tracer/snoopy_*_bpfel.{o,go}` files, which are committed so that a
-plain `go build` works.
+plain `go build` works. The Java agent is in `java/`, built into two jars by
+`java/build.sh` (releases and the image ship them), and `internal/javaagent`
+loads it.
 
 Some of this depends on other programs' internals, which their new releases
 can change. [release-risks.md](release-risks.md) lists what's likely
