@@ -45,6 +45,7 @@ Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
                      or host name at either end
   --port PORT        only connections with this port at either end
+                     (calls whose peer isn't known are left out, counted)
 
 Output:
   --brief            one line per call, like tcpdump
@@ -296,6 +297,12 @@ POST /v1/charges]`, or `answers` in JSON). A request from before snoopy
 started has no method or path to match. With `--har`, whole entries are
 kept or left out; `--pcap` isn't filtered. The summary at the end says how
 many calls were left out.
+
+`--host` and `--port` need a call's peer address. Calls whose peer isn't
+known (SSLEngine's, with `--java`, and those whose socket couldn't be
+found, as on kernels without BTF) are left out: snoopy warns once and says
+how many when it stops. QUIC packets on a socket that isn't connected, like
+quinn's, get their connection's peer from its other packets.
 
 ## Sharing output
 

@@ -152,6 +152,7 @@ Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
                      or host name at either end
   --port PORT        only connections with this port at either end
+                     (calls whose peer isn't known are left out, counted)
 
 Output:
   --brief            one line per call, like tcpdump

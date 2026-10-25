@@ -2,7 +2,8 @@
 # Builds snoopy's Java agent into java/out: snoopy-agent.jar, which
 # the JVM loads, and snoopy-hooks.jar, which the agent's manifest puts on
 # the boot class path from the same directory. Needs a JDK 17 or later;
-# ASM is downloaded from Maven Central and checked against its SHA-1.
+# ASM is downloaded from Maven Central and checked against SHA-256 sums
+# pinned below.
 set -eu
 cd "$(dirname "$0")"
 ASM=9.11.1
