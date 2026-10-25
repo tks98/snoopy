@@ -806,6 +806,10 @@ func isTLSLibraryName(name string) bool {
 
 type fileID struct {
 	dev, ino uint64
+	// changed is a file's status change time: a file deleted while it's
+	// still mapped (as Java's libraries extracted to /tmp are) can have its
+	// inode reused for another one.
+	changed int64
 }
 
 func idOf(path string) (fileID, error) {
@@ -820,7 +824,7 @@ func idOf(path string) (fileID, error) {
 	if !ok {
 		return fileID{}, errors.New("no inode information")
 	}
-	return fileID{dev: uint64(st.Dev), ino: st.Ino}, nil
+	return fileID{dev: uint64(st.Dev), ino: st.Ino, changed: st.Ctim.Nano()}, nil
 }
 
 func joinNotes(a, b string) string {

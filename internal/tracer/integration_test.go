@@ -870,11 +870,9 @@ func startPerProcess(t *testing.T, comm string) (*Tracer, *eventLog) {
 		return err == nil && strings.HasPrefix(string(name), comm)
 	}
 	start := time.Now()
-	debugf = func(format string, args ...any) { t.Logf("%v "+format, append([]any{time.Since(start)}, args...)...) }
-	t.Cleanup(func() { debugf = func(string, ...any) {} })
 	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil, true), named, named, func(target discover.Target, funcs []string, err error) {
-		if target.Path != "" || err != nil {
-			debugf("attach %s %v %v", target.Path, funcs, err)
+		if len(funcs) > 0 || err != nil {
+			t.Logf("%v: attached %s: %v %v", time.Since(start), target.Path, funcs, err)
 		}
 	})
 	if err != nil {
