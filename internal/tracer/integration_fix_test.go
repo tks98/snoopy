@@ -314,7 +314,25 @@ func TestNodeAddresses(t *testing.T) {
 	node := renamedTool(t, "node", "fixnode")
 	for _, noBTF := range []bool{false, true} {
 		t.Run(fmt.Sprintf("without BTF %v", noBTF), func(t *testing.T) {
-			events := startTracer(t, Options{Comm: "fixnode", ignoreKernelBTF: noBTF}, systemTargets(t, discover.OpenSSL))
+			// The system's OpenSSL, for Ubuntu's node, which only this node's
+			// calls are let through (by its name); or the one built into node
+			// (official builds, as on GitHub's runners), which only this copy
+			// of node uses, and whose main thread calls itself MainThread, so
+			// that it's not told by name.
+			opts := Options{Comm: "fixnode", ignoreKernelBTF: noBTF}
+			targets := systemTargets(t, discover.OpenSSL)
+			if found, err := discover.Inspect(node); err == nil {
+				var own []discover.Target
+				for _, target := range found {
+					if target.Library == discover.OpenSSL && target.Problem == nil {
+						own = append(own, target)
+					}
+				}
+				if len(own) > 0 {
+					opts.Comm, targets = "", own
+				}
+			}
+			events := startTracer(t, opts, targets)
 			srv, _ := newServer(t)
 			// Then another connection, whose socket gets the descriptor
 			// numbers that came free.
