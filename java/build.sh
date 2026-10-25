@@ -7,17 +7,19 @@ set -eu
 cd "$(dirname "$0")"
 ASM=9.11.1
 mkdir -p lib out
-fetch() { # artifact sha1
+# SHA-256 sums pinned here (Maven Central's own are SHA-1), checked
+# against the SHA-1 sums it publishes when they were taken.
+fetch() { # artifact sha256
 	f=lib/$1-$ASM.jar
 	if [ ! -f "$f" ]; then
 		curl -sSfL -o "$f.tmp" "https://repo1.maven.org/maven2/org/ow2/asm/$1/$ASM/$1-$ASM.jar"
 		mv "$f.tmp" "$f"
 	fi
-	echo "$2  $f" | sha1sum -c --quiet
+	echo "$2  $f" | sha256sum -c --quiet
 }
-fetch asm edb29aa0c2da2918ce338fb7b218c21ea138dde2
-fetch asm-tree ad2b01f445d65aa84cb65900d1c848d121843986
-fetch asm-commons 3707c04c3f7197c3d1d8dbc728b791a58809a59e
+fetch asm ae4e6e10d59d0a1500317764b21881ad883f8550e33c66e6142f7032c6fb566c
+fetch asm-tree 2b15c3c1b288a9fad3bb2cd6d988ba9521554914ed1f2a2029141fa3f483154a
+fetch asm-commons 6a5095ec53726156a78b2cd2efd45bc4e877754eca7c234f61224a53d6bfa661
 cp=lib/asm-$ASM.jar:lib/asm-tree-$ASM.jar:lib/asm-commons-$ASM.jar
 
 rm -rf out/classes out/hooks out/agent && mkdir -p out/classes out/hooks out/agent

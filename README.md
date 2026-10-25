@@ -27,6 +27,10 @@ go install github.com/tks98/snoopy/v2@latest
 sudo install "$(go env GOPATH)/bin/snoopy" /usr/local/bin/
 ```
 
+Releases after 2.9.1 have attested build provenance:
+`gh attestation verify snoopy_*_linux_amd64.tar.gz --repo tks98/snoopy`
+checks an archive.
+
 Then run `sudo snoopy --brief` and make some requests from another terminal,
 here with curl over HTTP/1.1 and HTTP/2, and Chrome over HTTP/3:
 
@@ -86,8 +90,9 @@ supported.
 
 ## Requirements
 
-- Linux 5.10 or later, on x86_64 or arm64 (tested on 5.10, 5.15, 6.1, 6.6,
-  6.12 and current kernels).
+- Linux 5.10 or later, on x86_64 or arm64. CI runs the tests on its
+  runners' current kernels, and checks that the eBPF programs load under
+  5.10, 5.15, 6.1, 6.6 and 6.12 whenever they change.
 - Root, or `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE` and `CAP_SYS_PTRACE`
   (and `CAP_SYS_ADMIN` for libraries replaced while in use).
 - Kernel BTF (`/sys/kernel/btf/vmlinux`), which most distributions ship.

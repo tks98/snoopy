@@ -4,42 +4,63 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-  packages: write # the image, at ghcr.io/tks98/snoopy
+# Only the release job, below, may write.
+permissions: {}
 
 jobs:
   goreleaser:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write # the release
+      packages: write # the image, at ghcr.io/tks98/snoopy, and its attestation
+      id-token: write # to sign the attestations
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # For the Java agent's jars (java/build.sh, a GoReleaser hook).
-      - uses: actions/setup-java@v6
+      # For the Java agent's jars (java/build.sh, a GoReleaser hook). An
+      # exact JDK, so that the jars can be built again from the tag, byte
+      # for byte; release-check.yml uses the same.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
-          java-version: 21
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+          java-version: 21.0.13+9
+      # For GoReleaser's SBOMs.
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          syft-version: v1.55.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: goreleaser/goreleaser-action@v7
+      # Also attaches the krew manifest, as krew-snoopy.yaml, for
+      # krew-index, which it's submitted to by hand (docs/kubernetes.md).
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
-          version: "~> v2"
+          version: v2.19.0
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Attach the krew manifest
-        # For krew-index, which it's submitted to by hand (docs/kubernetes.md).
+      # Provenance for everything released: checksums.txt lists the
+      # archives, their SBOMs, the jars and the krew manifest. Checked with
+      # gh attestation verify <file> --repo tks98/snoopy.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt
+      - name: Find the image's digest
+        id: image
         run: |
-          cp dist/krew/snoopy.yaml dist/krew-snoopy.yaml
-          gh release upload "$GITHUB_REF_NAME" dist/krew-snoopy.yaml --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          digest=$(docker buildx imagetools inspect "ghcr.io/tks98/snoopy:${GITHUB_REF_NAME#v}" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/tks98/snoopy
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true

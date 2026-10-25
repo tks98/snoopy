@@ -136,8 +136,8 @@ thing it depends on ships.
   aws-lc. aws-lc-rs seals TLS 1.2 records with `seal_scatter`, not `seal`.
 
 - **Guarded by:** `TestRustls` and `TestRustlsAsync` (TLS 1.3 and 1.2), only
-  with `SNOOPY_TEST_RUSTLS=1`, and `TestRustlsSymbols` and
-  `TestAwsLCSymbols`.
+  with `SNOOPY_TEST_RUSTLS=1`, which CI runs weekly (`rust.yml`), and
+  `TestRustlsSymbols` and `TestAwsLCSymbols`.
 
 ### HTTP/3 over quinn
 
@@ -150,8 +150,8 @@ thing it depends on ships.
   the peer).
 - **How it shows:** responses show "peer" for the remote address, and
   connections sharing a socket may be decoded mixed together, quietly.
-- **Guarded by:** `TestQuinnHTTP3` (`SNOOPY_TEST_RUSTLS=1`), two
-  connections over one socket with each provider.
+- **Guarded by:** `TestQuinnHTTP3` (`SNOOPY_TEST_RUSTLS=1`, weekly in CI),
+  two connections over one socket with each provider.
 
 ### HTTP/3 over ngtcp2 (curl)
 
@@ -267,7 +267,8 @@ In order of how much each removes.
    Envoy (checked for one clear answer, having no matching symbols), and
    Firefox (x86-64 and arm64) with Mozilla's, and runs `TestBoringSSLBinaries`
    and `TestFreeblBinaries` on them; and it runs `TestCurlHTTP3` against
-   Fedora's latest curl on both architectures. A release that breaks one of
+   the latest curl of a pinned Fedora release (moved on by hand to each new
+   one) on both architectures. A release that breaks one of
    them shows as a failed run within a week. When a release's symbols
    aren't out yet, the job only checks that one answer is found, and warns.
 2. **Check `golang.org/x/arch` bumps before merging them.** Run those

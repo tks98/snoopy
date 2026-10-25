@@ -7,7 +7,8 @@
 //	sudo ./tracer.test -test.v
 //
 // Tests for clients that aren't installed (curl, python3, gnutls-cli, an NSS,
-// wolfSSL, Mbed TLS or s2n-tls toolchain) are skipped.
+// wolfSSL, Mbed TLS or s2n-tls toolchain) are skipped, or fail with
+// SNOOPY_TEST_STRICT=1, as in CI, where a skip would hide a broken setup.
 package tracer
 
 import (
@@ -15,7 +16,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -55,9 +56,21 @@ func requireTool(t *testing.T, name string) string {
 	t.Helper()
 	path, err := exec.LookPath(name)
 	if err != nil {
-		t.Skipf("%s not installed", name)
+		missing(t, "%s not installed", name)
 	}
 	return path
+}
+
+// missing skips the test for want of something this machine doesn't have,
+// a client, a library or a download, or with SNOOPY_TEST_STRICT=1 (CI)
+// fails it: there everything is meant to be installed, and a skip would
+// look like a pass.
+func missing(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("SNOOPY_TEST_STRICT") == "1" {
+		t.Fatalf(format+" (and SNOOPY_TEST_STRICT=1)", args...)
+	}
+	t.Skipf(format, args...)
 }
 
 // eventLog collects every event, so tests can wait for events in any order:
@@ -89,7 +102,6 @@ func (l *eventLog) find(match func(*Event) bool) *Event {
 	return nil
 }
 
-// dump logs every event received so far, to show what arrived instead.
 // count returns how many of the events so far match.
 func (l *eventLog) count(match func(*Event) bool) int {
 	l.mu.Lock()
@@ -103,18 +115,24 @@ func (l *eventLog) count(match func(*Event) bool) int {
 	return n
 }
 
+// dump logs every event received so far, to show what arrived instead:
+// what each is, but not what it carried, since a test's filter can let
+// through other programs' traffic, and test logs are public in CI
+// (AGENTS.md). SNOOPY_TEST_DUMP_DATA=1 adds each event's first 64 bytes,
+// for debugging on a machine of your own.
 func (l *eventLog) dump(t *testing.T) {
 	t.Helper()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	withData := os.Getenv("SNOOPY_TEST_DUMP_DATA") == "1"
 	t.Logf("%d events received:", len(l.events))
 	for _, ev := range l.events {
-		data := ev.Data
-		if len(data) > 64 {
-			data = data[:64]
+		var data string
+		if withData {
+			data = fmt.Sprintf(" %q", ev.Data[:min(len(ev.Data), 64)])
 		}
-		t.Logf("  %v pid=%d tid=%d conn=%#x fd=%d %s > %s size=%d incomplete=%v header=%x %q",
-			ev.Function, ev.PID, ev.TID, ev.ConnID, ev.FD, ev.Local, ev.Remote, ev.Size, ev.Incomplete, ev.QUICHeader, data)
+		t.Logf("  %v pid=%d tid=%d comm=%q conn=%#x fd=%d %s > %s size=%d incomplete=%v header=%x%s",
+			ev.Function, ev.PID, ev.TID, ev.Comm, ev.ConnID, ev.FD, ev.Local, ev.Remote, ev.Size, ev.Incomplete, ev.QUICHeader, data)
 	}
 }
 
@@ -135,7 +153,7 @@ func startTracer(t *testing.T, opts Options, targets []discover.Target) *eventLo
 	}
 	if attached == 0 {
 		tr.Close()
-		t.Skip("no matching TLS library to attach to")
+		missing(t, "no matching TLS library to attach to")
 	}
 	if err := tr.AttachSyscalls(); err != nil {
 		t.Fatal(err)
@@ -377,7 +395,9 @@ while s.recv(4096): pass
 func TestGnuTLS(t *testing.T) {
 	requireRoot(t)
 	gnutls := requireTool(t, "gnutls-cli")
-	events := startTracer(t, Options{}, systemTargets(t, discover.GnuTLS))
+	// Only gnutls-cli: without a filter, every program using the system's
+	// GnuTLS would be traced, and on a timeout dump would list them.
+	events := startTracer(t, Options{Comm: "gnutls-cli"}, systemTargets(t, discover.GnuTLS))
 	_, port := newServer(t)
 
 	cmd := exec.Command(gnutls, "--insecure", "--logfile=/dev/null", "-p", port, "127.0.0.1")
@@ -399,7 +419,7 @@ func TestNSS(t *testing.T) {
 	pkgConfig := requireTool(t, "pkg-config")
 	flags, err := exec.Command(pkgConfig, "--cflags", "--libs", "nss").Output()
 	if err != nil {
-		t.Skip("NSS development files not installed")
+		missing(t, "NSS development files not installed")
 	}
 	client := filepath.Join(t.TempDir(), "nssclient")
 	args := append([]string{"testdata/nssclient.c", "-o", client}, strings.Fields(string(flags))...)
@@ -429,8 +449,9 @@ func TestMbedTLS(t *testing.T) {
 		"-lmbedtls", "-lmbedx509", "-lmbedcrypto")
 }
 
-// s2n-tls isn't packaged by most distributions; the test runs if it's
-// installed, e.g. built from source into /usr/local.
+// s2n-tls isn't packaged by most distributions (Debian and Ubuntu included);
+// the test runs if it's installed, e.g. built from source into /usr/local,
+// as CI does.
 func TestS2N(t *testing.T) {
 	testCClient(t, discover.S2N, "s2nclient", FuncS2NSend, FuncS2NRecv, "-ls2n")
 }
@@ -447,7 +468,7 @@ func testCClient(t *testing.T, lib discover.Library, name string, write, read Fu
 	args := append([]string{"testdata/" + name + ".c", "-o", client}, ldflags...)
 	if out, err := exec.Command(cc, args...).CombinedOutput(); err != nil {
 		if bytes.Contains(out, []byte("No such file or directory")) || bytes.Contains(out, []byte("cannot find -l")) {
-			t.Skipf("%s development files not installed", lib)
+			missing(t, "%s development files not installed", lib)
 		}
 		t.Fatalf("build %s: %v: %s", name, err, out)
 	}
@@ -750,7 +771,7 @@ func TestNewProcess(t *testing.T) {
 		}
 	}
 	if libssl == "" {
-		t.Skip("no system libssl")
+		missing(t, "no system libssl")
 	}
 	libDir := t.TempDir()
 	lib, err := os.ReadFile(libssl)
@@ -824,7 +845,7 @@ func TestHoldNewProcess(t *testing.T) {
 		}
 	}
 	if libssl == "" {
-		t.Skip("no system libssl")
+		missing(t, "no system libssl")
 	}
 	libDir := t.TempDir()
 	lib, err := os.ReadFile(libssl)
@@ -977,26 +998,32 @@ os.waitpid(pid, 0)
 }
 
 // javaLibs are the jars the Java tests use, from Maven Central: Netty with
-// netty-tcnative's BoringSSL, and Conscrypt.
-var javaLibs = []string{
-	"io/netty/netty-common/4.1.139.Final/netty-common-4.1.139.Final.jar",
-	"io/netty/netty-buffer/4.1.139.Final/netty-buffer-4.1.139.Final.jar",
-	"io/netty/netty-transport/4.1.139.Final/netty-transport-4.1.139.Final.jar",
-	"io/netty/netty-resolver/4.1.139.Final/netty-resolver-4.1.139.Final.jar",
-	"io/netty/netty-codec/4.1.139.Final/netty-codec-4.1.139.Final.jar",
-	"io/netty/netty-handler/4.1.139.Final/netty-handler-4.1.139.Final.jar",
-	"io/netty/netty-transport-native-unix-common/4.1.139.Final/netty-transport-native-unix-common-4.1.139.Final.jar",
-	"io/netty/netty-tcnative-classes/2.0.84.Final/netty-tcnative-classes-2.0.84.Final.jar",
-	"io/netty/netty-tcnative-boringssl-static/2.0.84.Final/netty-tcnative-boringssl-static-2.0.84.Final-linux-{arch}.jar",
-	"org/conscrypt/conscrypt-openjdk-uber/2.8.0/conscrypt-openjdk-uber-2.8.0.jar",
+// netty-tcnative's BoringSSL, and Conscrypt, with their SHA-256 sums.
+// Maven Central publishes SHA-1 sums only; these were checked against them
+// when taken.
+var javaLibs = []struct{ path, sha256 string }{
+	{"io/netty/netty-common/4.1.139.Final/netty-common-4.1.139.Final.jar", "50372d86e27b4b1cf0810d75eb534795966a199049a1e85a0c41bbd2bb97f519"},
+	{"io/netty/netty-buffer/4.1.139.Final/netty-buffer-4.1.139.Final.jar", "48d805b74e56dc5f92b1f288858185abc86db16d293e8da183542df6243427f2"},
+	{"io/netty/netty-transport/4.1.139.Final/netty-transport-4.1.139.Final.jar", "be7bff8b6274e7fae12bbad3c565777539e9b069517e0b3acc06d9ac2cd6ec05"},
+	{"io/netty/netty-resolver/4.1.139.Final/netty-resolver-4.1.139.Final.jar", "562a5388c88325b7d6ed05e8168736871ce0e64ab01e0ce52ea7710760b9b457"},
+	{"io/netty/netty-codec/4.1.139.Final/netty-codec-4.1.139.Final.jar", "ad43f07219dfb757a87b9c2b4765002be478c5401971379954e3d182f285fe6b"},
+	{"io/netty/netty-handler/4.1.139.Final/netty-handler-4.1.139.Final.jar", "ff85f00781b956d618b20f33da076c839a5e43e0084108b07bab0c19737168ec"},
+	{"io/netty/netty-transport-native-unix-common/4.1.139.Final/netty-transport-native-unix-common-4.1.139.Final.jar", "8e660ac8a485fc8d8b47d87d04ea33d19902dc6fc5a113e9353b762188b3f333"},
+	{"io/netty/netty-tcnative-classes/2.0.84.Final/netty-tcnative-classes-2.0.84.Final.jar", "7a4437abf98b0cec053af4443fe321177d2cfccfec7bcad4e7d8b75571bbec4d"},
+	{"io/netty/netty-tcnative-boringssl-static/2.0.84.Final/netty-tcnative-boringssl-static-2.0.84.Final-linux-" + map[string]string{
+		"amd64": "x86_64",
+		"arm64": "aarch_64",
+	}[runtime.GOARCH] + ".jar", map[string]string{
+		"amd64": "19d7cd7c3081c80ebe417af870e2fe62be1ca5969683d9cd402bb3ebc754d257",
+		"arm64": "610f92fa30ee2a4f5022ddb005728b6914b53101de195a99266f526ce1aeda1e",
+	}[runtime.GOARCH]},
+	{"org/conscrypt/conscrypt-openjdk-uber/2.8.0/conscrypt-openjdk-uber-2.8.0.jar", "4022024808c54211275c7d58ed81e4e13ed8ba170351588cba19f6b947478668"},
 }
 
 // javaClasspath downloads javaLibs into testdata/java/lib, once, checked
-// against the SHA-1 sums Maven Central publishes, and returns their
-// classpath.
+// against their SHA-256 sums, and returns their classpath.
 func javaClasspath(t *testing.T) string {
 	t.Helper()
-	arch := map[string]string{"amd64": "x86_64", "arm64": "aarch_64"}[runtime.GOARCH]
 	dir, err := filepath.Abs("testdata/java/lib")
 	if err != nil {
 		t.Fatal(err)
@@ -1007,7 +1034,7 @@ func javaClasspath(t *testing.T) string {
 	get := func(url string) []byte {
 		resp, err := http.Get(url)
 		if err != nil {
-			t.Skipf("download %s: %v", url, err)
+			missing(t, "download %s: %v", url, err)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
@@ -1021,16 +1048,19 @@ func javaClasspath(t *testing.T) string {
 	}
 	var cp []string
 	for _, lib := range javaLibs {
-		lib = strings.ReplaceAll(lib, "{arch}", arch)
-		path := filepath.Join(dir, filepath.Base(lib))
+		path := filepath.Join(dir, filepath.Base(lib.path))
 		cp = append(cp, path)
-		if _, err := os.Stat(path); err == nil {
-			continue
+		// Checked again when already there: an older test downloaded them
+		// checked against SHA-1 only.
+		if jar, err := os.ReadFile(path); err == nil {
+			if sum := sha256.Sum256(jar); hex.EncodeToString(sum[:]) == lib.sha256 {
+				continue
+			}
 		}
-		url := "https://repo1.maven.org/maven2/" + lib
-		jar, want := get(url), strings.Fields(string(get(url+".sha1")))
-		if sum := sha1.Sum(jar); len(want) == 0 || hex.EncodeToString(sum[:]) != want[0] {
-			t.Fatalf("%s: SHA-1 %x, Maven Central says %v", url, sum, want)
+		url := "https://repo1.maven.org/maven2/" + lib.path
+		jar := get(url)
+		if sum := sha256.Sum256(jar); hex.EncodeToString(sum[:]) != lib.sha256 {
+			t.Fatalf("%s: SHA-256 %x, want %s", url, sum, lib.sha256)
 		}
 		if err := os.WriteFile(path, jar, 0o644); err != nil {
 			t.Fatal(err)
@@ -1842,10 +1872,20 @@ func TestJSSE(t *testing.T) {
 			want = append(want, "engine-buffers-"+kinds[i]+"-into-"+dsts[i]+"-"+strings.Repeat("q", n)...)
 		}
 		pid := p.pid()
-		waitFor(t, events, "the last unwrap", func(ev *Event) bool {
-			return ev.PID == pid && ev.Function == FuncJSSEEngineUnwrap && bytes.HasSuffix(ev.Data, []byte("qqq"))
-		})
-		time.Sleep(500 * time.Millisecond)
+		// Events from other CPUs can come after the last unwrap's, so wait
+		// for all of both streams rather than a while.
+		total := func(fn Function) int {
+			n := 0
+			for _, data := range stream(events, func(ev *Event) bool { return ev.PID == pid && ev.Function == fn }) {
+				n += len(data)
+			}
+			return n
+		}
+		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			if total(FuncJSSEEngineWrap) >= len(want) && total(FuncJSSEEngineUnwrap) >= len(want) {
+				break
+			}
+		}
 		for _, fn := range []Function{FuncJSSEEngineWrap, FuncJSSEEngineUnwrap} {
 			got := stream(events, func(ev *Event) bool { return ev.PID == pid && ev.Function == fn })
 			if len(got) != 1 {
@@ -1946,7 +1986,12 @@ func TestJSSE(t *testing.T) {
 					// The JDK has to be one other users can run (one under
 					// /root isn't).
 					probe := append(slices.Clone(c.launcher), "-version")
+					// In CI (SNOOPY_TEST_JAVA=1) it must: there a skip
+					// here was a missing /etc/subuid entry for unshare.
 					if out, err := exec.Command(probe[0], probe[1:]...).CombinedOutput(); err != nil {
+						if os.Getenv("SNOOPY_TEST_JAVA") == "1" {
+							t.Fatalf("%s can't run this JDK as nobody: %v: %s", c.name, err, out)
+						}
 						t.Skipf("%s can't run this JDK as nobody: %v: %s", c.name, err, out)
 					}
 				}
@@ -1981,7 +2026,16 @@ func TestJSSE(t *testing.T) {
 		p.exec(t)
 		load(t, p, options(nonce))
 		load(t, p, "disable")
+		// The agent was running, its first frame seen, before it stopped.
+		for deadline := time.Now().Add(10 * time.Second); !tr.JavaReady(p.pid()); time.Sleep(50 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("the agent's session never became ready")
+			}
+		}
 		p.run(t)
+		gotResponses(t, p, 2)
+		// Time for events of the calls just made to arrive, had there been
+		// any.
 		time.Sleep(time.Second)
 		if n := events.count(func(ev *Event) bool { return ev.PID == p.pid() }); n != 0 {
 			t.Errorf("%d events after the agent was told to stop", n)
@@ -2014,11 +2068,28 @@ func TestJSSE(t *testing.T) {
 		p.exec(t)
 		load(t, p, options(javaNonce(t)))
 		p.run(t)
+		gotResponses(t, p, 2)
 		time.Sleep(time.Second)
 		if n := events.count(func(ev *Event) bool { return ev.PID == p.pid() }); n != 0 {
 			t.Errorf("%d events from frames with another nonce", n)
 		}
+		if tr.JavaReady(p.pid()) {
+			t.Error("a frame with another nonce made the session ready")
+		}
 	})
+}
+
+// gotResponses checks that a JSSEClient run in socket mode got its n
+// responses, so that a test checking for no events checks calls that were
+// made.
+func gotResponses(t *testing.T, p *javaProgram, n int) {
+	t.Helper()
+	for i := range n {
+		want := fmt.Sprintf("served /jsse/socket/%d ", i)
+		if !slices.ContainsFunc(p.lines, func(l string) bool { return strings.HasPrefix(l, want) }) {
+			t.Errorf("no response %q; printed %q", want, p.lines)
+		}
+	}
 }
 
 // mismatch returns where a and b first differ.

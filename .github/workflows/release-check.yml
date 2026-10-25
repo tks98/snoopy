@@ -13,37 +13,45 @@ on:
       - .github/workflows/release-check.yml
   workflow_dispatch:
 
-permissions:
-  contents: read
+# Each job asks for what it needs.
+permissions: {}
 
 jobs:
   snapshot:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # For the Java agent's jars (java/build.sh, a GoReleaser hook).
-      - uses: actions/setup-java@v6
+      # For the Java agent's jars (java/build.sh, a GoReleaser hook): the
+      # release's JDK, which they're reproducible for.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
-          java-version: 21
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: goreleaser/goreleaser-action@v7
+          java-version: 21.0.13+9
+      # For GoReleaser's SBOMs.
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          version: "~> v2"
+          syft-version: v1.55.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.19.0
           args: check
-      - uses: goreleaser/goreleaser-action@v7
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
-          version: "~> v2"
+          version: v2.19.0
           args: release --snapshot --clean
       - name: krew installs the plugin from its manifest
         run: |
           curl -fsSLO https://github.com/kubernetes-sigs/krew/releases/download/v0.4.5/krew-linux_amd64.tar.gz
+          echo "bacc06800bda14ec063cd0b6f377a961fdf4661c00366bf9834723cd28bfabc7  krew-linux_amd64.tar.gz" | sha256sum -c -
           tar xzf krew-linux_amd64.tar.gz ./krew-linux_amd64
           ./krew-linux_amd64 install krew
           export PATH="$HOME/.krew/bin:$PATH"
@@ -58,11 +66,21 @@ jobs:
             docker cp "$id:/usr/share/snoopy/java/snoopy-agent.jar" - | tar -t
             docker rm "$id" >/dev/null
           done
-      - name: The archives have the Java agent, and its jars are reproducible
+      - name: The archives have the Java agent and SBOMs, and its jars are reproducible
         run: |
           for a in dist/snoopy_*_linux_*.tar.gz; do
             tar -tzf "$a" | grep -qx snoopy-agent.jar && tar -tzf "$a" | grep -qx snoopy-hooks.jar || { echo "$a: no jars"; exit 1; }
+            grep -q "  ${a#dist/}.sbom.json$" dist/checksums.txt || { echo "$a: no SBOM"; exit 1; }
           done
           grep snoopy- dist/checksums.txt
           sha256sum java/out/snoopy-*.jar > first.sha256
           sh java/build.sh && sha256sum -c first.sha256
+      # The same commit makes the same archives (their files' times are the
+      # commit's), whenever it's built. Not the SBOMs, which say when.
+      - run: (cd dist && sha256sum *.tar.gz) > archives.sha256
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.19.0
+          args: release --snapshot --clean --skip=docker,sbom
+      - name: The archives are reproducible
+        run: cd dist && sha256sum -c ../archives.sha256
