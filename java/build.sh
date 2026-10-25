@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds snoopy's Java agent (spike) into java/out: snoopy-agent.jar, which
+# Builds snoopy's Java agent into java/out: snoopy-agent.jar, which
 # the JVM loads, and snoopy-hooks.jar, which the agent's manifest puts on
 # the boot class path from the same directory. Needs a JDK 17 or later;
 # ASM is downloaded from Maven Central and checked against its SHA-1.
