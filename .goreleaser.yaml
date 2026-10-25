@@ -2,6 +2,13 @@ version: 2
 
 project_name: snoopy
 
+# snoopy's Java agent (--java), built with a JDK 21 or later into
+# java/out, reproducibly for a given JDK (java/build.sh). Not something
+# `go install` or a plain go build needs.
+before:
+  hooks:
+    - sh java/build.sh
+
 builds:
   - id: snoopy
     env:
@@ -31,6 +38,9 @@ archives:
     files:
       - LICENSE
       - README.md
+      # Next to snoopy, where --java looks for them.
+      - src: java/out/snoopy-*.jar
+        strip_parent: true
   # krew wants the license in the archive.
   - id: kubectl-snoopy
     ids: [kubectl-snoopy]
@@ -41,11 +51,20 @@ archives:
 
 checksum:
   name_template: checksums.txt
+  extra_files:
+    - glob: java/out/snoopy-*.jar
+
+# The agent's jars on their own too, for a snoopy from go install or a
+# package without them.
+release:
+  extra_files:
+    - glob: java/out/snoopy-*.jar
 
 changelog:
   sort: asc
 
-# A multi-arch image with just the static binary, at ghcr.io/tks98/snoopy.
+# A multi-arch image with the static binary and the Java agent's jars, at
+# ghcr.io/tks98/snoopy.
 # It needs the host's PID namespace and privileges to trace anything; see
 # docs/usage.md, "Containers and Kubernetes".
 dockers_v2:
@@ -58,6 +77,9 @@ dockers_v2:
     platforms:
       - linux/amd64
       - linux/arm64
+    extra_files:
+      - java/out/snoopy-agent.jar
+      - java/out/snoopy-hooks.jar
     labels:
       org.opencontainers.image.title: snoopy
       org.opencontainers.image.description: See what Linux programs send over TLS, with eBPF

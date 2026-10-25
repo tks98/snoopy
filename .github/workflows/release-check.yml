@@ -8,6 +8,7 @@ on:
     paths:
       - .goreleaser.yaml
       - Dockerfile
+      - "java/**"
       - .github/workflows/release.yml
       - .github/workflows/release-check.yml
   workflow_dispatch:
@@ -25,6 +26,11 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      # For the Java agent's jars (java/build.sh, a GoReleaser hook).
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: goreleaser/goreleaser-action@v7
@@ -43,9 +49,20 @@ jobs:
           export PATH="$HOME/.krew/bin:$PATH"
           kubectl krew install --manifest=dist/krew/snoopy.yaml --archive="$(ls dist/kubectl-snoopy_*_linux_amd64.tar.gz)"
           kubectl snoopy --version
-      - name: The images run
+      - name: The images run, and have the Java agent
         run: |
           docker images ghcr.io/tks98/snoopy
           for img in $(docker images ghcr.io/tks98/snoopy --format '{{.Repository}}:{{.Tag}}'); do
             docker run --rm --platform "linux/${img##*-}" "$img" --version
+            id=$(docker create --platform "linux/${img##*-}" "$img")
+            docker cp "$id:/usr/share/snoopy/java/snoopy-agent.jar" - | tar -t
+            docker rm "$id" >/dev/null
           done
+      - name: The archives have the Java agent, and its jars are reproducible
+        run: |
+          for a in dist/snoopy_*_linux_*.tar.gz; do
+            tar -tzf "$a" | grep -qx snoopy-agent.jar && tar -tzf "$a" | grep -qx snoopy-hooks.jar || { echo "$a: no jars"; exit 1; }
+          done
+          grep snoopy- dist/checksums.txt
+          sha256sum java/out/snoopy-*.jar > first.sha256
+          sh java/build.sh && sha256sum -c first.sha256

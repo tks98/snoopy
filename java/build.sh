@@ -25,12 +25,28 @@ javac --release 21 -d out/classes -cp "$cp" $(find agent/src -name '*.java')
 cp -r out/classes/snoopy out/hooks/ && rm -rf out/hooks/snoopy/agent
 cp -r out/classes/snoopy out/agent/ && rm -rf out/agent/snoopy/hooks
 (cd out/agent && for j in asm asm-tree asm-commons; do jar xf ../../lib/$j-$ASM.jar org; done)
+epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 315532800)}
+date=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$epoch" +%Y-%m-%dT%H:%M:%SZ)
 cat > out/manifest.txt <<MF
 Premain-Class: snoopy.agent.Agent
 Agent-Class: snoopy.agent.Agent
 Can-Retransform-Classes: true
 Boot-Class-Path: snoopy-hooks.jar
 MF
-jar cfm out/snoopy-agent.jar out/manifest.txt -C out/agent .
-jar cf out/snoopy-hooks.jar -C out/hooks .
+# jar adds what it's given in that order: sorted, the same everywhere.
+pack() { # jar dir [manifest]
+	jarfile=$PWD/$1 manifest=${3:+$PWD/$3}
+	(
+		cd "$2"
+		files=$(find . -type f | LC_ALL=C sort)
+		if [ -n "$manifest" ]; then
+			jar --create --file "$jarfile" --date="$date" --manifest="$manifest" $files
+		else
+			jar --create --file "$jarfile" --date="$date" $files
+		fi
+	)
+}
+rm -f out/snoopy-agent.jar out/snoopy-hooks.jar
+pack out/snoopy-agent.jar out/agent out/manifest.txt
+pack out/snoopy-hooks.jar out/hooks
 echo "built java/out/snoopy-agent.jar and java/out/snoopy-hooks.jar"

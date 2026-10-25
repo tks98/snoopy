@@ -325,9 +325,15 @@ with `--pid`, which reports what `SSLSocket` and `SSLEngine` read and wrote
 (through `java.net.http.HttpClient` too):
 
 ```sh
-java/build.sh                              # builds the agent into java/out (needs JDK 21+)
-sudo ./snoopy --java --pid "$(pgrep -f my-service.jar)"
+sudo snoopy --java --pid "$(pgrep -f my-service.jar)"
 ```
+
+The agent is two jars, `snoopy-agent.jar` and `snoopy-hooks.jar`, which
+snoopy looks for next to itself: they're in the release archives, in the
+image (at `/usr/share/snoopy/java`) and attached to each release on their
+own, with checksums. A snoopy from `go install` doesn't have them; take
+them from the release, or build them with `java/build.sh` (JDK 21 or
+later, into `java/out`), and point `--java-agent` at their directory.
 
 This is experimental: tested with HotSpot 21 and 25 on Linux, for JVMs on
 the host. The JVM needs attaching left on, which it is by default

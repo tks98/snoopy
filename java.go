@@ -21,14 +21,14 @@ const javaReadyTimeout = 5 * time.Second
 // is told to stop capturing (it can't be unloaded) and the session goes.
 func startJava(cfg config, t *tracer.Tracer) (stop func(), err error) {
 	pid := cfg.pid
+	dir, err := javaAgentDir(cfg.javaAgent)
+	if err != nil {
+		return nil, err
+	}
 	if ok, err := javaagent.IsHotSpot(pid); err != nil {
 		return nil, fmt.Errorf("--java: %w", err)
 	} else if !ok {
 		return nil, fmt.Errorf("--java: process %d isn't a HotSpot JVM (it has no libjvm.so)", pid)
-	}
-	dir, err := javaAgentDir(cfg.javaAgent)
-	if err != nil {
-		return nil, err
 	}
 	jar, err := javaagent.Stage(pid, dir)
 	if err != nil {
@@ -81,5 +81,5 @@ func javaAgentDir(dir string) (string, error) {
 			return d, nil
 		}
 	}
-	return "", fmt.Errorf("--java: snoopy's Java agent (%s) isn't next to snoopy; build it with java/build.sh and point --java-agent at java/out", javaagent.AgentJar)
+	return "", fmt.Errorf("--java: snoopy's Java agent (%s and %s) isn't next to snoopy: they're in the release archives and the image, or build them with java/build.sh; then point --java-agent at their directory", javaagent.AgentJar, javaagent.HooksJar)
 }
