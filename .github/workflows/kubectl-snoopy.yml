@@ -36,6 +36,10 @@ jobs:
           version: v2.15.0
           working-directory: cmd/kubectl-snoopy
       - run: go test -race ./...
+      # Known vulnerabilities reachable from the code, in the toolchain
+      # (go.mod's toolchain line) or a dependency.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
       - name: Build for every platform krew installs it on
         run: |
           for os in linux darwin windows; do

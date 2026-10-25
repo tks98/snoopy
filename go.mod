@@ -2,6 +2,8 @@ module github.com/tks98/snoopy/v2
 
 go 1.26.0
 
+toolchain go1.26.10
+
 require (
 	github.com/andybalholm/brotli v1.2.6
 	github.com/cilium/ebpf v0.22.0

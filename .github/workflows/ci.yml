@@ -38,6 +38,10 @@ jobs:
           version: v2.15.0
 
       - run: go test -race ./...
+      # Known vulnerabilities reachable from the code, in the toolchain
+      # (go.mod's toolchain line) or a dependency.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Build for amd64 and arm64
         run: |
