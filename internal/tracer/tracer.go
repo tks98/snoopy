@@ -701,6 +701,7 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 				// once the mapping is done.
 				pid &^= loadedLibrary
 				tid := int(binary.NativeEndian.Uint32(rec.RawSample[4:]))
+				debugf("library load pid=%d tid=%d hold=%v", pid, tid, hold != nil && hold(pid))
 				if hold != nil && hold(pid) {
 					select {
 					case holds <- heldProcess{pid: pid, tid: tid, library: true}:
@@ -745,6 +746,7 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 			case p := <-holds:
 				// A new process, or a thread that loaded a TLS library.
 				sig, ok := seize(p.tid)
+				debugf("seize pid=%d tid=%d library=%v ok=%v", p.pid, p.tid, p.library, ok)
 				if !ok {
 					continue
 				}
@@ -754,6 +756,7 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 					select {
 					case <-p.done:
 					case <-time.After(p.maxHold()):
+						debugf("hold timed out pid=%d tid=%d", p.pid, p.tid)
 					}
 				case <-ctx.Done():
 				}
@@ -817,7 +820,9 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 			case pid := <-pids:
 				inspect(pid, false)
 			case p := <-held:
+				debugf("inspect held pid=%d library=%v", p.pid, p.library)
 				inspect(p.pid, !p.library)
+				debugf("inspected held pid=%d", p.pid)
 				close(p.done)
 			}
 		}
@@ -828,6 +833,9 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 		reader.Close()
 	}, nil
 }
+
+// debugf, if set (by tests), is told what holding processes does.
+var debugf = func(string, ...any) {}
 
 type heldProcess struct {
 	pid, tid int // the thread held: the process's for a new one
