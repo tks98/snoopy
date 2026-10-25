@@ -4,6 +4,7 @@ package procinfo
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // maxCacheEntries bounds each cache; when full it is simply reset.
@@ -22,8 +24,18 @@ const maxCacheEntries = 4096
 // Resolver caches /proc lookups. It is not safe for concurrent use.
 type Resolver struct {
 	proc       string
-	containers map[uint32]string
+	containers map[uint32]container
 	sockets    map[sockKey]socket
+	// recheck is how long a process's container ID is used before its
+	// start time is looked at again, to tell a reused PID.
+	recheck time.Duration
+}
+
+// container is a process's container ID, by its PID and start time.
+type container struct {
+	id      string
+	start   uint64
+	checked time.Time
 }
 
 type sockKey struct {
@@ -40,27 +52,59 @@ type socket struct {
 func NewResolver(procRoot string) *Resolver {
 	return &Resolver{
 		proc:       procRoot,
-		containers: map[uint32]string{},
+		containers: map[uint32]container{},
 		sockets:    map[sockKey]socket{},
+		recheck:    time.Second,
 	}
 }
 
 // ContainerID returns the ID of the container a process runs in, or "" if
-// it isn't in a recognizable container.
+// it isn't in a recognizable container. It's cached by PID and start time,
+// which is looked at again once a second: a PID can be another process's
+// by then.
 func (r *Resolver) ContainerID(pid uint32) string {
-	if id, ok := r.containers[pid]; ok {
-		return id
+	now := time.Now()
+	c, ok := r.containers[pid]
+	if ok && now.Sub(c.checked) < r.recheck {
+		return c.id
+	}
+	start, ok2 := r.startTime(pid)
+	if !ok2 {
+		return "" // the process may have exited; don't cache
+	}
+	if ok && c.start == start {
+		c.checked = now
+		r.containers[pid] = c
+		return c.id
 	}
 	data, err := os.ReadFile(filepath.Join(r.proc, strconv.Itoa(int(pid)), "cgroup"))
 	if err != nil {
-		return "" // the process may have exited; don't cache
+		return ""
 	}
 	id := ContainerIDFromCgroup(string(data))
 	if len(r.containers) >= maxCacheEntries {
 		clear(r.containers)
 	}
-	r.containers[pid] = id
+	r.containers[pid] = container{id: id, start: start, checked: now}
 	return id
+}
+
+// startTime returns when a process started, field 22 of /proc/<pid>/stat.
+func (r *Resolver) startTime(pid uint32) (uint64, bool) {
+	stat, err := os.ReadFile(filepath.Join(r.proc, strconv.Itoa(int(pid)), "stat"))
+	if err != nil {
+		return 0, false
+	}
+	i := bytes.LastIndexByte(stat, ')') // the command name may contain anything
+	if i < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	if len(fields) < 20 {
+		return 0, false
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	return start, err == nil
 }
 
 // Container runtimes put the 64-hex-digit container ID in the cgroup path,
