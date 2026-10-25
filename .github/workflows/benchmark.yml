@@ -51,3 +51,12 @@ jobs:
         run: |
           sudo env "PATH=$PATH" docs/benchmark/run.sh 10 | tee benchmark.txt
           { echo '```'; cat benchmark.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Run for Java (--java)
+        # The JDK's own HTTPS server, under the same load.
+        run: |
+          sudo env "PATH=$PATH" docs/benchmark/java.sh 10 | tee benchmark-java.txt
+          { echo '```'; cat benchmark-java.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

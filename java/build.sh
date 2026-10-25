@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds snoopy's Java agent (spike) into java/out: snoopy-agent.jar, which
 # the JVM loads, and snoopy-hooks.jar, which the agent's manifest puts on
-# the boot class path from the same directory. Needs a JDK 21 or later;
+# the boot class path from the same directory. Needs a JDK 17 or later;
 # ASM is downloaded from Maven Central and checked against its SHA-1.
 set -eu
 cd "$(dirname "$0")"
@@ -21,11 +21,11 @@ fetch asm-commons 3707c04c3f7197c3d1d8dbc728b791a58809a59e
 cp=lib/asm-$ASM.jar:lib/asm-tree-$ASM.jar:lib/asm-commons-$ASM.jar
 
 rm -rf out/classes out/hooks out/agent && mkdir -p out/classes out/hooks out/agent
-javac --release 21 -d out/classes -cp "$cp" $(find agent/src -name '*.java')
+javac --release 17 -d out/classes -cp "$cp" $(find agent/src -name '*.java')
 cp -r out/classes/snoopy out/hooks/ && rm -rf out/hooks/snoopy/agent
 cp -r out/classes/snoopy out/agent/ && rm -rf out/agent/snoopy/hooks
 (cd out/agent && for j in asm asm-tree asm-commons; do jar xf ../../lib/$j-$ASM.jar org; done)
-epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 315532800)}
+epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 946684800)}
 date=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$epoch" +%Y-%m-%dT%H:%M:%SZ)
 cat > out/manifest.txt <<MF
 Premain-Class: snoopy.agent.Agent

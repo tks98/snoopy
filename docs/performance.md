@@ -118,3 +118,44 @@ The BPF programs' own time per call, for nginx at 1 KiB traced: 180 to
 
 To measure on another machine, run `sudo docs/benchmark/run.sh`; its header
 says what it needs.
+
+## Java (`--java`)
+
+`docs/benchmark/java.sh` does the same with the JDK's own HTTPS server
+(`com.sun.net.httpserver`, which is SunJSSE through `SSLEngine`), traced by
+snoopy's Java agent rather than probes. Each mode gets a JVM of its own,
+warmed up before and after the mode is set up:
+
+- **off:** no agent.
+- **agent:** the agent loaded and writing its frames, but no snoopy
+  reading them: the agent's own cost.
+- **quiet** and **text:** `snoopy --java --pid <server> --quiet`, and
+  without `--quiet`.
+- **idle:** the agent left in the JVM, told to stop, by a snoopy that came
+  and went.
+
+Same VM, OpenJDK 25, two CPUs for the server:
+
+| workload | mode | req/s | µs/req | p50 µs | p99 µs | snoopy CPU | chunks lost |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| JSSE HTTPS, 1 KiB | off | 87,410 | 22.9 | 357 | 3,250 | | |
+| | agent | 80,131 | 25.0 | 397 | 3,320 | | |
+| | quiet | 67,515 | 29.6 | 455 | 2,810 | 12% | 0 |
+| | text | 55,016 | 36.4 | 545 | 5,080 | 79% | 0 |
+| | idle | 88,385 | 22.6 | 354 | 3,070 | | |
+| JSSE HTTPS, 256 KiB | off | 934 | 2,141 | 41,200 | 45,940 | | |
+| | agent | 904 | 2,212 | 41,660 | 48,480 | | |
+| | quiet | 852 | 2,347 | 41,050 | 43,040 | 13% | 0 |
+| | text | 822 | 2,433 | 41,040 | 42,960 | 44% | 0 |
+| | idle | 922 | 2,169 | 41,330 | 48,020 | | |
+
+A 1 KiB request costs the server about 7 µs more with `--quiet`, for the
+two or three SSLEngine calls each makes, which is less than a native TLS
+call's uprobe above: the agent's part is about 2 µs, and the rest is the
+write each frame takes and the BPF program copying it. A 256 KiB response,
+16 TLS records, costs about 10% more. Once snoopy has stopped, the agent's
+hooks only check that they're off, which doesn't show. Text output costs
+the server more than `--quiet` here, although snoopy has CPUs of its own; I
+think it's the VM's shared caches and memory bandwidth, but haven't looked
+further. The JVM's numbers vary more from run to run than nginx's, by 5 to
+10%, so differences smaller than that don't mean much.

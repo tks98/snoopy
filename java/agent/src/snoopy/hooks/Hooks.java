@@ -7,9 +7,12 @@ import java.net.InetAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.lang.ref.WeakReference;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
  * What the instrumented JSSE methods call, loaded by the bootstrap class
@@ -38,7 +41,6 @@ public final class Hooks {
     static final AtomicLong seq = new AtomicLong();
     static final AtomicLong failed = new AtomicLong();
     static final AtomicLong nextConn = new AtomicLong(1);
-    static final Map<Object, Long> conns = new WeakHashMap<>();
 
     /** Opens the transport and starts copying; true if it's ready. */
     public static synchronized boolean enable(long sessionNonce, int max) {
@@ -50,7 +52,9 @@ public final class Hooks {
             maxCapture = max;
             enabled = true;
             // A frame with no payload says the transport is ready.
-            emit(0, WRITE, SOCKET, null, 0, 0, 0, null, 0);
+            byte[] f = new byte[HEADER];
+            header(f, null, WRITE, SOCKET, 0, 0, 0);
+            emit(null, f, HEADER);
             return true;
         } catch (Throwable t) {
             enabled = false;
@@ -74,14 +78,73 @@ public final class Hooks {
         }
     }
 
-    static long conn(Object owner) {
-        synchronized (conns) {
-            Long id = conns.get(owner);
-            if (id == null) {
-                id = nextConn.getAndIncrement();
-                conns.put(owner, id);
+    // A connection: the agent's ID for it, and what its frames' headers say
+    // of its addresses.
+    static final class Conn {
+        final WeakReference<Object> owner;
+        final long id;
+        final short family, lport, rport;
+        final byte[] laddr, raddr;
+
+        Conn(Object owner, long id) {
+            this.owner = new WeakReference<>(owner);
+            this.id = id;
+            short f = 0, lp = 0, rp = 0;
+            byte[] la = null, ra = null;
+            if (owner instanceof Socket s) {
+                InetAddress local = s.getLocalAddress(), remote = s.getInetAddress();
+                if (local != null && remote != null && local.getClass() == remote.getClass()) {
+                    f = (short) (remote instanceof Inet4Address ? AF_INET : AF_INET6);
+                    la = local.getAddress();
+                    ra = remote.getAddress();
+                    lp = (short) s.getLocalPort();
+                    rp = (short) s.getPort();
+                }
             }
-            return id;
+            family = f;
+            lport = lp;
+            rport = rp;
+            laddr = la;
+            raddr = ra;
+        }
+    }
+
+    static final Map<Object, Conn> conns = new WeakHashMap<>();
+    // The connections seen last, by identity hash: most calls find theirs
+    // here, without a lock.
+    static final AtomicReferenceArray<Conn> recent = new AtomicReferenceArray<>(256);
+
+    static Conn conn(Object owner) {
+        int slot = System.identityHashCode(owner) & (recent.length() - 1);
+        Conn c = recent.get(slot);
+        if (c != null && c.owner.get() == owner) {
+            return c;
+        }
+        synchronized (conns) {
+            c = conns.get(owner);
+            if (c == null) {
+                c = new Conn(owner, nextConn.getAndIncrement());
+                conns.put(owner, c);
+            }
+        }
+        recent.set(slot, c);
+        return c;
+    }
+
+    // Frames are built in arrays kept here between calls, one per slot,
+    // which threads (virtual ones too) take turns with.
+    static final AtomicReferenceArray<byte[]> frames = new AtomicReferenceArray<>(64);
+
+    static byte[] takeFrame(int size) {
+        int slot = (int) Thread.currentThread().getId() & (frames.length() - 1);
+        byte[] f = frames.getAndSet(slot, null);
+        return f != null && f.length >= size ? f : new byte[Math.max(size, HEADER + 2048)];
+    }
+
+    static void giveFrame(byte[] f) {
+        int slot = (int) Thread.currentThread().getId() & (frames.length() - 1);
+        if (f.length <= HEADER + maxCapture) {
+            frames.compareAndSet(slot, null, f);
         }
     }
 
@@ -111,7 +174,12 @@ public final class Hooks {
     }
 
     static void socketFrame(Object socket, byte dir, byte[] b, int off, int len, long start) {
-        emit(conn(socket), dir, SOCKET, b, off, len, len, socket instanceof Socket s ? s : null, System.nanoTime() - start);
+        Conn c = conn(socket);
+        int cap = Math.min(len, maxCapture);
+        byte[] f = takeFrame(HEADER + cap);
+        header(f, c, dir, SOCKET, len, cap, System.nanoTime() - start);
+        System.arraycopy(b, off, f, HEADER, cap);
+        emit(c, f, HEADER + cap);
     }
 
     /**
@@ -161,10 +229,11 @@ public final class Hooks {
     }
 
     // engineFrame gathers n bytes from bufs, from the positions they had at
-    // entry, without moving them.
+    // entry, into a frame, without moving them.
     static void engineFrame(Object engine, byte dir, int n, ByteBuffer[] bufs, int off, int len, int[] pos, long start) {
+        Conn c = conn(engine);
         int cap = Math.min(n, maxCapture);
-        byte[] data = new byte[cap];
+        byte[] f = takeFrame(HEADER + cap);
         int got = 0;
         for (int i = 0; i < len && got < cap; i++) {
             ByteBuffer d = bufs[off + i].duplicate();
@@ -175,40 +244,41 @@ public final class Hooks {
                 continue;
             }
             d.limit(from + k).position(from);
-            d.get(data, got, k);
+            d.get(f, HEADER + got, k);
             got += k;
         }
-        emit(conn(engine), dir, ENGINE, data, 0, got, n, null, System.nanoTime() - start);
+        header(f, c, dir, ENGINE, n, got, System.nanoTime() - start);
+        emit(c, f, HEADER + got);
     }
 
-    // emit writes one frame: the header (struct java_frame), then up to
-    // maxCapture bytes of the payload. Synchronized, so frames keep their
-    // order and aren't torn.
-    static synchronized void emit(long conn, byte dir, byte kind, byte[] b, int off, int len, int orig, Socket socket, long latency) {
-        int cap = Math.min(len, maxCapture);
-        byte[] frame = new byte[HEADER + cap];
-        ByteBuffer h = ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN);
-        h.putLong(MAGIC).putLong(nonce).putLong(conn).putLong(seq.getAndIncrement());
-        InetAddress local = socket == null ? null : socket.getLocalAddress();
-        InetAddress remote = socket == null ? null : socket.getInetAddress();
-        int family = 0;
-        if (local != null && remote != null && local.getClass() == remote.getClass()) {
-            family = remote instanceof Inet4Address ? AF_INET : AF_INET6;
-        }
-        h.put(dir).put(kind).putShort((short) family);
-        h.putInt(orig).putInt(cap);
-        h.putShort((short) (family == 0 ? 0 : socket.getLocalPort())).putShort((short) (family == 0 ? 0 : socket.getPort()));
-        if (family != 0) {
-            h.put(local.getAddress()).position(64).put(remote.getAddress());
+    // header fills in a frame's header, struct java_frame.
+    static void header(byte[] f, Conn c, byte dir, byte kind, int size, int captured, long latency) {
+        ByteBuffer h = ByteBuffer.wrap(f, 0, HEADER).order(ByteOrder.LITTLE_ENDIAN);
+        h.putLong(MAGIC).putLong(nonce).putLong(c == null ? 0 : c.id).putLong(0); // seq: set in emit
+        h.put(dir).put(kind).putShort(c == null ? 0 : c.family);
+        h.putInt(size).putInt(captured);
+        h.putShort(c == null ? 0 : c.lport).putShort(c == null ? 0 : c.rport);
+        Arrays.fill(f, 48, 80, (byte) 0); // a reused frame's addresses
+        if (c != null && c.family != 0) {
+            h.put(c.laddr).position(64).put(c.raddr);
         }
         h.position(80).putLong(Math.max(latency, 0));
-        if (cap > 0) {
-            System.arraycopy(b, off, frame, HEADER, cap);
-        }
+    }
+
+    // emit writes a frame of n bytes and gives it back. A connection's
+    // frames are written one at a time, in order; /dev/null writes are
+    // atomic, so different connections' go at once.
+    static void emit(Conn c, byte[] f, int n) {
+        Object lock = c == null ? Hooks.class : c;
         try {
-            out.write(frame);
+            synchronized (lock) {
+                ByteBuffer.wrap(f, 24, 8).order(ByteOrder.LITTLE_ENDIAN).putLong(seq.getAndIncrement());
+                out.write(f, 0, n);
+            }
         } catch (Throwable t) {
             failed.incrementAndGet();
+        } finally {
+            giveFrame(f);
         }
     }
 }
