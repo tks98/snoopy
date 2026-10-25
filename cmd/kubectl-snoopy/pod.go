@@ -15,6 +15,7 @@ const (
 	managedBy      = "kubectl-snoopy"
 	targetKey      = "kubectl-snoopy/target"
 	snoopyName     = "snoopy" // the container's name in the pod we make
+	snoopyPath     = "/usr/bin/snoopy"
 	defaultImage   = "ghcr.io/tks98/snoopy"
 )
 
@@ -61,21 +62,27 @@ func isInit(pod *corev1.Pod, name string) bool {
 	return slices.ContainsFunc(pod.Spec.InitContainers, func(c corev1.Container) bool { return c.Name == name })
 }
 
-// snoopyArgs returns snoopy's arguments: the containers to trace, then the
-// rest as given.
-func snoopyArgs(targets []target, rest []string) []string {
-	var args []string
+// execCommand returns the command that runs snoopy in the snoopy pod: the
+// containers to trace, then the rest of its arguments as given.
+func execCommand(targets []target, rest []string) []string {
+	args := []string{snoopyPath}
 	for _, t := range targets {
 		args = append(args, "--container", t.id+"="+t.name)
 	}
 	return append(args, rest...)
 }
 
-// snoopyPod returns a pod that runs snoopy on node, for what it traces
+// snoopyPod returns a pod to run snoopy in on node, for what it traces
 // there (say, "shop/pod checkout-7d9f"), named after name: it shares the
 // node's PID namespace and is privileged, which snoopy needs to load its
 // eBPF program and see other pods' processes.
-func snoopyPod(node, name, what, namespace, image string, args []string, deadline time.Duration) *corev1.Pod {
+//
+// Its container only waits (snoopy --serve-exec), and snoopy itself runs
+// through pods/exec (execCommand). A container's own output is its log,
+// which the kubelet keeps in a file on the node, log shippers send on, and
+// anyone allowed pods/log can read; what snoopy captures must not go
+// there. An exec's output only goes to the one who started it.
+func snoopyPod(node, name, what, namespace, image string, deadline time.Duration) *corev1.Pod {
 	privileged := true
 	noToken := false
 	grace := int64(5)
@@ -106,12 +113,13 @@ func snoopyPod(node, name, what, namespace, image string, args []string, deadlin
 			// Wherever the target runs, whatever the node's taints.
 			Tolerations: []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
 			Containers: []corev1.Container{{
-				Name:                     snoopyName,
-				Image:                    image,
-				ImagePullPolicy:          pull,
-				Args:                     args,
-				SecurityContext:          &corev1.SecurityContext{Privileged: &privileged},
-				TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+				Name:            snoopyName,
+				Image:           image,
+				ImagePullPolicy: pull,
+				Command:         []string{snoopyPath, "--serve-exec"},
+				SecurityContext: &corev1.SecurityContext{Privileged: &privileged},
+				// Never a copy of the log in the pod's status.
+				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 			}},
 		},
 	}
@@ -146,9 +154,9 @@ func explainCreate(err error, namespace string) error {
 			"--debug-namespace set to one that does (such as kube-system, or one labeled "+
 			"pod-security.kubernetes.io/enforce=privileged)\n  %v", namespace, err)
 	}
-	if strings.Contains(msg, "forbidden") {
+	if strings.Contains(msg, "forbidden") && strings.Contains(msg, "cannot create") {
 		return fmt.Errorf("not allowed to create the snoopy pod in namespace %s (it needs create on pods, "+
-			"and pods/attach); see kubectl snoopy --help\n  %v", namespace, err)
+			"and pods/exec); see kubectl snoopy --help\n  %v", namespace, err)
 	}
 	return fmt.Errorf("create the snoopy pod: %w", err)
 }
@@ -159,7 +167,8 @@ func waitingProblem(pod *corev1.Pod) string {
 	for _, s := range pod.Status.ContainerStatuses {
 		if w := s.State.Waiting; w != nil {
 			switch w.Reason {
-			case "ErrImagePull", "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError":
+			case "ErrImagePull", "ImagePullBackOff", "ErrImageNeverPull", "InvalidImageName",
+				"CreateContainerConfigError", "CreateContainerError", "RunContainerError":
 				return w.Reason + ": " + w.Message
 			}
 		}
