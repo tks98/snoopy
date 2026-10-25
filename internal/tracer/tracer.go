@@ -141,14 +141,19 @@ func New(opts Options) (*Tracer, error) {
 	var comm [16]byte
 	copy(comm[:], opts.Comm)
 	pidnsDev, pidnsIno := pidNamespace()
+	// Per process, with Comm, the processes attached for are what's traced
+	// (Attach adds them to traced_tgids): one that renames itself later
+	// stays traced, and probes on a file every process uses (--lib) only
+	// trace them.
+	perProcess := opts.PerProcess && btfErr == nil
 	for name, value := range map[string]any{
 		"pidns_dev":    pidnsDev,
 		"pidns_ino":    pidnsIno,
-		"filter_tgids": opts.PID != 0,
+		"filter_tgids": opts.PID != 0 || perProcess && opts.Comm != "",
 		"max_capture":  uint32(opts.MaxCapture),
 		// Without BTF the kernel only knows thread names, so the process
 		// name is filtered on in user space instead.
-		"filter_comm": opts.Comm != "" && btfErr == nil,
+		"filter_comm": opts.Comm != "" && btfErr == nil && !perProcess,
 		"targ_comm":   comm,
 		"have_btf":    btfErr == nil,
 	} {
@@ -160,7 +165,7 @@ func New(opts Options) (*Tracer, error) {
 
 	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{},
 		procs: map[int]*procLinks{}, everyone: map[procFile]bool{}}
-	t.perProcess = opts.PerProcess && t.haveBTF
+	t.perProcess = perProcess
 	if err := spec.LoadAndAssign(&t.objs, &loadOpts); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
@@ -283,6 +288,11 @@ type cProbe struct {
 func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
 	if !t.perProcess {
 		pid = 0
+	}
+	if pid != 0 && t.opts.Comm != "" {
+		if err := t.TracePID(uint32(pid)); err != nil {
+			return nil, err
+		}
 	}
 	key, err := targetKey(target)
 	if err != nil {

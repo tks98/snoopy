@@ -29,6 +29,7 @@ type HAR struct {
 	version string
 	entries []*harEntry
 	conns   map[harConnKey]*harConn
+	filter  *HTTPFilter
 }
 
 // maxHARBody bounds how much of a body a HAR entry keeps, and maxHAREntries
@@ -81,10 +82,12 @@ type harMessage struct {
 }
 
 // NewHAR returns a printer that writes a HAR log to w when it's closed.
-// version is snoopy's, for the log's creator. Of opts, only Redact applies.
+// version is snoopy's, for the log's creator. Of opts, only Redact and
+// Filter apply, the filter to whole entries.
 func NewHAR(w io.Writer, version string, opts Options) *HAR {
-	opts.Warn = nil
-	return &HAR{w: w, dec: newDecoders(opts), version: version, conns: map[harConnKey]*harConn{}}
+	filter := opts.Filter
+	opts.Warn, opts.Filter = nil, nil // the filter applies to whole entries
+	return &HAR{w: w, dec: newDecoders(opts), version: version, conns: map[harConnKey]*harConn{}, filter: filter}
 }
 
 func (h *HAR) Print(ev *tracer.Event) error {
@@ -360,6 +363,9 @@ func (h *HAR) Close() error {
 	var entries []entry
 	for _, e := range h.entries {
 		req, resp := &e.req, &e.resp
+		if h.filter != nil && !h.filter.match(&exchange{method: req.method, path: req.target, status: resp.status}) {
+			continue
+		}
 		u := url.URL{Scheme: cmpOr(req.scheme, "https"), Host: req.authority}
 		if u.Host == "" && e.server.IsValid() {
 			u.Host = e.server.String()

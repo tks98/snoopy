@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/tks98/snoopy/v2/internal/discover"
+	"github.com/tks98/snoopy/v2/internal/output"
 	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
@@ -46,6 +47,8 @@ func TestParseFlags(t *testing.T) {
 		{"--port", "0"},
 		{"--port", "https"},
 		{"--count", "-1"},
+		{"--status", "6xx"},
+		{"--path", "v1"},
 		{"--redact", "--hex"},
 		{"--redact", "--pcap", "out.pcap"},
 		{"extra"},
@@ -83,6 +86,22 @@ func TestContainers(t *testing.T) {
 	}
 	if _, err := parseFlags([]string{"--container", "=name"}, io.Discard); err == nil {
 		t.Error("an empty ID was accepted")
+	}
+}
+
+// --method, --path and --status make one filter, with values repeated or
+// comma-separated.
+func TestHTTPFilterFlags(t *testing.T) {
+	c, err := parseFlags([]string{"--method", "GET,post", "--path", "/v1/", "--status", "5xx", "--status", "404"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := c.filter
+	if f == nil || len(f.Methods) != 2 || len(f.Paths) != 1 || len(f.Status) != 2 || f.Status[1] != (output.StatusRange{From: 404, To: 404}) {
+		t.Errorf("filter %+v", f)
+	}
+	if c, _ := parseFlags(nil, io.Discard); c.filter != nil {
+		t.Error("a filter without the flags")
 	}
 }
 

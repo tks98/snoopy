@@ -67,6 +67,9 @@ the output, JSON and pcap, containers, and troubleshooting.
   Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 (curl's HTTP/3)
   and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.
+- **Runtimes:** curl, Python, Ruby, PHP, Node.js (official builds too), .NET,
+  Go, Rust and Bun programs; not Java, Erlang or Deno
+  ([docs/how-it-works.md](docs/how-it-works.md#languages-and-runtimes)).
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
   symbols and is found by signature, and Firefox. Their HTTP/3 too.
 - **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded,

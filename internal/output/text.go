@@ -23,10 +23,11 @@ type Printer interface {
 // Text prints events for humans: a header line per call followed by the
 // payload, decoded if it is HTTP, and hex-dumped if it is binary.
 type Text struct {
-	w      io.Writer
-	opts   Options
-	dec    decoders
-	hidden int
+	w        io.Writer
+	opts     Options
+	dec      decoders
+	hidden   int
+	filtered int
 
 	dim, title, fn, write, read, header, warn func(a ...any) string
 }
@@ -60,9 +61,16 @@ func NewText(w io.Writer, opts Options) *Text {
 // connection going.
 func (t *Text) Hidden() int { return t.hidden }
 
+// Filtered returns how many events Options.Filter left out so far.
+func (t *Text) Filtered() int { return t.filtered }
+
 func (t *Text) Print(ev *tracer.Event) error {
 	dc := t.dec.decode(ev)
 	if dc.notice {
+		return nil
+	}
+	if dc.filteredOut {
+		t.filtered++
 		return nil
 	}
 	if !t.opts.Verbose && dc.housekeeping() {
@@ -99,6 +107,9 @@ func (t *Text) Print(ev *tracer.Event) error {
 
 	if dc.note != "" {
 		fmt.Fprintln(&b, t.warn("["+dc.note+"]"))
+	}
+	if dc.answers != "" {
+		fmt.Fprintln(&b, t.dim("["+dc.answers+"]"))
 	}
 	switch {
 	case t.opts.Hex:
