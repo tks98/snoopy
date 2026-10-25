@@ -78,11 +78,20 @@ HTTPS:
 | Bun | BoringSSL, built in | yes |
 | Chrome, Firefox, Electron apps | BoringSSL, NSS | yes, HTTP/3 too |
 | Deno | rustls, in a stripped binary | no: rustls is found by its symbols |
-| Java (OpenJDK) | JSSE, written in Java | no |
+| Java with Netty's netty-tcnative (gRPC-Java and Netty, when it's there) | BoringSSL in a JNI library, extracted to a temporary file | yes, found when the JVM loads it, however late |
+| Java with Conscrypt | BoringSSL in a JNI library, stripped | yes, found by signature |
+| Java (OpenJDK), otherwise | JSSE, written in Java | no ([plan-java.md](plan-java.md)) |
 | Erlang, Elixir | OTP's `ssl`, written in Erlang | no |
 
+A TLS library a process loads after it started, such as the ones a JVM
+extracts and loads the first time it needs TLS, is found when it's mapped:
+the BPF program tells user space when a process it traces maps a file whose
+name is a TLS library's, and with `--comm`, `--pid` or `--container` the
+thread that loaded it is held until snoopy has attached to it, so its first
+connection isn't missed.
+
 Not supported: rustls under tokio with providers other than aws-lc-rs and
-ring, Java, Erlang's `ssl`, stripped TLS
+ring, Java's own JSSE, Erlang's `ssl`, stripped TLS
 libraries other than
 BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn, ngtcp2 and quic-go (quiche, for
 example), programs that use OpenSSL only through its BIO layer (e.g.
