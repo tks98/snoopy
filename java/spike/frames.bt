@@ -1,0 +1,15 @@
+// The spike's temporary consumer: prints the agent's frames, as
+// "F conn seq dir kind orig cap <payload hex> pid". On raw_syscalls, like
+// snoopy's own program: syscalls:sys_enter_write missed most writes on a
+// 7.0 kernel. The write syscall is 64 on arm64, 1 on x86-64.
+config = { max_strlen = 4200 }
+
+tracepoint:raw_syscalls:sys_enter /(args.id == 64 || args.id == 1) && args.args[2] >= 88/ {
+	$p = args.args[1];
+	if (*(uint64 *)uptr($p) == 0x3130564a59504e53) {
+		$cap = *(uint32 *)uptr($p + 40);
+		printf("F %d %d %d %d %d %d %rx %d\n", *(uint64 *)uptr($p + 16), *(uint64 *)uptr($p + 24),
+			*(uint8 *)uptr($p + 32), *(uint8 *)uptr($p + 33), *(uint32 *)uptr($p + 36), $cap,
+			buf(uptr($p + 88), $cap), pid);
+	}
+}

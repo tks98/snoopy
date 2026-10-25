@@ -31,6 +31,18 @@ arch=$(go env GOARCH)
 mkdir -p "$tmp/image/linux/$arch"
 (cd "$root" && CGO_ENABLED=0 go build -trimpath -o "$tmp/image/linux/$arch/snoopy" .)
 cp "$root/Dockerfile" "$tmp/image/"
+# The Dockerfile copies the Java agent's jars too: built if there's a JDK,
+# else empty, which this test (no --java) doesn't mind.
+mkdir -p "$tmp/image/java/out"
+java=false
+if command -v javac >/dev/null && sh "$root/java/build.sh" >/dev/null 2>&1; then
+	cp "$root"/java/out/snoopy-*.jar "$tmp/image/java/out/"
+	java=true
+elif [ -n "${SNOOPY_E2E_JAVA:-}" ]; then
+	fail "SNOOPY_E2E_JAVA is set, but the Java agent can't be built here (no JDK 17 or later?)"
+else
+	touch "$tmp/image/java/out/snoopy-agent.jar" "$tmp/image/java/out/snoopy-hooks.jar"
+fi
 docker build -q --build-arg "TARGETPLATFORM=linux/$arch" -t "$image" "$tmp/image" >/dev/null
 kind load docker-image "$image" --name "$cluster" >/dev/null
 (cd "$here" && go build -o "$tmp/kubectl-snoopy" .)
@@ -103,6 +115,68 @@ for i in $(seq 30); do
 done
 [ "$left" -eq 0 ] || fail "$left snoopy pods left behind after following"
 kubectl delete deployment clients --wait=false >/dev/null
+
+if $java; then
+	echo "== --java: a JVM's own TLS, in a pod running as another user"
+	cat > "$tmp/Loop.java" <<'JAVA'
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+
+// Requests https://example.com every second through java.net.http, which
+// is SunJSSE's SSLEngine.
+public class Loop {
+    public static void main(String[] args) throws Exception {
+        HttpClient c = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+        while (true) {
+            try {
+                c.send(HttpRequest.newBuilder(URI.create("https://example.com/")).build(), HttpResponse.BodyHandlers.discarding());
+            } catch (Exception e) {
+                System.err.println(e);
+            }
+            Thread.sleep(1000);
+        }
+    }
+}
+JAVA
+	kubectl delete pod javaclient --ignore-not-found --wait >/dev/null
+	kubectl create configmap javaclient --from-file="$tmp/Loop.java" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: javaclient
+spec:
+  securityContext:
+    runAsUser: 65534
+    runAsGroup: 65534
+  containers:
+    - name: java
+      image: eclipse-temurin:21-jdk
+      command: [java, /src/Loop.java]
+      volumeMounts:
+        - { name: src, mountPath: /src }
+  volumes:
+    - name: src
+      configMap: { name: javaclient }
+YAML
+	kubectl wait --for=condition=Ready pod/javaclient --timeout=300s >/dev/null
+	sleep 5 # the JVM compiling Loop.java and getting going
+	status=0
+	timeout 180 "$tmp/kubectl-snoopy" javaclient --image "$image" --java --json --count 4 > "$tmp/out.json" 2> "$tmp/err" || status=$?
+	if [ "$status" -ne 0 ]; then
+		cat "$tmp/err" >&2
+		fail "kubectl snoopy --java exited with $status"
+	fi
+	grep -v '^{' "$tmp/err" || true
+	engine=$(grep -c '"function":"SSLEngine' "$tmp/out.json" || true)
+	named=$(grep '"function":"SSLEngine' "$tmp/out.json" | grep -c '"container_name":"javaclient/java"' || true)
+	echo "SSLEngine events: $engine, named javaclient/java: $named"
+	[ "$engine" -ge 4 ] || fail "expected 4 SSLEngine events"
+	[ "$named" -eq "$engine" ] || fail "SSLEngine events without the pod's container name"
+	kubectl delete pod javaclient --wait=false >/dev/null
+fi
 
 echo "== a namespace that doesn't allow privileged pods"
 kubectl create namespace restricted --dry-run=client -o yaml | kubectl apply -f - >/dev/null

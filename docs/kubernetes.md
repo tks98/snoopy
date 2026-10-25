@@ -41,6 +41,7 @@ kubectl snoopy deploy/checkout -n shop --status 5xx   # only failed responses
 kubectl snoopy -l app=checkout -n shop   # every pod with these labels
 kubectl snoopy POD --brief               # one line per call
 kubectl snoopy POD --json --port 443     # JSON, port 443 only
+kubectl snoopy deploy/checkout --java    # Java's own TLS too, through snoopy's agent
 kubectl snoopy POD -- --max-size 65536   # any of snoopy's flags, after --
 kubectl snoopy POD -- --quiet --har - > requests.har   # a HAR file, when you stop it
 kubectl snoopy --cleanup                 # delete snoopy pods left behind
@@ -61,12 +62,19 @@ are all gone is deleted. A new container's first calls can be missed while
 its snoopy pod starts. `--no-follow` traces only what's running at the
 start; with `--count`, which applies to each snoopy pod, it doesn't follow.
 
-`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--redact`, `--method`,
-`--path`, `--status`, `--host`, `--port` and `--count` are snoopy's own and
-are passed on; the rest of snoopy's flags go
+`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--redact`, `--java`,
+`--method`, `--path`, `--status`, `--host`, `--port` and `--count` are
+snoopy's own and are passed on; the rest of snoopy's flags go
 after `--` ([usage.md](usage.md) has them all). kubectl's usual flags
 (`-n`, `--context`, `--kubeconfig`) work as they do for kubectl. Ctrl-C
 stops it.
+
+`--java` loads snoopy's Java agent into the JVMs in the pods' containers,
+for Java's own TLS (SunJSSE), which isn't a library snoopy can probe
+([how-it-works.md](how-it-works.md#java-and-jsse)). The JVMs need a
+writable `/tmp`, which a pod with `readOnlyRootFilesystem` gets from an
+`emptyDir` there. The agent stays in a JVM, idle, after you stop; a
+container that restarts starts without it.
 
 ## What it does
 
@@ -139,8 +147,8 @@ by.
 - **"snoopy's container can't start: ErrImagePull":** the node can't pull
   the image; mirror it and use `--image`.
 - **Nothing shows:** the pod's TLS may be in something snoopy doesn't trace
-  (Java's, for one; see [how-it-works.md](how-it-works.md)), or it made no
-  calls while you watched. `-- --verbose` shows what snoopy attached to.
+  (see [how-it-works.md](how-it-works.md); Java's own needs `--java`), or it
+  made no calls while you watched. `-- --verbose` shows what snoopy attached to.
 - **A snoopy pod was left behind** (the plugin was killed): `kubectl snoopy
   --cleanup`, or wait for `--max-duration`.
 

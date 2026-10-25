@@ -68,8 +68,9 @@ the output, JSON and pcap, containers, and troubleshooting.
   and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.
 - **Runtimes:** curl, Python, Ruby, PHP, Node.js (official builds too), .NET,
-  Go, Rust and Bun programs, and Java with Netty's netty-tcnative (gRPC-Java)
-  or Conscrypt; not Java's own JSSE, Erlang or Deno
+  Go, Rust and Bun programs, and Java: with Netty's netty-tcnative (gRPC-Java)
+  or Conscrypt as is, and Java's own TLS (JSSE) with `--java`, which loads a
+  small agent into the JVM; not Erlang or Deno
   ([docs/how-it-works.md](docs/how-it-works.md#languages-and-runtimes)).
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
   symbols and is found by signature, and Firefox. Their HTTP/3 too.

@@ -68,6 +68,12 @@ Output:
 
 Capture:
   --max-size BYTES   bytes to capture per call (default 16384, at most 1048576)
+  --java             also Java's own TLS (SunJSSE) in the --pid JVM, or the
+                     JVMs in the --container containers, by loading
+                     snoopy's agent into them (it stays loaded, idle,
+                     after snoopy stops)
+  --java-agent DIR   the directory with the agent's jars (default: next to
+                     snoopy, or java/out in a source tree)
   --lib PATH         also attach to this library or program, e.g. one with
                      OpenSSL linked in statically (repeatable)
   --no-scan          only attach to system libraries and --lib, not to what
@@ -310,6 +316,41 @@ combined with `--hex` or `--pcap`, which show data as sent: there, HTTP/2's
 and HTTP/3's headers are compressed, and can't be masked reliably. It
 catches what's recognizable, not everything a program might consider
 secret, so read output before sharing it anyway.
+
+## Java
+
+Java programs whose TLS is native (Netty's tcnative, Conscrypt) are traced
+like any other program. Java's own TLS, SunJSSE, has no native library to
+attach to, so with `--java` snoopy loads a small agent into the JVM given
+with `--pid`, which reports what `SSLSocket` and `SSLEngine` read and wrote
+(through `java.net.http.HttpClient` too):
+
+```sh
+sudo snoopy --java --pid "$(pgrep -f my-service.jar)"
+```
+
+The agent is two jars, `snoopy-agent.jar` and `snoopy-hooks.jar`, which
+snoopy looks for next to itself: they're in the release archives, in the
+image (at `/usr/share/snoopy/java`) and attached to each release on their
+own, with checksums. A snoopy from `go install` doesn't have them; take
+them from the release, or build them with `java/build.sh` (JDK 21 or
+later, into `java/out`), and point `--java-agent` at their directory.
+
+This is experimental: tested with HotSpot 17, 21 and 25 on Linux (x86-64
+and arm64), for JVMs of any user on the host or in containers (Docker, a
+user namespace as in rootless containers), with `SSLSocket`, `HttpClient` over
+HTTP/1.1 and HTTP/2, gRPC's framing over HTTP/2, `SSLEngine` with heap,
+direct, sliced, read-only, gathered and scattered buffers, and connections
+on virtual threads. As with any program, an HTTP/2 connection that was open
+before snoopy started shows its frames and bodies but not its headers. The JVM needs attaching left on, which it is by default
+(`-XX:+DisableAttachMechanism` turns it off; snoopy checks before
+signalling it), and a writable `/tmp`, where it makes its attach socket and
+snoopy puts the agent's jars (`/tmp/.snoopy-java-*`, kept for later runs);
+a container with a read-only root needs a tmpfs there. For a container,
+give `--pid` the JVM's PID as the host sees it. The agent can't be unloaded: when snoopy stops, it stops
+capturing and stays in the JVM, idle, until it exits. `SSLEngine` calls
+have no socket, so they show no addresses, and `--host` and `--port` don't
+match them.
 
 ## Containers and Kubernetes
 

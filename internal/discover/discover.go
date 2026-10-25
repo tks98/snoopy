@@ -33,6 +33,7 @@ const (
 	S2N
 	Rustls
 	NGTCP2 // its crypto library's packet protection, for QUIC (curl's HTTP/3)
+	JSSE   // Java's SunJSSE, through snoopy's Java agent rather than probes
 )
 
 func (l Library) String() string {
@@ -55,6 +56,8 @@ func (l Library) String() string {
 		return "rustls"
 	case NGTCP2:
 		return "ngtcp2"
+	case JSSE:
+		return "jsse"
 	}
 	return "unknown"
 }

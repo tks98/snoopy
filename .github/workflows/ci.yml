@@ -1,8 +1,14 @@
 name: CI
 
+# On pull requests, and on main once merged; not on every branch push too,
+# which ran everything twice for a pull request's commits. Docs alone don't
+# need it.
 on:
   push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**"]
   workflow_dispatch:
 
 permissions:
@@ -77,7 +83,8 @@ jobs:
       - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
       - name: Run (as root)
         working-directory: internal/tracer
-        run: sudo ./tracer.test -test.v -test.timeout 5m
+        # TestJSSE has a job of its own, for each JDK.
+        run: sudo ./tracer.test -test.v -test.timeout 5m -test.skip TestJSSE
       # --quiet: the runner's own TLS traffic, including its credentials,
       # must not end up in the (public) log.
       - name: Smoke-test the binary
@@ -85,3 +92,27 @@ jobs:
           go build -o snoopy .
           ./snoopy --version
           sudo timeout -s INT 5 ./snoopy --no-scan --quiet || [ $? -eq 124 ]
+
+  java:
+    name: Java agent (JDK ${{ matrix.jdk }}, ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        jdk: [17, 21, 25]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk }}
+      - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      - name: Run TestJSSE (as root)
+        working-directory: internal/tracer
+        # With PATH, which sudo would reset, for setup-java's JDK; and
+        # SNOOPY_TEST_JAVA, so that it fails rather than skips without one.
+        run: sudo env PATH="$PATH" SNOOPY_TEST_JAVA=1 ./tracer.test -test.v -test.timeout 5m -test.run TestJSSE

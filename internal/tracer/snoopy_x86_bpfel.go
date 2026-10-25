@@ -101,6 +101,13 @@ type snoopyIoThread struct {
 	DgramEnd   uint64
 }
 
+type snoopyJavaSession struct {
+	_     structs.HostLayout
+	Nonce uint64
+	Fd    int32
+	Pad   uint32
+}
+
 type snoopyQuicProc struct {
 	_          structs.HostLayout
 	LastRecvFd int32
@@ -144,6 +151,7 @@ const (
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
 	snoopyMapIoThreads              = "io_threads"
+	snoopyMapJavaSessions           = "java_sessions"
 	snoopyMapLastWakeup             = "last_wakeup"
 	snoopyMapQuicProcs              = "quic_procs"
 	snoopyMapQuicTraffic            = "quic_traffic"
@@ -299,6 +307,7 @@ type snoopyMapSpecs struct {
 	Events        *ebpf.MapSpec `ebpf:"events"`
 	Execs         *ebpf.MapSpec `ebpf:"execs"`
 	IoThreads     *ebpf.MapSpec `ebpf:"io_threads"`
+	JavaSessions  *ebpf.MapSpec `ebpf:"java_sessions"`
 	LastWakeup    *ebpf.MapSpec `ebpf:"last_wakeup"`
 	QuicProcs     *ebpf.MapSpec `ebpf:"quic_procs"`
 	QuicTraffic   *ebpf.MapSpec `ebpf:"quic_traffic"`
@@ -350,6 +359,7 @@ type snoopyMaps struct {
 	Events        *ebpf.Map `ebpf:"events"`
 	Execs         *ebpf.Map `ebpf:"execs"`
 	IoThreads     *ebpf.Map `ebpf:"io_threads"`
+	JavaSessions  *ebpf.Map `ebpf:"java_sessions"`
 	LastWakeup    *ebpf.Map `ebpf:"last_wakeup"`
 	QuicProcs     *ebpf.Map `ebpf:"quic_procs"`
 	QuicTraffic   *ebpf.Map `ebpf:"quic_traffic"`
@@ -369,6 +379,7 @@ func (m *snoopyMaps) Close() error {
 		m.Events,
 		m.Execs,
 		m.IoThreads,
+		m.JavaSessions,
 		m.LastWakeup,
 		m.QuicProcs,
 		m.QuicTraffic,

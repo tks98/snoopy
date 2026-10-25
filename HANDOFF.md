@@ -67,6 +67,13 @@ compile for darwin, and `go test ./...` fails on macOS. Work inside a Linux VM:
 - From macOS you can still cross-check that things build:
   `GOOS=linux go build ./... && GOOS=linux go vet ./...`.
 
+CI's jobs run locally too, with `tools/act.sh` and act (`brew install act`,
+0.2.89 or later for node24 actions), in Docker Desktop on the Mac, whose
+Linux kernel has the BTF the BPF tests need: `tools/act.sh -W
+.github/workflows/ci.yml -j integration` ran the integration tests on it,
+as root, in about two minutes. Only arm64, the Mac's architecture; jobs
+with x86-64 in their matrix run there only. The script's comments have more.
+
 Running other kernels (vimto) needs QEMU. Without KVM it is slow but works:
 `VIMTO_DISABLE_KVM=true make integration-vm KERNEL=5.10` took about a minute
 per kernel here. Nested virtualization in a Mac VM needs an M3 or newer and
@@ -111,7 +118,10 @@ signature finding against real binaries (see
 | `internal/funcfind/` | Locates functions in stripped x86-64 and arm64 binaries by the strings and constants they use (`x86.go`, `arm64.go`) |
 | `internal/procinfo/` | Container ID from cgroups; `/proc` socket lookup (fallback when there's no BTF) |
 | `internal/output/` | Text, NDJSON and pcap writers; HTTP/1 message framing (`http1.go`), HTTP/2 with HPACK (`http2.go`), gRPC messages and schema-less protobuf (`grpc.go`), QUIC and HTTP/3 with QPACK (`quic.go`, `qpack.go`), body decompression (`body.go`) |
+| `internal/javaagent/` | `--java`: staging the agent's jars in a JVM's `/tmp`, and HotSpot's attach protocol, in Go |
+| `java/` | The Java agent (`agent/src`: the ASM transformer and `Hooks`, which writes frames to `/dev/null`), `build.sh`, and the spike's tools |
 | `main.go` | CLI flags and wiring |
+| `java.go` | `--java`: which JVMs, loading the agent into them, stopping it |
 | `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64) |
 | `.github/workflows/release.yml`, `.goreleaser.yaml` | Releases on `v*` tags |
 | `.vimto.toml` | VM settings for kernel-matrix tests (root, 2 GB, loopback up) |
@@ -437,7 +447,7 @@ signature finding against real binaries (see
   before a new library is attached are missed, and so are those of
   libraries a long-running process `dlopen`s more than 3 s after its exec.
 - **Not supported:** rustls under tokio with providers other than aws-lc-rs
-  and ring (`Reader::read` is inlined into tokio-rustls), Java, QUIC/HTTP/3
+  and ring (`Reader::read` is inlined into tokio-rustls), QUIC/HTTP/3
   outside Chromium, Firefox, quinn, ngtcp2 and quic-go, Firefox's QUIC with
   ChaCha20-Poly1305 (which, a spike showed, reaches freebl's HACL* Poly1305
   without going through its exported `ChaCha20Poly1305_Seal`/`Open`/
@@ -452,7 +462,11 @@ signature finding against real binaries (see
 - **HTTP/1 pipelining:** a response is matched to the last request sent, so
   with pipelined requests a response to HEAD can be taken to have a body.
 - **No socket details** (fd or addresses) for apps that do their own socket
-  I/O around OpenSSL with memory BIOs, e.g. .NET.
+  I/O around OpenSSL with memory BIOs, e.g. .NET, nor for Java's `SSLEngine`.
+- **Java's JSSE needs `--java`,** which loads snoopy's agent into the JVM
+  (docs/how-it-works.md, "Java and JSSE"). It can't be unloaded, only told
+  to stop. Not covered: writes that throw part way, kernels without BTF
+  (untested), and the agent's own lost frames, which aren't reported.
 - **Untested:**
   - IPv6 end to end: the dev container had IPv6 disabled. Unit tests cover the
     decoding.
@@ -462,8 +476,6 @@ signature finding against real binaries (see
 - **Ideas:**
   - rustls under tokio with ring, and HTTP/3 in curl and Go:
     docs/plan-rustls-http3.md.
-  - Java's TLS (JSSE), a big gap but hard: the code is JIT-compiled.
-  - Publish a container image (the static binary makes it trivial).
   - An `--sslkeylog` mode.
   - A flag for the ring buffer size (`tracer.Options.RingBufferSize` exists,
     but there's no CLI flag).

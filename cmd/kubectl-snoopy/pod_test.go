@@ -120,8 +120,8 @@ func TestExplainCreate(t *testing.T) {
 }
 
 func TestPassed(t *testing.T) {
-	o := &options{brief: true, verbose: true, hosts: []string{"example.com"}, ports: []string{"443"}, count: 3}
-	want := []string{"--brief", "--verbose", "--host", "example.com", "--port", "443", "--count", "3"}
+	o := &options{brief: true, verbose: true, java: true, hosts: []string{"example.com"}, ports: []string{"443"}, count: 3}
+	want := []string{"--brief", "--java", "--verbose", "--host", "example.com", "--port", "443", "--count", "3"}
 	if got := o.passed(); !reflect.DeepEqual(got, want) {
 		t.Errorf("got %q", got)
 	}

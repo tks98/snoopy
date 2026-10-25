@@ -57,6 +57,8 @@ type config struct {
 	noColor    bool
 	verbose    bool
 	version    bool
+	java       bool
+	javaAgent  string
 }
 
 // containerList is --container's: IDs or ID prefixes, each optionally with
@@ -168,6 +170,12 @@ Output:
 
 Capture:
   --max-size BYTES   bytes to capture per call (default %d, at most %d)
+  --java             also Java's own TLS (SunJSSE) in the --pid JVM, or the
+                     JVMs in the --container containers, by loading
+                     snoopy's agent into them (it stays loaded, idle,
+                     after snoopy stops)
+  --java-agent DIR   the directory with the agent's jars (default: next to
+                     snoopy, or java/out in a source tree)
   --lib PATH         also attach to this library or program, e.g. one with
                      OpenSSL linked in statically (repeatable)
   --no-scan          only attach to system libraries and --lib, not to what
@@ -215,6 +223,8 @@ func flags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.BoolVar(&c.noColor, "no-color", false, "")
 	fs.BoolVar(&c.verbose, "verbose", false, "")
 	fs.BoolVar(&c.version, "version", false, "")
+	fs.BoolVar(&c.java, "java", false, "")
+	fs.StringVar(&c.javaAgent, "java-agent", "", "")
 	return fs
 }
 
@@ -232,6 +242,15 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	}
 	if c.count < 0 {
 		return c, errors.New("--count must be positive")
+	}
+	if c.java && c.pid == 0 && len(c.containers) == 0 {
+		return c, errors.New("--java needs --pid or --container: snoopy loads its agent only into JVMs it's given")
+	}
+	if c.java && c.pid != 0 && len(c.containers) > 0 {
+		return c, errors.New("--java takes --pid or --container, not both")
+	}
+	if c.javaAgent != "" && !c.java {
+		return c, errors.New("--java-agent is for --java")
 	}
 	var output []string
 	for name, set := range map[string]bool{"--brief": c.brief, "--json": c.json, "--hex": c.hex, "--full": c.full} {
@@ -455,6 +474,8 @@ func run(cfg config) error {
 		}
 	}
 	switch {
+	case len(attached) == 0 && cfg.java:
+		// SunJSSE needs no library, which a JVM may not have.
 	case len(attached) == 0 && t.PerProcess():
 		logf("no process to trace is running yet; attaching to them as they start")
 	case len(attached) == 0:
@@ -502,6 +523,13 @@ func run(cfg config) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if cfg.java {
+		stopJava, err := startJava(ctx, cfg, t)
+		if err != nil {
+			return err
+		}
+		defer stopJava()
+	}
 	quic := &quicSeen{pids: map[uint32]bool{}}
 	go watchCounters(ctx, t, quic)
 	if cfg.pid != 0 && !t.ResolvesAddresses() {

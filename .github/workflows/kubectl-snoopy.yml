@@ -3,7 +3,9 @@ name: kubectl snoopy
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**"]
   workflow_dispatch:
 
 permissions:
@@ -57,4 +59,11 @@ jobs:
         run: |
           curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
           sudo install kind /usr/local/bin/kind
+      # For the Java agent's jars in the image, and its part of the test.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
       - run: cmd/kubectl-snoopy/e2e.sh
+        env:
+          SNOOPY_E2E_JAVA: "1"

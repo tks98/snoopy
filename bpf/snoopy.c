@@ -69,6 +69,11 @@ enum fn_id {
 	// QUIC packets through Go's AEADs (quic-go).
 	FN_GO_QUIC_SEND,
 	FN_GO_QUIC_RECV,
+	// SunJSSE, through snoopy's Java agent (see note_java_frame).
+	FN_JSSE_SOCKET_READ,
+	FN_JSSE_SOCKET_WRITE,
+	FN_JSSE_ENGINE_UNWRAP,
+	FN_JSSE_ENGINE_WRAP,
 };
 
 // A header-only record that isn't a call: a connection whose earlier events
@@ -583,6 +588,26 @@ static __always_inline __u64 submit_flags(__u64 now)
 	return BPF_RB_FORCE_WAKEUP;
 }
 
+// Outputs h->captured bytes from buf, as records of up to CHUNK_SIZE.
+static __always_inline void output_chunks(struct event_header *h, __u64 buf, __u64 flags)
+{
+	__u32 captured = h->captured;
+	for (__u32 i = 0; i < MAX_CHUNKS; i++) {
+		__u32 off = i * CHUNK_SIZE;
+		if (off >= captured)
+			break;
+
+		__u32 len = captured - off;
+		const void *src = (const void *)(buf + off);
+		h->chunk_offset = off;
+		int err = len > CHUNK_SIZE ? output_full_chunk(h, src, flags) : output_last_chunk(h, src, len, flags);
+		if (err == -2)
+			count_lost();
+		if (err || len <= CHUNK_SIZE)
+			break;
+	}
+}
+
 static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
 {
 	if (n <= 0)
@@ -627,24 +652,8 @@ static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64
 			h.quic_header_len = len;
 	}
 
-	__u32 captured = h.size < max_capture ? h.size : max_capture;
-	h.captured = captured;
-	__u64 flags = submit_flags(now);
-
-	for (__u32 i = 0; i < MAX_CHUNKS; i++) {
-		__u32 off = i * CHUNK_SIZE;
-		if (off >= captured)
-			break;
-
-		__u32 len = captured - off;
-		const void *src = (const void *)(call->buf + off);
-		h.chunk_offset = off;
-		int err = len > CHUNK_SIZE ? output_full_chunk(&h, src, flags) : output_last_chunk(&h, src, len, flags);
-		if (err == -2)
-			count_lost();
-		if (err || len <= CHUNK_SIZE)
-			break;
-	}
+	h.captured = h.size < max_capture ? h.size : max_capture;
+	output_chunks(&h, call->buf, submit_flags(now));
 }
 
 /* Bookkeeping for calls in flight */
@@ -887,6 +896,7 @@ static __always_inline int record_fd(__u64 fd)
 enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #if defined(__TARGET_ARCH_x86)
 #define SYS_MMAP 9
+#define SYS_WRITE 1
 #define SYSCALL_FD(regs) ((regs)->di)
 #define SYSCALL_ARG1(regs) ((regs)->si)
 #define SYSCALL_ARG2(regs) ((regs)->dx)
@@ -905,6 +915,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #define IS_DATAGRAM_IO(id) ((id) >= 44 && (id) <= 47 || (id) == 299 || (id) == 307)
 #elif defined(__TARGET_ARCH_arm64)
 #define SYS_MMAP 222
+#define SYS_WRITE 64
 #define SYSCALL_FD(regs) ((regs)->orig_x0)
 #define SYSCALL_ARG1(regs) ((regs)->user_regs.regs[1])
 #define SYSCALL_ARG2(regs) ((regs)->user_regs.regs[2])
@@ -1369,6 +1380,131 @@ static __always_inline void note_library_load(struct pt_regs *regs)
 
 // raw_syscalls:sys_enter(struct pt_regs *regs, long id). A raw tracepoint
 // needs neither tracefs nor BTF, unlike the per-syscall tracepoints.
+/* SunJSSE, through snoopy's Java agent */
+
+// The agent (java/agent) writes what SunJSSE's application calls read and
+// wrote as frames, a struct java_frame and the payload, to a descriptor for
+// /dev/null, on the calling thread; they're picked up here, before the
+// write goes anywhere. A process's frames count only once user space has
+// registered its session (java_sessions, by PID as snoopy sees it), with
+// the nonce the agent was started with, and, with BTF, only on the null
+// device; the first one fixes the descriptor. They're kept out of the
+// socket tracking below.
+#define JAVA_FRAME_MAGIC 0x3130564a59504e53ULL // "SNPYJV01"
+#define JAVA_KIND_SOCKET 0
+#define JAVA_KIND_ENGINE 1
+#define JAVA_READ 1
+// Java connection IDs are the agent's own numbers: tagged, so they can't be
+// taken for a native library's handle.
+#define JAVA_CONN_TAG (0x4aULL << 56)
+#define S_IFCHR 0020000
+#define NULL_RDEV ((1u << 20) | 3) // 1:3, in the kernel's dev_t encoding
+
+struct java_frame {
+	__u64 magic;
+	__u64 nonce;
+	__u64 conn;	  // the agent's ID for the SSLSocket or SSLEngine
+	__u64 seq;	  // the agent's frame count, for spotting gaps
+	__u8 dir;	  // JAVA_READ, or 0 for writes
+	__u8 kind;	  // JAVA_KIND_*
+	__u16 family;	  // AF_INET, AF_INET6, or 0 if the addresses are unknown
+	__u32 size;	  // bytes the call transferred
+	__u32 captured;	  // bytes of them that follow
+	__u16 lport;
+	__u16 rport;
+	__u8 laddr[16];
+	__u8 raddr[16];
+	__u64 latency_ns; // time spent inside the call
+};
+
+struct java_session {
+	__u64 nonce;
+	__s32 fd; // the agent's descriptor, once its first frame is seen; -1 before
+	__u32 _pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u32); // host TGID
+	__type(value, struct java_session);
+} java_sessions SEC(".maps");
+
+static __always_inline bool null_device(__s32 fd)
+{
+	struct file *file = file_at(fd);
+	if (!file)
+		return false;
+	struct inode *inode = BPF_CORE_READ(file, f_inode);
+	return (BPF_CORE_READ(inode, i_mode) & S_IFMT) == S_IFCHR && BPF_CORE_READ(inode, i_rdev) == NULL_RDEV;
+}
+
+// Reports whether a write is a frame of a registered agent, and if so
+// outputs its events.
+static __always_inline bool note_java_frame(struct pt_regs *regs)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	// Sessions are by PID as snoopy sees it, in its own PID namespace if
+	// it's in one (a pod with the node's, in kind, is nested).
+	__u64 ns = pidns_ino ? ns_pid_tgid() : pid_tgid;
+	if (!ns)
+		return false;
+	__u32 tgid = ns >> 32;
+	struct java_session *s = bpf_map_lookup_elem(&java_sessions, &tgid);
+	if (!s)
+		return false;
+	__u64 fd = 0, buf = 0, count = 0;
+	if (bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD(regs)) ||
+	    bpf_probe_read_kernel(&buf, sizeof(buf), &SYSCALL_ARG1(regs)) ||
+	    bpf_probe_read_kernel(&count, sizeof(count), &SYSCALL_ARG2(regs)))
+		return false;
+	if (count < sizeof(struct java_frame) || (s->fd >= 0 && (__s32)fd != s->fd))
+		return false;
+	struct java_frame f;
+	if (bpf_probe_read_user(&f, sizeof(f), (void *)buf) || f.magic != JAVA_FRAME_MAGIC || f.nonce != s->nonce)
+		return false;
+	if (have_btf && !null_device((__s32)fd))
+		return false;
+	s->fd = (__s32)fd;
+	if (!f.size)
+		return true; // the agent's first frame, saying it's ready
+
+	struct event_header h;
+	__builtin_memset(&h, 0, sizeof(h));
+	__u64 now = bpf_ktime_get_ns();
+	h.timestamp_ns = now;
+	h.latency_ns = f.latency_ns;
+	h.conn_id = f.conn | JAVA_CONN_TAG;
+	h.pid = ns >> 32;
+	h.tid = (__u32)ns;
+	h.size = f.size;
+	if (f.kind == JAVA_KIND_ENGINE)
+		h.fn = f.dir == JAVA_READ ? FN_JSSE_ENGINE_UNWRAP : FN_JSSE_ENGINE_WRAP;
+	else
+		h.fn = f.dir == JAVA_READ ? FN_JSSE_SOCKET_READ : FN_JSSE_SOCKET_WRITE;
+	get_process_name(h.comm);
+	h.fd = -1;
+	if (f.family == AF_INET || f.family == AF_INET6) {
+		h.family = f.family;
+		h.lport = f.lport;
+		h.rport = f.rport;
+		__builtin_memcpy(h.laddr, f.laddr, sizeof(h.laddr));
+		__builtin_memcpy(h.raddr, f.raddr, sizeof(h.raddr));
+	}
+	// What follows the header, at most what the call transferred and
+	// snoopy's own limit.
+	__u32 captured = f.captured;
+	if (captured > count - sizeof(f))
+		captured = count - sizeof(f);
+	if (captured > f.size)
+		captured = f.size;
+	if (captured > max_capture)
+		captured = max_capture;
+	h.captured = captured;
+	output_chunks(&h, buf + sizeof(f), submit_flags(now));
+	return true;
+}
+
 SEC("raw_tracepoint/sys_enter")
 int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
@@ -1381,6 +1517,8 @@ int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 
 	struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
+	if (id == SYS_WRITE && note_java_frame(regs))
+		return 0;
 	__u64 fd = 0;
 	if (bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD(regs)))
 		return 0;

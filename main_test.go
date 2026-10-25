@@ -23,6 +23,12 @@ func TestParseFlags(t *testing.T) {
 		t.Errorf("got %+v", c)
 	}
 
+	for _, args := range [][]string{{"--java", "--pid", "1"}, {"--java", "--container", "abc", "--java-agent", "/x"}} {
+		if c, err := parseFlags(args, io.Discard); err != nil || !c.java {
+			t.Errorf("%q: %+v, %v", args, c, err)
+		}
+	}
+
 	c, err = parseFlags(nil, io.Discard)
 	if err != nil || c.maxSize != tracer.DefaultMaxCapture || c.pid != 0 || c.json {
 		t.Errorf("defaults: %+v, %v", c, err)
@@ -53,6 +59,10 @@ func TestParseFlags(t *testing.T) {
 		{"--redact", "--pcap", "out.pcap"},
 		{"extra"},
 		{"--nope"},
+		{"--java"},
+		{"--java", "--comm", "java"},
+		{"--java", "--pid", "1", "--container", "abc"},
+		{"--java-agent", "/x"},
 	} {
 		if _, err := parseFlags(args, io.Discard); err == nil {
 			t.Errorf("%q: no error", args)

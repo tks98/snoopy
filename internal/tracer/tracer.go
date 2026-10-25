@@ -197,6 +197,30 @@ func (t *Tracer) TracePID(pid uint32) error {
 	return nil
 }
 
+// RegisterJava makes the frames of snoopy's Java agent in process pid (as
+// snoopy sees it, in its PID namespace) count, those carrying nonce, the session's secret: the agent
+// writes them to /dev/null, and they become events like a TLS library's
+// calls. Register before loading the agent, so its first calls are seen.
+func (t *Tracer) RegisterJava(pid uint32, nonce uint64) error {
+	s := snoopyJavaSession{Nonce: nonce, Fd: -1}
+	if err := t.objs.JavaSessions.Update(pid, &s, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("register java session for pid %d: %w", pid, err)
+	}
+	return nil
+}
+
+// JavaReady reports whether process pid's agent has written a frame for its
+// session: its first says it's ready.
+func (t *Tracer) JavaReady(pid uint32) bool {
+	var s snoopyJavaSession
+	return t.objs.JavaSessions.Lookup(pid, &s) == nil && s.Fd >= 0
+}
+
+// UnregisterJava stops counting process pid's agent frames.
+func (t *Tracer) UnregisterJava(pid uint32) {
+	_ = t.objs.JavaSessions.Delete(pid)
+}
+
 // procPidInitIno is the inode of the kernel's own PID namespace, which is
 // fixed (PROC_PID_INIT_INO).
 const procPidInitIno = 0xEFFFFFFC

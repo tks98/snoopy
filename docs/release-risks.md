@@ -29,6 +29,7 @@ thing it depends on ships.
 | [Firefox HTTP/3 through freebl](#firefox-http3-through-freebl) | neqo's choice of crypto | rare | Quiet |
 | [rustls](#rustls) | rustls internals, rustc | 6 weeks (Rust) | Loud, or quiet |
 | [Go crypto/tls](#go-cryptotls) | Go's internal structs, pclntab | 6 months | Mostly loud |
+| [Java's JSSE (`--java`)](#javas-jsse---java) | OpenJDK's `sun.security.ssl` internals, class file versions | 6 months | Quiet |
 | [arm64 analysis in funcfind](#arm64-analysis-in-funcfind) | `golang.org/x/arch` updates | per bump | Partial |
 | [Committed BPF objects](#committed-bpf-objects) | clang version | on regenerate | Loud |
 
@@ -211,6 +212,27 @@ thing it depends on ships.
 - **Guarded by:** `TestArm64`, which runs in CI on hand-assembled code and
   would catch a change in what it covers. The freebl parsing is only checked
   by hand.
+
+### Java's JSSE (`--java`)
+
+- **Depends on:** SunJSSE's internal classes keeping their shape:
+  `sun.security.ssl.SSLSocketImpl$AppInputStream.read(byte[], int, int)`
+  and `$AppOutputStream.write(byte[], int, int)` with the `this$0` field
+  for their socket, and `SSLEngineImpl`'s six-argument `wrap` and `unwrap`,
+  which the shorter ones call. Also ASM knowing the JDK's class file
+  version, and HotSpot's attach protocol.
+- **Breaks when:** a JDK renames or restructures those methods, has the
+  shorter `wrap`/`unwrap` stop going through the six-argument ones, or
+  ships a class file version the agent's ASM doesn't read.
+- **How it shows:** a missing method is quiet in the agent, which only
+  instruments what matches, so `--java` loads and then captures nothing
+  for that path; a class file version ASM doesn't know makes the agent
+  print "not instrumenting" on the JVM's stderr. A changed delegation could
+  capture an engine call twice or not at all.
+- **Already seen:** nothing yet; the shapes are the same in 17, 21 and 25.
+- **Guarded by:** `TestJSSE`, in CI for JDK 17, 21 and 25 on x86-64 and
+  arm64, which checks bytes captured exactly once; and the kind e2e's Java
+  pod. A new JDK release needs adding there.
 
 ### Committed BPF objects
 

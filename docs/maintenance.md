@@ -17,6 +17,7 @@ sections after it use them.
 - [HTTP/3 in Firefox](#http3-in-firefox)
 - [rustls](#rustls)
 - [Go crypto/tls](#go-cryptotls)
+- [Java's JSSE (`--java`)](#javas-jsse---java)
 - [funcfind and golang.org/x/arch](#funcfind-and-golangorgxarch)
 - [The BPF program](#the-bpf-program)
 - [HTTP decoding and compressed bodies](#http-decoding-and-compressed-bodies)
@@ -719,6 +720,63 @@ Build the integration tests with the new Go version and run them:
 - **Not attached because of the prologue:** compare the new stack check with
   what `GoFunc.Body` expects (`go tool objdump -s 'crypto/tls.\(\*Conn\).Read' <binary>`).
 
+## Java's JSSE (`--java`)
+
+### How it was found
+
+Step 1 of [plan-java.md](plan-java.md), written up in
+[java-spike.md](java-spike.md). The JDK's sources say where application
+data crosses SunJSSE: `SSLSocketImpl`'s inner `AppInputStream` and
+`AppOutputStream`, and `SSLEngineImpl`'s `wrap` and `unwrap`. `javap`
+shows their shapes in a given JDK:
+
+```sh
+javap -p 'sun.security.ssl.SSLSocketImpl$AppInputStream' 'sun.security.ssl.SSLSocketImpl$AppOutputStream'
+javap -p -c sun.security.ssl.SSLEngineImpl | grep -A20 'public javax.net.ssl.SSLEngineResult wrap'
+```
+
+17, 21 and 25 have the same ones: `read(byte[], int, int)` and
+`write(byte[], int, int)`, with `this$0` for the socket, and the
+four-argument `wrap` and `unwrap` calling the six-argument ones, which are
+what's instrumented.
+
+### Where it lives
+
+- `java/agent/src/snoopy/agent/Agent.java`: which methods, and the code
+  added to them (ASM, at normal returns; the socket methods' arguments, and
+  the engine buffers' positions, are kept at entry). `java/build.sh` pins
+  ASM.
+- `java/agent/src/snoopy/hooks/Hooks.java`: the frames. Loaded by the boot
+  class loader (`Boot-Class-Path`), which java.base is made to read
+  (`redefineModule`). Nothing in it may throw into the application.
+- `internal/javaagent`: staging the jars in the JVM's `/tmp`, and the
+  attach client.
+- `java.go`: `--java`, which JVMs, and stopping.
+- `note_java_frame` in `bpf/snoopy.c` (see [the BPF program](#the-bpf-program)).
+
+### How to tell it broke
+
+`TestJSSE` runs in CI for each JDK in the `java` job's matrix, and checks
+each path's bytes come out exactly once. By hand: `snoopy --java --pid PID`
+says "Java agent loaded" and then shows nothing for one kind of call (a
+method that moved), or the JVM's stderr says "snoopy agent: not
+instrumenting ..." (ASM can't read the class, usually a newer class file
+version), or "the agent was loaded ..., but nothing it captures is seen"
+(the frames aren't recognized: a magic or layout mismatch, or the session
+under another PID).
+
+### How to fix it
+
+- **A new JDK:** add it to the `java` job in `.github/workflows/ci.yml`,
+  run `javap` as above, and if ASM is older than the JDK, bump `ASM` and its
+  SHA-1s in `java/build.sh` (Maven Central has the `.sha1` files).
+- **A moved method:** match its new name or descriptor in `Agent.Visitor`;
+  if the shorter `wrap`/`unwrap` no longer go through the six-argument
+  ones, instrument one level only, or engine calls are captured twice.
+- **Attaching fails:** `javaagent.Load` says how. The JDK's
+  `VirtualMachineImpl` (Linux) and `attachListener_posix.cpp` are the
+  reference for the protocol and who may connect.
+
 ## funcfind and golang.org/x/arch
 
 funcfind's arm64 code and `freebl.go` decode instructions with
@@ -768,6 +826,15 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   process is looked at again. Java's netty-tcnative and Conscrypt are found
   this way, extracted to temporary files and deleted; `TestJavaNativeTLS`
   loads them at start and five seconds later.
+
+- **Java agent frames:** `note_java_frame`, first thing in `sys_enter` for
+  `write`, picks up the agent's frames for a session in `java_sessions`
+  (by PID as snoopy sees it, like `traced_tgids`), and returns before the
+  socket tracking. `struct java_frame` must match `Hooks.header` in
+  `java/agent/src/snoopy/hooks/Hooks.java` (88 bytes, little-endian), and
+  `JAVA_FRAME_MAGIC` its `MAGIC`; change the magic's last two digits
+  ("01") with the layout, so an old agent's frames aren't misread. They're
+  output through `output_chunks`, the same loop as a library's calls.
 
 ## HTTP decoding and compressed bodies
 
