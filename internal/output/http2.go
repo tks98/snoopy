@@ -143,7 +143,13 @@ type http2Dir struct {
 	buf      []byte         // unparsed bytes, starting at a frame header
 	dataLeft int            // payload bytes still to come of the current DATA frame
 	data     dataFrame
-	block    []byte // header block being assembled
+	block    []byte              // header block being assembled
+	fields   []hpack.HeaderField // the block's fields as they're decoded
+	// The size of fields, and whether some were left out to keep it under
+	// maxHeaderList.
+	fieldsSize int
+	fieldsCut  bool
+	note       string // to return from process
 	// The HEADERS frame the block started with: its stream, and whether it
 	// ends the stream.
 	blockStream    uint32
@@ -183,7 +189,16 @@ func (f *dataFrame) bodyBytes(piece []byte) []byte {
 
 const (
 	maxHTTP2Conns   = 4096
-	maxHTTP2Pending = 1 << 20 // larger frames than this are given up on
+	maxHTTP2Pending = 1 << 20 // larger frames and header blocks than this are given up on
+	// The largest HPACK dynamic table followed. Browsers advertise 64 KiB
+	// (SETTINGS_HEADER_TABLE_SIZE), most others the default 4 KiB; a larger
+	// table only makes room for one header to be repeated many times over.
+	maxHPACKTable = 64 << 10
+	// The most of a header block's fields shown, counted as HPACK does (RFC
+	// 9113, section 6.5.2), in the ballpark of the limits servers set on
+	// it. One byte can refer to a table entry, so a small block can
+	// otherwise decode to gigabytes.
+	maxHeaderList = 256 << 10
 )
 
 func newHTTP2Conns(pool *bodyPool) *http2Conns {
@@ -217,6 +232,7 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 	if d.broken {
 		return nil, false, ""
 	}
+	d.note = ""
 	if !d.synced {
 		if !http2Aligned(data) { // wait for a call that starts with a frame
 			return nil, false, ""
@@ -238,6 +254,7 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 		d.broken = true
 		return nil, false, "HTTP/2 decoding stopped for this direction of the connection: " + err.Error()
 	}
+	note = d.note
 	if conn.late && !conn.noted {
 		conn.noted = true
 		note = "this HTTP/2 connection started before snoopy, so its headers can't be decoded"
@@ -269,9 +286,9 @@ func (c *http2Conns) start(key http2Key, late bool) *http2Conn {
 	for i := range conn.dirs {
 		d := &conn.dirs[i]
 		if !late {
-			d.dec = hpack.NewDecoder(4096, nil)
+			d.dec = hpack.NewDecoder(4096, d.field)
 			// The peer's SETTINGS may allow a larger table; we only listen.
-			d.dec.SetAllowedMaxDynamicTableSize(1 << 24)
+			d.dec.SetAllowedMaxDynamicTableSize(maxHPACKTable)
 			d.synced = true
 		}
 		d.bodies = map[uint32]*bodyDecoder{}
@@ -293,6 +310,21 @@ func (d *http2Dir) endBodies(err error) {
 	for stream, dec := range d.bodies {
 		dec.fail(err)
 		delete(d.bodies, stream)
+	}
+}
+
+// trimBodies makes room in d.bodies, which keeps a stream's decoder from
+// its headers to its end: a peer that never ends its streams would
+// otherwise fill it. The pool gives up on all but maxLiveBodies of them,
+// so dropping the ones it gave up on is enough.
+func (d *http2Dir) trimBodies() {
+	if len(d.bodies) < maxBodyInfos {
+		return
+	}
+	for stream, dec := range d.bodies {
+		if dec.err != nil {
+			delete(d.bodies, stream)
+		}
 	}
 }
 
@@ -429,6 +461,17 @@ func (d *http2Dir) info(stream uint32) *bodyInfo {
 	return info
 }
 
+// field is the HPACK decoder's emit function: it collects a header block's
+// fields, up to maxHeaderList.
+func (d *http2Dir) field(f hpack.HeaderField) {
+	if d.fieldsCut || d.fieldsSize+int(f.Size()) > maxHeaderList {
+		d.fieldsCut = true
+		return
+	}
+	d.fieldsSize += int(f.Size())
+	d.fields = append(d.fields, f)
+}
+
 // headerBlock collects the header block fragments of HEADERS, PUSH_PROMISE
 // and CONTINUATION frames, and decodes the block once it's complete.
 func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *bodyPool) error {
@@ -461,6 +504,9 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 			d.blockStream, d.blockEndStream = f.Stream, flags&endStream != 0
 		}
 	case 9: // CONTINUATION
+		if len(d.block)+len(p) > maxHTTP2Pending {
+			return fmt.Errorf("header block of more than %d bytes is too large to follow", maxHTTP2Pending)
+		}
 		d.block = append(d.block, p...)
 	default:
 		return nil
@@ -476,10 +522,23 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 		}
 		return nil
 	}
-	fields, err := d.dec.DecodeFull(d.block)
+	d.fields, d.fieldsSize, d.fieldsCut = nil, 0, false
+	_, err := d.dec.Write(d.block)
+	if err == nil {
+		err = d.dec.Close()
+	}
 	d.block = d.block[:0]
+	if cap(d.block) > 64<<10 { // let a large block's array go
+		d.block = nil
+	}
+	fields := d.fields
+	d.fields = nil
 	if err != nil {
 		return fmt.Errorf("can't decode header block: %v", err)
+	}
+	if d.fieldsCut {
+		d.note = fmt.Sprintf("a header block on stream %d decoded to more than %d KiB; the rest of its fields aren't shown",
+			f.Stream, maxHeaderList>>10)
 	}
 	f.Headers = fields
 	if stream := d.blockStream; stream != 0 {
@@ -499,6 +558,7 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 		if dec == nil { // not trailers
 			if enc := contentEncoding(fields); enc != "" && !d.blockEndStream {
 				if dec := pool.start(enc); dec != nil {
+					d.trimBodies()
 					d.bodies[stream] = dec
 					if err := dec.failed(); err != nil {
 						f.Body = bodyPart{Encoding: enc, Err: err.Error()}
