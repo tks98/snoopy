@@ -26,7 +26,8 @@ sudo snoopy --lib /usr/bin/node             # also attach to a binary with OpenS
 
 ```text
 Which processes:
-  --pid PID          only this process and those it starts
+  --pid PID          only this process and those it starts, until they've
+                     all exited
   --comm NAME        only processes whose name, as in /proc/<pid>/comm, or
                      program's file name starts with NAME (curl, firefox, node)
   --container ID     only processes in the container with this ID, or ID
@@ -57,13 +58,14 @@ Output:
   --verbose          also calls that only keep connections going (HTTP/2
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
-  --count N          stop after N calls
+  --count N          stop after N calls (0, the default: don't)
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
   --har FILE         also write the HTTP requests and responses to a HAR file
                      when snoopy stops ("-" for stdout), for browsers'
                      developer tools and other HAR viewers
-  --quiet            don't print calls (with --pcap or --har)
+  --quiet            don't print calls (with --pcap or --har; without them,
+                     snoopy only counts the calls)
   --no-color         no colors
 
 Capture:
@@ -347,10 +349,13 @@ before snoopy started shows its frames and bodies but not its headers. The JVM n
 signalling it), and a writable `/tmp`, where it makes its attach socket and
 snoopy puts the agent's jars (`/tmp/.snoopy-java-*`, kept for later runs);
 a container with a read-only root needs a tmpfs there. For a container,
-give `--pid` the JVM's PID as the host sees it. The agent can't be unloaded: when snoopy stops, it stops
-capturing and stays in the JVM, idle, until it exits. `SSLEngine` calls
-have no socket, so they show no addresses, and `--host` and `--port` don't
-match them.
+give `--pid` the JVM's PID as the host sees it. The agent can't be unloaded: when snoopy stops, it tells
+every agent it loaded to stop capturing, which then stays in the JVM, idle,
+until it exits. That takes 3 seconds at most; a second Ctrl-C exits at
+once, leaving the agents capturing for no one until a later `snoopy
+--java` stops them. `SSLEngine` calls have no socket, so they show no
+addresses: `--host` and `--port` leave them out, and snoopy warns that it
+does and says how many it left out when it stops.
 
 ## Containers and Kubernetes
 

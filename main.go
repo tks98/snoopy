@@ -21,7 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/fatih/color"
+	"golang.org/x/sys/unix"
 
 	"github.com/tks98/snoopy/v2/internal/discover"
 	"github.com/tks98/snoopy/v2/internal/output"
@@ -82,6 +84,9 @@ func (c *containerList) Set(v string) error {
 		if _, rest, ok := strings.Cut(id, "://"); ok {
 			id = rest
 		}
+		if id == "" && v == "" {
+			return errors.New("empty container ID")
+		}
 		if id == "" {
 			return fmt.Errorf("empty container ID in %q", v)
 		}
@@ -115,7 +120,7 @@ func (p *portList) String() string { return fmt.Sprint([]uint16(*p)) }
 func (p *portList) Set(v string) error {
 	n, err := strconv.ParseUint(v, 10, 16)
 	if err != nil || n == 0 {
-		return fmt.Errorf("not a port: %q", v)
+		return errors.New("ports are 1 to 65535")
 	}
 	*p = append(*p, uint16(n))
 	return nil
@@ -128,7 +133,8 @@ eBPF. It needs root.
 Usage: sudo snoopy [flags]
 
 Which processes:
-  --pid PID          only this process and those it starts
+  --pid PID          only this process and those it starts, until they've
+                     all exited
   --comm NAME        only processes whose name, as in /proc/<pid>/comm, or
                      program's file name starts with NAME (curl, firefox, node)
   --container ID     only processes in the container with this ID, or ID
@@ -159,13 +165,14 @@ Output:
   --verbose          also calls that only keep connections going (HTTP/2
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
-  --count N          stop after N calls
+  --count N          stop after N calls (0, the default: don't)
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
   --har FILE         also write the HTTP requests and responses to a HAR file
                      when snoopy stops ("-" for stdout), for browsers'
                      developer tools and other HAR viewers
-  --quiet            don't print calls (with --pcap or --har)
+  --quiet            don't print calls (with --pcap or --har; without them,
+                     snoopy only counts the calls)
   --no-color         no colors
 
 Capture:
@@ -193,11 +200,12 @@ Examples:
   sudo snoopy --quiet --pcap - | tcpdump -r - -nn -A
 `, tracer.DefaultMaxCapture, tracer.MaxCaptureLimit)
 
-// flags returns the command line flags, which set c.
-func flags(c *config, stderr io.Writer) *flag.FlagSet {
+// flags returns the command line flags, which set c. Their errors are
+// returned, not printed, and neither is the help text.
+func flags(c *config) *flag.FlagSet {
 	fs := flag.NewFlagSet("snoopy", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() { fmt.Fprint(stderr, usage) }
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 
 	// The usages are in the help text instead.
 	fs.IntVar(&c.pid, "pid", 0, "")
@@ -228,20 +236,30 @@ func flags(c *config, stderr io.Writer) *flag.FlagSet {
 	return fs
 }
 
+// parseFlags parses the command line; with -h or --help, it writes the
+// help text to stderr and returns flag.ErrHelp.
 func parseFlags(args []string, stderr io.Writer) (config, error) {
 	var c config
-	fs := flags(&c, stderr)
-	if err := fs.Parse(args); err != nil {
+	fs := flags(&c)
+	if err := fs.Parse(args); errors.Is(err, flag.ErrHelp) {
+		fmt.Fprint(stderr, usage)
 		return c, err
+	} else if err != nil {
+		return c, flagError(err)
 	}
 	if fs.NArg() > 0 {
 		return c, fmt.Errorf("unexpected argument %q; to trace processes by name, use --comm %[1]s", fs.Arg(0))
 	}
-	if c.pid < 0 {
-		return c, errors.New("--pid must be positive")
+	pidSet := false
+	fs.Visit(func(f *flag.Flag) { pidSet = pidSet || f.Name == "pid" })
+	if c.pid < 0 || pidSet && c.pid == 0 {
+		return c, fmt.Errorf("--pid %d isn't a process ID", c.pid)
 	}
 	if c.count < 0 {
-		return c, errors.New("--count must be positive")
+		return c, errors.New("--count can't be negative")
+	}
+	if c.pcap == "-" && c.har == "-" {
+		return c, errors.New("--pcap - and --har - can't both write to stdout")
 	}
 	if c.java && c.pid == 0 && len(c.containers) == 0 {
 		return c, errors.New("--java needs --pid or --container: snoopy loads its agent only into JVMs it's given")
@@ -262,13 +280,13 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		slices.Sort(output)
 		return c, fmt.Errorf("%s can't be combined", strings.Join(output, " and "))
 	}
-	// These show data as sent, where HTTP/2's and HTTP/3's headers are
-	// compressed: they can't be redacted.
 	if f, err := httpFilter(c); err != nil {
 		return c, err
 	} else {
 		c.filter = f
 	}
+	// These show data as sent, where HTTP/2's and HTTP/3's headers are
+	// compressed: they can't be redacted.
 	if c.redact && c.hex {
 		return c, errors.New("--redact can't be combined with --hex, which shows data as captured")
 	}
@@ -276,6 +294,16 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		return c, errors.New("--redact can't be combined with --pcap, which writes data as captured")
 	}
 	return c, nil
+}
+
+// flagError puts an error of the flag package's in the help text's terms:
+// the package names flags with one dash, the help text with two.
+func flagError(err error) error {
+	msg := err.Error()
+	for _, s := range []string{"for flag -", "for -", "not defined: -", "needs an argument: -"} {
+		msg = strings.Replace(msg, s, s+"-", 1)
+	}
+	return errors.New(msg)
 }
 
 // httpFilter returns the filter --method, --path and --status make, or nil
@@ -353,6 +381,20 @@ func hostPrefixes(h string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
+// active reports whether --host or --port was given.
+func (f addrFilter) active() bool {
+	return len(f.hosts) > 0 || len(f.ports) > 0
+}
+
+// check reports whether an event matches, and, if it doesn't, whether
+// that's because its peer's address isn't known: it might have.
+func (f addrFilter) check(ev *tracer.Event) (match, unknown bool) {
+	if f.match(ev) {
+		return true, false
+	}
+	return false, !ev.Remote.IsValid() || ev.Remote.Addr().IsUnspecified()
+}
+
 func (f addrFilter) match(ev *tracer.Event) bool {
 	ends := []netip.AddrPort{ev.Local, ev.Remote}
 	if len(f.hosts) > 0 && !slices.ContainsFunc(ends, func(a netip.AddrPort) bool {
@@ -373,7 +415,7 @@ func main() {
 		return
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "snoopy:", err)
+		fmt.Fprintf(os.Stderr, "snoopy: %v (see snoopy --help)\n", err)
 		os.Exit(2)
 	}
 	if cfg.version {
@@ -408,6 +450,11 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	if cfg.pid != 0 {
+		if _, ok := processKey(cfg.pid); !ok {
+			return fmt.Errorf("no process %d", cfg.pid)
+		}
+	}
 	// Loading the BPF program comes first: without root, its error is the
 	// one to see.
 	// With a process filter, probes go on those processes only, so the
@@ -415,13 +462,14 @@ func run(cfg config) error {
 	perProcess := !cfg.noScan && (cfg.pid != 0 || cfg.comm != "" || len(cfg.containers) > 0)
 	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize, PerProcess: perProcess})
 	if err != nil {
-		return err
+		return loadError(err, cfg.verbose)
 	}
 	defer t.Close()
 	printers, closePrinters, err := openPrinters(cfg)
 	if err != nil {
 		return err
 	}
+	closePrinters = sync.OnceFunc(closePrinters)
 	defer closePrinters()
 
 	discover.Progress = func(msg string) { logf("%s", msg) }
@@ -494,6 +542,7 @@ func run(cfg config) error {
 		}
 	}
 	// Also attach to what processes started from now on use.
+	stopWatching := func() {}
 	if !cfg.noScan {
 		// Per process, every new process attaches to its files: they're
 		// reported the first time.
@@ -501,7 +550,7 @@ func run(cfg config) error {
 		for _, target := range attached {
 			reported[reportKey(target)] = true
 		}
-		stopWatching, err := t.WatchNewProcesses(watcher, acceptProcess(cfg, t), holdProcess(cfg),
+		stop, err := t.WatchNewProcesses(watcher, acceptProcess(cfg, t), holdProcess(cfg),
 			func(target discover.Target, funcs []string, err error) {
 				key := reportKey(target)
 				if t.PerProcess() && err == nil && reported[key] && !cfg.verbose {
@@ -514,6 +563,7 @@ func run(cfg config) error {
 		if err != nil {
 			logf("warning: programs started from now on are only traced if they use a library already attached to: %v", err)
 		} else {
+			stopWatching = sync.OnceFunc(stop)
 			defer stopWatching()
 		}
 	}
@@ -523,23 +573,33 @@ func run(cfg config) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	stopJava := func() {}
 	if cfg.java {
-		stopJava, err := startJava(ctx, cfg, t)
+		s, err := startJava(ctx, cfg, t)
 		if err != nil {
 			return err
 		}
+		stopJava = sync.OnceFunc(s)
 		defer stopJava()
 	}
 	quic := &quicSeen{pids: map[uint32]bool{}}
 	go watchCounters(ctx, t, quic)
-	if cfg.pid != 0 && !t.ResolvesAddresses() {
-		// Without BTF, the BPF program can't tell a process's parents, so
-		// processes that fork without executing a program are found here.
-		go followChildren(ctx, t, cfg.pid)
+	if cfg.pid != 0 {
+		go watchExit(ctx, cfg.pid, stop)
+		if !t.ResolvesAddresses() {
+			// Without BTF, the BPF program can't tell a process's parents, so
+			// processes that fork without executing a program are found here.
+			go followChildren(ctx, t, cfg.pid)
+		}
 	}
 
 	resolver := procinfo.NewResolver("/proc")
-	calls := 0
+	events := newPipeline(filter, printers, cfg.count)
+	if cfg.quiet && cfg.pcap == "" && cfg.har == "" {
+		// For measuring snoopy's overhead, say, or a smoke test that
+		// mustn't show what it captures.
+		logf("--quiet without --pcap or --har: calls are counted, not written anywhere")
+	}
 	logf("tracing; press Ctrl-C to stop")
 	err = t.Run(ctx, func(ev *tracer.Event) {
 		if ev.Function.IsQUIC() {
@@ -556,51 +616,168 @@ func run(cfg config) error {
 				ev.Local, ev.Remote = local, remote
 			}
 		}
-		if ev.Function == tracer.FuncQUICPacketSent {
-			// Not shown or counted, only followed (see its doc).
-			for _, p := range printers {
-				if err := p.Print(ev); err != nil {
-					logf("error: write output: %v", err)
-					stop()
-					return
-				}
-			}
-			return
+		done, err := events.handle(ev)
+		if err != nil {
+			logf("error: write output: %v", err)
 		}
-		if !filter.match(ev) || cfg.count > 0 && calls >= cfg.count {
-			return
-		}
-		shown := true
-		for _, p := range printers {
-			before, beforeFiltered := hidden(p), filtered(p)
-			if err := p.Print(ev); err != nil {
-				logf("error: write output: %v", err)
-				stop()
-				return
-			}
-			shown = shown && hidden(p) == before && filtered(p) == beforeFiltered
-		}
-		if !shown {
-			return
-		}
-		calls++
-		if cfg.count > 0 && calls >= cfg.count {
+		if done {
 			stop()
 		}
 	})
+	// From here on, a second Ctrl-C exits at once: what's left is
+	// reporting, and telling Java agents to stop, which may take a while.
+	exitNow := make(chan os.Signal, 1)
+	signal.Notify(exitNow, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-exitNow
+		os.Exit(130)
+	}()
+	stop()
+	stopWatching() // nothing more to report attaching to
 
-	summary := fmt.Sprintf("captured %d calls", calls)
+	logf("%s", events.summary(printers))
+	if lost, _ := t.LostEvents(); lost > 0 {
+		logf("warning: %d chunks were dropped because the ring buffer was full", lost)
+	}
+	closePrinters()
+	stopJava()
+	return err
+}
+
+// loadError shortens the BPF verifier's rejection of snoopy's program,
+// whose log runs to thousands of lines, to what to do about it, unless
+// --verbose.
+func loadError(err error, verbose bool) error {
+	const rejected = "the kernel's BPF verifier rejected snoopy's program"
+	var ve *ebpf.VerifierError
+	if verbose || !errors.As(err, &ve) && !strings.HasPrefix(err.Error(), rejected) {
+		return err
+	}
+	kernel := ""
+	var u unix.Utsname
+	if unix.Uname(&u) == nil {
+		kernel = " (this is " + unix.ByteSliceToString(u.Release[:]) + ")"
+	}
+	return fmt.Errorf("%s: it needs Linux 5.10 or later with BTF%s; --verbose shows the verifier's log", rejected, kernel)
+}
+
+// pipeline takes the events of the processes asked for to the printers,
+// if --host and --port let them through, and counts the calls shown.
+type pipeline struct {
+	filter addrFilter
+	// With --host or --port, a printer whose output is discarded, given QUIC
+	// packets first, so that their peers are known before they're filtered:
+	// a packet on a socket that isn't connected to one peer (quinn's) has
+	// none, and the printers give it the one its connection's packets were
+	// sent to.
+	peers    output.Printer
+	printers []output.Printer
+	count    int // --count
+	calls    int
+	// noAddr is how many calls --host and --port left out because their
+	// peers' addresses weren't known.
+	noAddr int
+}
+
+func newPipeline(filter addrFilter, printers []output.Printer, count int) *pipeline {
+	p := &pipeline{filter: filter, printers: printers, count: count}
+	if filter.active() {
+		p.peers = output.NewBrief(io.Discard, output.Options{})
+	}
+	return p
+}
+
+// handle passes an event on, and reports whether snoopy is done: with
+// --count's calls shown, or on an error writing them.
+func (p *pipeline) handle(ev *tracer.Event) (done bool, err error) {
+	if p.peers != nil && (ev.Function.IsQUIC() || ev.Function == tracer.FuncQUICPacketSent) {
+		_ = p.peers.Print(ev) // writes nowhere
+	}
+	if ev.Function == tracer.FuncQUICPacketSent {
+		// Not shown or counted, only followed (see its doc).
+		for _, pr := range p.printers {
+			if err := pr.Print(ev); err != nil {
+				return true, err
+			}
+		}
+		return false, nil
+	}
+	if p.count > 0 && p.calls >= p.count {
+		return true, nil
+	}
+	if match, unknown := p.filter.check(ev); !match {
+		if unknown {
+			if p.noAddr == 0 {
+				logf("warning: --host and --port leave out calls whose peer's address isn't known, such as SSLEngine's (--java); snoopy says how many when it stops")
+			}
+			p.noAddr++
+		}
+		return false, nil
+	}
+	shown := true
+	for _, pr := range p.printers {
+		before, beforeFiltered := hidden(pr), filtered(pr)
+		if err := pr.Print(ev); err != nil {
+			return true, err
+		}
+		shown = shown && hidden(pr) == before && filtered(pr) == beforeFiltered
+	}
+	if !shown {
+		return false, nil
+	}
+	p.calls++
+	return p.count > 0 && p.calls >= p.count, nil
+}
+
+// summary says what was captured and what was left out.
+func (p *pipeline) summary(printers []output.Printer) string {
+	summary := fmt.Sprintf("captured %d %s", p.calls, plural(p.calls, "call", "calls"))
+	if n := p.noAddr; n > 0 {
+		summary += fmt.Sprintf(", left out %d whose peer's address --host or --port needed but wasn't known", n)
+	}
 	if n := filteredTotal(printers); n > 0 {
 		summary += fmt.Sprintf(", left out %d that --method, --path or --status didn't match", n)
 	}
 	if n := hiddenTotal(printers); n > 0 {
 		summary += fmt.Sprintf(", and hid %d that only kept connections going (--verbose shows them)", n)
 	}
-	logf("%s", summary)
-	if lost, _ := t.LostEvents(); lost > 0 {
-		logf("warning: %d chunks were dropped because the ring buffer was full", lost)
+	return summary
+}
+
+// watchExit calls exited once process pid, and those it started that were
+// seen, have exited: there's nothing left to trace.
+func watchExit(ctx context.Context, pid int, exited func()) {
+	key, ok := processKey(pid)
+	if !ok {
+		return
 	}
-	return err
+	alive := map[procKey]bool{key: true}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		if key.alive() {
+			for _, child := range discover.Descendants(pid)[1:] {
+				if k, ok := processKey(child); ok {
+					alive[k] = true
+				}
+			}
+		}
+		for k := range alive {
+			if !k.alive() {
+				delete(alive, k)
+			}
+		}
+		if len(alive) == 0 {
+			logf("process %d and those it started have exited", pid)
+			exited()
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // reportKey identifies a target's file however it was reached, by name or
@@ -837,9 +1014,6 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 	if cfg.har != "" {
 		w := io.Writer(os.Stdout)
 		if cfg.har == "-" {
-			if stdoutUsed {
-				return nil, nil, errors.New("--pcap - and --har - can't both write to stdout")
-			}
 			stdoutUsed = true
 		} else {
 			f, err := os.Create(cfg.har)
@@ -877,9 +1051,6 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 	}, nil
 }
 
-// watchCounters warns about what the BPF program counts going missing: data
-// dropped because the ring buffer was full, and QUIC packets of connections
-// that started before snoopy and can't be followed (Firefox's).
 // quicSeen is the processes snoopy captured QUIC packets from.
 type quicSeen struct {
 	mu   sync.Mutex
@@ -902,6 +1073,9 @@ func (q *quicSeen) has(pid uint32) bool {
 // receive, with none of its QUIC packets captured, to be warned about.
 const minUDP443 = 32
 
+// watchCounters warns about what the BPF program counts going missing: data
+// dropped because the ring buffer was full, and QUIC packets of connections
+// that started before snoopy and can't be followed (Firefox's).
 func watchCounters(ctx context.Context, t *tracer.Tracer, quic *quicSeen) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
