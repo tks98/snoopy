@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -18,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Library identifies a TLS implementation.
@@ -257,25 +260,78 @@ type Watcher struct {
 	// by each.
 	perProcess bool
 	mu         sync.Mutex
-	seen       map[fileID][]Target // what each file inspected has
-	roots      map[fileID]bool     // root filesystems whose library directories were looked in
+	// What each file inspected has. A file whose targets were returned to
+	// be attached to for every process is kept in attached, so that it's
+	// never returned again, which would attach to it twice; there are only
+	// as many as there are probes. The others, most executables, with
+	// nothing to attach to, and all files per process, where their
+	// targets are returned for each process anyway, are kept in seen, the
+	// most recently used of them: forgetting one only costs inspecting it
+	// again.
+	attached map[fileID][]Target
+	seen     *lru[fileID, []Target]
+	// Root filesystems whose library directories were looked in, besides
+	// our own (ownRoot). Forgetting one means looking again: the files in
+	// them are known.
+	roots   *lru[fileID, bool]
+	ownRoot fileID
 }
+
+// maxSeen bounds the files and root filesystems a Watcher remembers, in
+// addition to those attached to (see Watcher.attached): it's told of every
+// program that runs.
+const maxSeen = 4096
 
 // NewWatcher returns a Watcher that skips the files of known, which are
 // already attached to, and our own root's library directories, whose
 // libraries Find returned. With perProcess, it returns targets for each
 // process, the files of known included.
 func NewWatcher(known []Target, perProcess bool) *Watcher {
-	w := &Watcher{proc: "/proc", perProcess: perProcess, seen: map[fileID][]Target{}, roots: map[fileID]bool{}}
+	w := newWatcher("/proc", perProcess)
 	for _, t := range known {
 		if id, err := idOf(t.Path); err == nil {
-			w.seen[id] = append(w.seen[id], t)
+			found, _ := w.lookup(id)
+			w.remember(id, append(found, t))
 		}
 	}
 	if id, err := dirID("/"); err == nil {
-		w.roots[id] = true
+		w.ownRoot = id
 	}
 	return w
+}
+
+func newWatcher(proc string, perProcess bool) *Watcher {
+	return &Watcher{proc: proc, perProcess: perProcess, attached: map[fileID][]Target{},
+		seen: newLRU[fileID, []Target](maxSeen), roots: newLRU[fileID, bool](maxSeen)}
+}
+
+// lookup returns what a file inspected before has. w.mu must be held, or
+// w not yet shared.
+func (w *Watcher) lookup(id fileID) ([]Target, bool) {
+	if found, ok := w.attached[id]; ok {
+		return found, true
+	}
+	return w.seen.get(id)
+}
+
+// remember records what a file has. w.mu must be held, or w not yet shared.
+func (w *Watcher) remember(id fileID, found []Target) {
+	if !w.perProcess && slices.ContainsFunc(found, func(t Target) bool { return t.Problem == nil }) {
+		w.attached[id] = found
+		return
+	}
+	w.seen.put(id, found)
+}
+
+// knownRoot reports whether a root filesystem's library directories were
+// looked in, and records that they are now. w.mu must be held.
+func (w *Watcher) knownRoot(id fileID) bool {
+	if id == w.ownRoot {
+		return true
+	}
+	_, known := w.roots.get(id)
+	w.roots.put(id, true)
+	return known
 }
 
 // Known reports whether a process's executable and root filesystem were
@@ -297,8 +353,14 @@ func (w *Watcher) Known(pid int) bool {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	_, seen := w.seen[exe]
-	return seen && w.roots[root]
+	if _, seen := w.lookup(exe); !seen {
+		return false
+	}
+	if root == w.ownRoot {
+		return true
+	}
+	_, known := w.roots.get(root)
+	return known
 }
 
 // Root returns the targets among the TLS libraries in the usual library
@@ -314,8 +376,7 @@ func (w *Watcher) Root(pid int) []Target {
 		return nil
 	}
 	w.mu.Lock()
-	known := w.roots[id]
-	w.roots[id] = true
+	known := w.knownRoot(id)
 	w.mu.Unlock()
 	if known && !w.perProcess {
 		return nil
@@ -350,8 +411,14 @@ func (w *Watcher) filesRoot(pid int, root string) string {
 	return ""
 }
 
-// maxNeeded bounds how many libraries Needed reads.
-const maxNeeded = 256
+// maxNeeded bounds how many libraries Needed reads, maxLookups how many it
+// looks for, and maxSearchDirs in how many directories, besides the usual
+// ones: the names come from the process's files, which can list any number.
+const (
+	maxNeeded     = 256
+	maxLookups    = 4 * maxNeeded
+	maxSearchDirs = 32
+)
 
 // Needed returns the targets among the TLS libraries a process that has
 // only just started is about to load: its executable's DT_NEEDED libraries,
@@ -369,53 +436,84 @@ func (w *Watcher) Needed(pid int) []Target {
 	if r, _ := os.Readlink(root); r != "" && r != "/" && strings.HasPrefix(exe, r+"/") {
 		exe = strings.TrimPrefix(exe, r) // a chroot's (see processFiles)
 	}
+	exe = path.Clean("/" + exe)
 	root = w.filesRoot(pid, root)
 	envPath, preload := loaderEnv(dir)
 
+	// Names and search paths all come from the process and its files, so
+	// they're only ever looked up in its root, as paths in it (see inRoot),
+	// and never as globs.
 	var targets []Target
 	visited := map[string]bool{}
+	lookups := 0
 	queue := []string{exe} // paths in the process's root
 	for _, lib := range preload {
-		if !strings.Contains(lib, "/") {
-			lib = findLibrary(root, lib, append(envPath, libDirs...))
+		switch {
+		case strings.HasPrefix(lib, "/"):
+		case strings.Contains(lib, "/"):
+			lib = "" // relative to its working directory
+		default:
+			lib = findLibrary(root, lib, envPath)
 		}
 		if lib != "" {
 			queue = append(queue, lib)
 		}
 	}
 	for len(queue) > 0 && len(visited) < maxNeeded {
-		path := queue[0]
+		cur := path.Clean("/" + queue[0])
 		queue = queue[1:]
-		if visited[path] {
+		if visited[cur] {
 			continue
 		}
-		visited[path] = true
-		if path != exe && isTLSLibraryName(filepath.Base(path)) {
-			targets = append(targets, w.inspect(filepath.Join(root, path), "")...)
+		visited[cur] = true
+		if cur != exe && isTLSLibraryName(filepath.Base(cur)) {
+			targets = append(targets, w.inspect(inRoot(root, cur), "")...)
 		}
-		f, file, err := openELF(filepath.Join(root, path))
+		needed, runpath, err := dependencies(inRoot(root, cur))
 		if err != nil {
 			continue
 		}
-		needed, _ := f.ImportedLibraries()
 		var search []string
-		for _, tag := range []elf.DynTag{elf.DT_RUNPATH, elf.DT_RPATH} {
-			if paths, _ := f.DynString(tag); len(paths) > 0 {
-				for _, p := range filepath.SplitList(paths[0]) {
-					search = append(search, strings.ReplaceAll(p, "$ORIGIN", filepath.Dir(path)))
-				}
-				break // RUNPATH, if present, overrides RPATH
-			}
+		for _, p := range runpath {
+			search = append(search, strings.ReplaceAll(p, "$ORIGIN", filepath.Dir(cur)))
 		}
-		file.Close()
-		search = append(append(envPath, search...), libDirs...)
+		search = slices.Concat(envPath, search)
 		for _, name := range needed {
-			if lib := findLibrary(root, name, search); lib != "" {
+			if lookups++; lookups > maxLookups {
+				return targets
+			}
+			if strings.HasPrefix(name, "/") {
+				queue = append(queue, name) // the loader takes it as it is
+			} else if lib := findLibrary(root, name, search); lib != "" {
 				queue = append(queue, lib)
 			}
 		}
 	}
 	return targets
+}
+
+// dependencies returns the libraries an ELF file needs and where it says
+// to look for them, its RUNPATH or else its RPATH. It's the one place
+// other than Inspect that parses a process's files, and like it turns a
+// panic in that into an error.
+func dependencies(path string) (needed, runpath []string, err error) {
+	defer func() {
+		if perr := recovered(recover()); perr != nil {
+			needed, runpath, err = nil, nil, perr
+		}
+	}()
+	f, file, err := openELF(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer file.Close()
+	needed, _ = f.ImportedLibraries()
+	for _, tag := range []elf.DynTag{elf.DT_RUNPATH, elf.DT_RPATH} {
+		if paths, _ := f.DynString(tag); len(paths) > 0 {
+			return needed, filepath.SplitList(paths[0]), nil // RUNPATH, if present, overrides RPATH
+		}
+	}
+	return needed, nil, nil
 }
 
 // loaderEnv returns the LD_LIBRARY_PATH directories and LD_PRELOAD
@@ -436,14 +534,24 @@ func loaderEnv(dir string) (path, preload []string) {
 	return path, preload
 }
 
-// findLibrary returns where the first of dirs (which may be globs) in root
-// that has a library named name has it, as a path in root, or "".
+// findLibrary returns where the first of dirs in root, and then of the
+// usual library directories, that has a library named name has it, as a
+// path in root, or "". name and dirs come from the process, so they're
+// taken literally; only the usual directories' own globs are expanded.
 func findLibrary(root, name string, dirs []string) string {
-	for _, d := range dirs {
-		matches, _ := filepath.Glob(filepath.Join(root, d, name))
+	if name == "" || name == "." || name == ".." || strings.Contains(name, "/") {
+		return ""
+	}
+	for _, d := range dirs[:min(len(dirs), maxSearchDirs)] {
+		if p := path.Join("/", d, name); isRegular(inRoot(root, p)) {
+			return p
+		}
+	}
+	for _, d := range libDirs {
+		matches, _ := filepath.Glob(root + d)
 		for _, m := range matches {
-			if fi, err := os.Stat(m); err == nil && fi.Mode().IsRegular() {
-				return strings.TrimPrefix(m, root)
+			if p := strings.TrimPrefix(m, root) + "/" + name; isRegular(inRoot(root, p)) {
+				return p
 			}
 		}
 	}
@@ -458,7 +566,7 @@ func (w *Watcher) inspect(path, note string) []Target {
 		return nil
 	}
 	w.mu.Lock()
-	found, seen := w.seen[id]
+	found, seen := w.lookup(id)
 	w.mu.Unlock()
 	if seen && !w.perProcess {
 		return nil
@@ -476,7 +584,7 @@ func (w *Watcher) inspect(path, note string) []Target {
 			return nil // gone with the process, or not ours to see; maybe next time
 		}
 		w.mu.Lock()
-		w.seen[id] = slices.Clone(found)
+		w.remember(id, slices.Clone(found))
 		w.mu.Unlock()
 	}
 	for i := range found {
@@ -639,7 +747,7 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 	// Files are reached through the process's root, but a chrooted
 	// process's maps and exe name them by their path from ours.
 	root, _ := os.Readlink(filepath.Join(dir, "root"))
-	inRoot := func(path string) string {
+	trimRoot := func(path string) string {
 		if root != "" && root != "/" && strings.HasPrefix(path, root+"/") {
 			return strings.TrimPrefix(path, root)
 		}
@@ -655,7 +763,7 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 				deleted: lib.Path,
 			})
 		} else {
-			out = append(out, candidate{path: filepath.Join(dir, "root", inRoot(lib.Path))})
+			out = append(out, candidate{path: inRoot(filepath.Join(dir, "root"), trimRoot(lib.Path))})
 		}
 	}
 
@@ -669,7 +777,7 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 			deleted: strings.TrimSuffix(exe, deletedSuffix),
 		})
 	default:
-		out = append(out, candidate{path: filepath.Join(dir, "root", inRoot(exe))})
+		out = append(out, candidate{path: inRoot(filepath.Join(dir, "root"), trimRoot(exe))})
 	}
 	return out, nil
 }
@@ -815,19 +923,19 @@ type fileID struct {
 	modified int64
 }
 
+// idOf returns the identity of a regular file, resolved as OpenPath
+// resolves it.
 func idOf(path string) (fileID, error) {
-	fi, err := os.Stat(path)
+	fd, err := OpenPath(path)
 	if err != nil {
 		return fileID{}, err
 	}
-	if !fi.Mode().IsRegular() {
-		return fileID{}, errors.New("not a regular file")
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fileID{}, err
 	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fileID{}, errors.New("no inode information")
-	}
-	return fileID{dev: uint64(st.Dev), ino: st.Ino, modified: fi.ModTime().UnixNano()}, nil
+	return fileID{dev: st.Dev, ino: st.Ino, modified: st.Mtim.Nano()}, nil
 }
 
 func joinNotes(a, b string) string {
