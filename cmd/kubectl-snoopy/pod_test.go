@@ -64,11 +64,11 @@ func TestTargets(t *testing.T) {
 }
 
 func TestSnoopyPod(t *testing.T) {
-	args := snoopyArgs([]target{{"containerd://aaa", "checkout-7d9f/app"}}, []string{"--brief"})
-	if want := []string{"--container", "containerd://aaa=checkout-7d9f/app", "--brief"}; !reflect.DeepEqual(args, want) {
-		t.Errorf("args: %q", args)
+	cmd := execCommand([]target{{"containerd://aaa", "checkout-7d9f/app"}}, []string{"--brief"})
+	if want := []string{"/usr/bin/snoopy", "--container", "containerd://aaa=checkout-7d9f/app", "--brief"}; !reflect.DeepEqual(cmd, want) {
+		t.Errorf("command: %q", cmd)
 	}
-	pod := snoopyPod("pool-a-3", "checkout-7d9f", "shop/pod checkout-7d9f", "kube-system", "ghcr.io/tks98/snoopy:2.6.0", args, time.Hour)
+	pod := snoopyPod("pool-a-3", "checkout-7d9f", "shop/pod checkout-7d9f", "kube-system", "ghcr.io/tks98/snoopy:2.6.0", time.Hour)
 	spec := pod.Spec
 	c := spec.Containers[0]
 	switch {
@@ -84,11 +84,18 @@ func TestSnoopyPod(t *testing.T) {
 		t.Errorf("token %v, deadline %v", *spec.AutomountServiceAccountToken, *spec.ActiveDeadlineSeconds)
 	case len(spec.Tolerations) != 1 || spec.Tolerations[0].Operator != corev1.TolerationOpExists:
 		t.Errorf("tolerations: %v", spec.Tolerations)
-	case c.ImagePullPolicy != corev1.PullIfNotPresent || !reflect.DeepEqual(c.Args, args):
+	case c.ImagePullPolicy != corev1.PullIfNotPresent:
 		t.Errorf("container: %+v", c)
+	// The container only waits, and snoopy runs through exec, so what it
+	// captures isn't the container's log; nor is the log the pod's
+	// termination message.
+	case !reflect.DeepEqual(c.Command, []string{"/usr/bin/snoopy", "--serve-exec"}) || len(c.Args) != 0:
+		t.Errorf("command %q, args %q", c.Command, c.Args)
+	case c.TerminationMessagePolicy != corev1.TerminationMessageReadFile:
+		t.Errorf("termination message policy: %s", c.TerminationMessagePolicy)
 	}
 
-	if p := snoopyPod("n", strings.Repeat("x", 60), "", "shop", "snoopy", nil, 0); len(p.GenerateName) > 63-5 || p.Spec.ActiveDeadlineSeconds != nil {
+	if p := snoopyPod("n", strings.Repeat("x", 60), "", "shop", "snoopy", 0); len(p.GenerateName) > 63-5 || p.Spec.ActiveDeadlineSeconds != nil {
 		t.Errorf("long name: %q, deadline %v", p.GenerateName, p.Spec.ActiveDeadlineSeconds)
 	}
 }
@@ -102,7 +109,7 @@ func TestImagePull(t *testing.T) {
 		"registry:5000/snoopy:e2e":         corev1.PullIfNotPresent,
 		"ghcr.io/tks98/snoopy@sha256:abcd": corev1.PullIfNotPresent,
 	} {
-		if got := snoopyPod("n", "x", "", "shop", image, nil, 0).Spec.Containers[0].ImagePullPolicy; got != want {
+		if got := snoopyPod("n", "x", "", "shop", image, 0).Spec.Containers[0].ImagePullPolicy; got != want {
 			t.Errorf("%s: %s, want %s", image, got, want)
 		}
 	}
@@ -114,7 +121,7 @@ func TestExplainCreate(t *testing.T) {
 		t.Errorf("PSA: %v", err)
 	}
 	rbac := errors.New(`pods is forbidden: User "dev" cannot create resource "pods"`)
-	if err := explainCreate(rbac, "shop"); !strings.Contains(err.Error(), "pods/attach") {
+	if err := explainCreate(rbac, "shop"); !strings.Contains(err.Error(), "pods/exec") {
 		t.Errorf("RBAC: %v", err)
 	}
 }
