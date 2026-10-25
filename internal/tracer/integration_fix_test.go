@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tks98/snoopy/v2/internal/discover"
 )
@@ -52,6 +53,126 @@ func renamedTool(t *testing.T, name, as string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// A library whose mtime changes is new to the Watcher, which tells files
+// apart by it, but not attached to again: its calls would show twice.
+func TestReattachAfterTouch(t *testing.T) {
+	requireRoot(t)
+	curl := renamedTool(t, "curl", "fixcurl")
+	lib := privateLibSSL(t)
+	tr, err := New(Options{Comm: "fixcurl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.AttachSyscalls(); err != nil {
+		t.Fatal(err)
+	}
+	stop, err := tr.WatchNewProcesses(discover.NewWatcher(nil, false), nil, nil, func(discover.Target, []string, error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := runTracer(t, tr)
+	t.Cleanup(stop)
+	// Slow to answer, so curl is attached to by then.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Second)
+		fmt.Fprintf(w, "served %s late", r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	run := func(path string) {
+		t.Helper()
+		cmd := exec.Command(curl, "-sk", "--http1.1", srv.URL+path)
+		cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+filepath.Dir(lib.Path))
+		if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "served "+path) {
+			t.Fatalf("curl: %v: %s", err, out)
+		}
+	}
+	reads := func(path string) int {
+		return events.count(func(ev *Event) bool { return ev.Function == FuncSSLRead && contains("served "+path)(ev) })
+	}
+	run("/first")
+	waitFor(t, events, "the first response", contains("served /first"))
+	later := time.Now().Add(time.Minute)
+	if err := os.Chtimes(lib.Path, later, later); err != nil {
+		t.Fatal(err)
+	}
+	run("/second")
+	waitFor(t, events, "the second response", contains("served /second"))
+	time.Sleep(time.Second)
+	if n := reads("/second"); n != 1 {
+		t.Errorf("the second response was seen %d times", n)
+	}
+}
+
+// openFDs returns how many files the test process has open.
+func openFDs(t *testing.T) int {
+	t.Helper()
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(fds)
+}
+
+// A file attached to for every process is let go of once it's deleted and
+// no process maps it, and not before.
+func TestDetachUnused(t *testing.T) {
+	requireRoot(t)
+	python := requireTool(t, "python3")
+	lib := privateLibSSL(t)
+	tr, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	before := openFDs(t)
+	if funcs, err := tr.Attach(lib, 0); err != nil || len(funcs) == 0 {
+		t.Fatalf("attach: %v %v", funcs, err)
+	}
+	attached := func() bool {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return len(tr.files) == 1
+	}
+	if funcs, err := tr.Attach(lib, 0); err != nil || len(funcs) != 0 || !attached() {
+		t.Fatalf("attached again: %v %v", funcs, err)
+	}
+	tr.DetachUnused()
+	if !attached() {
+		t.Fatal("detached from a file that's there")
+	}
+
+	// A process maps it; then it's deleted.
+	cmd := exec.Command(python, "-c", `import ctypes, sys; ctypes.CDLL(sys.argv[1]); print("loaded", flush=True); sys.stdin.read()`, lib.Path)
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	if line, _ := bufio.NewReader(stdout).ReadString('\n'); line != "loaded\n" {
+		t.Fatalf("python3: %q", line)
+	}
+	if err := os.Remove(lib.Path); err != nil {
+		t.Fatal(err)
+	}
+	tr.DetachUnused()
+	if !attached() {
+		t.Fatal("detached from a deleted file a process maps")
+	}
+	stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	tr.DetachUnused()
+	if attached() {
+		t.Fatal("still attached to a deleted file no process maps")
+	}
+	tr.closing.Wait()
+	if after := openFDs(t); after != before {
+		t.Errorf("%d files open before attaching, %d after detaching", before, after)
+	}
 }
 
 // traced returns whether a process is in traced_tgids.
