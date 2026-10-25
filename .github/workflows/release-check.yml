@@ -48,14 +48,19 @@ jobs:
         with:
           version: v2.19.0
           args: release --snapshot --clean
+      # Scratch files go in $RUNNER_TEMP, not the checkout: a file there
+      # leaves the tree dirty, which Go writes into the next build's binaries
+      # (vcs.modified), and the archives would differ.
       - name: krew installs the plugin from its manifest
         run: |
+          dist=$PWD/dist
+          cd "$RUNNER_TEMP"
           curl -fsSLO https://github.com/kubernetes-sigs/krew/releases/download/v0.4.5/krew-linux_amd64.tar.gz
           echo "bacc06800bda14ec063cd0b6f377a961fdf4661c00366bf9834723cd28bfabc7  krew-linux_amd64.tar.gz" | sha256sum -c -
           tar xzf krew-linux_amd64.tar.gz ./krew-linux_amd64
           ./krew-linux_amd64 install krew
           export PATH="$HOME/.krew/bin:$PATH"
-          kubectl krew install --manifest=dist/krew/snoopy.yaml --archive="$(ls dist/kubectl-snoopy_*_linux_amd64.tar.gz)"
+          kubectl krew install --manifest="$dist/krew/snoopy.yaml" --archive="$(ls "$dist"/kubectl-snoopy_*_linux_amd64.tar.gz)"
           kubectl snoopy --version
       - name: The images run, and have the Java agent
         run: |
@@ -73,14 +78,17 @@ jobs:
             grep -q "  ${a#dist/}.sbom.json$" dist/checksums.txt || { echo "$a: no SBOM"; exit 1; }
           done
           grep snoopy- dist/checksums.txt
-          sha256sum java/out/snoopy-*.jar > first.sha256
-          sh java/build.sh && sha256sum -c first.sha256
+          sha256sum java/out/snoopy-*.jar > "$RUNNER_TEMP/jars.sha256"
+          sh java/build.sh && sha256sum -c "$RUNNER_TEMP/jars.sha256"
       # The same commit makes the same archives (their files' times are the
       # commit's), whenever it's built. Not the SBOMs, which say when.
-      - run: (cd dist && sha256sum *.tar.gz) > archives.sha256
+      - run: (cd dist && sha256sum *.tar.gz) > "$RUNNER_TEMP/archives.sha256"
+      - name: The checkout is clean, for the second build
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then git status --porcelain; echo "::error::files left in the checkout make the second build differ"; exit 1; fi
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           version: v2.19.0
           args: release --snapshot --clean --skip=docker,sbom
       - name: The archives are reproducible
-        run: cd dist && sha256sum -c ../archives.sha256
+        run: cd dist && sha256sum -c "$RUNNER_TEMP/archives.sha256"
