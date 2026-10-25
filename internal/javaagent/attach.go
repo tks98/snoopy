@@ -19,7 +19,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -32,17 +31,31 @@ import (
 // Load loads the agent jar into process pid, passing it options, and
 // returns the JVM's answer. jar is a path as the JVM sees it.
 func Load(pid int, jar, options string, timeout time.Duration) (string, error) {
+	// The process, held onto: a signal goes to it, not to one that took its
+	// PID.
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return "", fmt.Errorf("process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
 	p, err := inspect(pid)
 	if err != nil {
 		return "", err
 	}
+	root, err := openRoot(pid)
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(root)
 	deadline := time.Now().Add(timeout)
-	sock := filepath.Join(p.root, "tmp", fmt.Sprintf(".java_pid%d", p.nsPID))
-	if !isSocket(sock) {
-		if err := p.trigger(sock, deadline); err != nil {
+	name := fmt.Sprintf("tmp/.java_pid%d", p.nsPID)
+	sock, err := openSocket(root, name)
+	if err != nil {
+		if sock, err = p.trigger(pidfd, root, name, deadline); err != nil {
 			return "", err
 		}
 	}
+	defer unix.Close(sock)
 	// The JVM is the same process still, not one that took its PID.
 	if q, err := inspect(pid); err != nil || q.start != p.start {
 		return "", fmt.Errorf("process %d went away while attaching", pid)
@@ -56,7 +69,6 @@ func Load(pid int, jar, options string, timeout time.Duration) (string, error) {
 
 type process struct {
 	pid, nsPID  int
-	root, cwd   string
 	uid, gid    int
 	start       string // field 22 of /proc/<pid>/stat, against PID reuse
 	catchesQuit bool
@@ -67,7 +79,7 @@ func inspect(pid int) (*process, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &process{pid: pid, nsPID: pid, root: fmt.Sprintf("/proc/%d/root", pid), cwd: fmt.Sprintf("/proc/%d/cwd", pid)}
+	p := &process{pid: pid, nsPID: pid}
 	for _, line := range strings.Split(string(status), "\n") {
 		k, v, _ := strings.Cut(line, ":")
 		f := strings.Fields(v)
@@ -96,57 +108,82 @@ func inspect(pid int) (*process, error) {
 	return p, nil
 }
 
-// trigger asks the JVM to start listening on sock: it creates the attach
-// file, owned by the JVM's user, and sends SIGQUIT, which a JVM that
-// doesn't handle it (-Xrs) would die of.
-func (p *process) trigger(sock string, deadline time.Time) error {
+// trigger asks the JVM to start listening on its attach socket, name in
+// its root: it creates the attach file, owned by the JVM's user, and sends
+// SIGQUIT, which a JVM that doesn't handle it (-Xrs) would die of. It
+// returns the socket, as openSocket does.
+func (p *process) trigger(pidfd, root int, name string, deadline time.Time) (int, error) {
 	if !p.catchesQuit {
-		return fmt.Errorf("process %d doesn't handle SIGQUIT, so it isn't a JVM that can be attached to", p.pid)
+		return -1, fmt.Errorf("process %d doesn't handle SIGQUIT, so it isn't a JVM that can be attached to", p.pid)
 	}
 	// A JVM that doesn't attach answers SIGQUIT with a thread dump on its
 	// stdout: not worth causing to find out.
 	if attachDisabled(p.pid) {
-		return fmt.Errorf("process %d runs with -XX:+DisableAttachMechanism, so no agent can be loaded into it; start it with -javaagent instead", p.pid)
+		return -1, fmt.Errorf("process %d runs with -XX:+DisableAttachMechanism, so no agent can be loaded into it; start it with -javaagent instead", p.pid)
 	}
-	name := fmt.Sprintf(".attach_pid%d", p.nsPID)
-	var file string
-	for _, dir := range []string{p.cwd, filepath.Join(p.root, "tmp")} {
-		f, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if errors.Is(err, os.ErrExist) {
-			file = filepath.Join(dir, name)
+	// In its working directory, or else its /tmp: made there, not
+	// somewhere a symlink points, and given to its user through the file
+	// itself.
+	file := fmt.Sprintf(".attach_pid%d", p.nsPID)
+	made := false
+	for _, open := range []func() (int, error){
+		func() (int, error) { return openCwd(p.pid) },
+		func() (int, error) { return openIn(root, "tmp", unix.O_PATH|unix.O_DIRECTORY, 0) },
+	} {
+		dir, err := open()
+		if err != nil {
+			continue
+		}
+		defer unix.Close(dir)
+		fd, err := createIn(dir, file, 0o600)
+		if errors.Is(err, unix.EEXIST) {
+			made = true // someone's, perhaps a JDK's tool: the JVM looks for it all the same
 			break
 		}
-		if err == nil {
-			f.Close()
-			file = filepath.Join(dir, name)
-			_ = os.Chown(file, p.uid, p.gid)
-			defer os.Remove(file)
-			break
+		if err != nil {
+			continue
 		}
+		_ = unix.Fchown(fd, p.uid, p.gid)
+		unix.Close(fd)
+		defer unix.Unlinkat(dir, file, 0)
+		made = true
+		break
 	}
-	if file == "" {
-		return fmt.Errorf("can't create %s in process %d's working directory or /tmp", name, p.pid)
+	if !made {
+		return -1, fmt.Errorf("can't create %s in process %d's working directory or /tmp", file, p.pid)
 	}
-	if err := syscall.Kill(p.pid, syscall.SIGQUIT); err != nil {
-		return err
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGQUIT, nil, 0); err != nil {
+		return -1, fmt.Errorf("process %d: %w", p.pid, err)
 	}
-	for wait := 20 * time.Millisecond; !isSocket(sock); wait = min(2*wait, 500*time.Millisecond) {
+	for wait := 20 * time.Millisecond; ; wait = min(2*wait, 500*time.Millisecond) {
+		if sock, err := openSocket(root, name); err == nil {
+			return sock, nil
+		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("process %d didn't start its attach listener (is attaching disabled, -XX:+DisableAttachMechanism?)", p.pid)
+			return -1, fmt.Errorf("process %d didn't start its attach listener (is attaching disabled, -XX:+DisableAttachMechanism?)", p.pid)
 		}
 		time.Sleep(wait)
 	}
-	return nil
 }
 
-func isSocket(path string) bool {
-	fi, err := os.Stat(path)
-	return err == nil && fi.Mode()&os.ModeSocket != 0
+// openSocket returns an O_PATH descriptor for the socket at name in the
+// filesystem whose root is root, or an error if there's none.
+func openSocket(root int, name string) (int, error) {
+	fd, err := openIn(root, name, unix.O_PATH|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, err
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFSOCK {
+		unix.Close(fd)
+		return -1, fmt.Errorf("%s isn't a socket", name)
+	}
+	return fd, nil
 }
 
 // request sends a command with its arguments, and returns the output of a
 // command that succeeded.
-func request(p *process, sock string, deadline time.Time, cmd string, args ...string) (string, error) {
+func request(p *process, sock int, deadline time.Time, cmd string, args ...string) (string, error) {
 	c, err := dialAs(sock, p.uid, p.gid)
 	if err != nil {
 		return "", err
@@ -169,25 +206,26 @@ func request(p *process, sock string, deadline time.Time, cmd string, args ...st
 	out, _ := io.ReadAll(r)
 	code, err := strconv.Atoi(strings.TrimSpace(status))
 	if err != nil {
-		return "", fmt.Errorf("attach listener answered %q", status)
+		return "", fmt.Errorf("attach listener answered %s", quote(status))
 	}
 	msg := strings.TrimSpace(string(out))
 	if code != 0 {
-		return msg, fmt.Errorf("%s failed (%d): %s", cmd, code, msg)
+		return msg, fmt.Errorf("%s failed (%d): %s", cmd, code, quote(msg))
 	}
 	// load's own result: the agent's, where it failed.
 	if rc, ok := strings.CutPrefix(msg, "return code: "); ok && strings.TrimSpace(rc) != "0" {
-		return msg, fmt.Errorf("%s failed: %s", cmd, msg)
+		return msg, fmt.Errorf("%s failed: %s", cmd, quote(msg))
 	}
 	return msg, nil
 }
 
-func statOwner(fi os.FileInfo) (int, bool) {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, false
+// quote makes what a process said fit to show: quoted, so it can't carry
+// terminal escapes, and not too long.
+func quote(s string) string {
+	if len(s) > 200 {
+		s = s[:200] + "..."
 	}
-	return int(st.Uid), true
+	return strconv.Quote(s)
 }
 
 // attachDisabled reports whether a JVM was started with attaching turned
@@ -219,25 +257,22 @@ func attachDisabled(pid int) bool {
 	return disabled
 }
 
-// dialAs connects to the JVM's attach socket as the JVM's user, uid and gid
-// as the host sees them: the listener takes connections from its own user
-// (and, in some versions, root), as the kernel shows them in its user
-// namespace, where root may be no one (rootless containers).
+// dialAs connects to the JVM's attach socket, sock (an O_PATH descriptor),
+// as the JVM's user, uid and gid as the host sees them: the listener takes
+// connections from its own user (and, in some versions, root), as the
+// kernel shows them in its user namespace, where root may be no one
+// (rootless containers).
 //
-// The socket is opened as root, and connected to through /proc/self/fd on a
-// thread whose effective IDs are set to the JVM's: setresuid and setresgid
-// as raw syscalls change only the calling thread, unlike Go's own, which
-// change every one. The thread isn't given back to the runtime (the
-// goroutine exits locked to it), so nothing else runs with its IDs.
-func dialAs(sock string, uid, gid int) (net.Conn, error) {
+// The socket is connected to through /proc/self/fd, for a JVM that isn't
+// root's on a thread whose effective IDs are set to the JVM's: setresuid
+// and setresgid as raw syscalls change only the calling thread, unlike Go's
+// own, which change every one. The thread isn't given back to the runtime
+// (the goroutine exits locked to it), so nothing else runs with its IDs.
+func dialAs(sock, uid, gid int) (net.Conn, error) {
+	path := fmt.Sprintf("/proc/self/fd/%d", sock)
 	if uid == 0 {
-		return net.Dial("unix", sock)
+		return net.Dial("unix", path)
 	}
-	fd, err := unix.Open(sock, unix.O_PATH|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer unix.Close(fd)
 	type result struct {
 		c   net.Conn
 		err error
@@ -253,7 +288,7 @@ func dialAs(sock string, uid, gid int) (net.Conn, error) {
 			done <- result{nil, fmt.Errorf("setresuid: %w", e)}
 			return
 		}
-		c, err := net.Dial("unix", fmt.Sprintf("/proc/self/fd/%d", fd))
+		c, err := net.Dial("unix", path)
 		done <- result{c, err}
 	}()
 	r := <-done
