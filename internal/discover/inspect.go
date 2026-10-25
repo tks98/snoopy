@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"runtime"
 	"slices"
@@ -81,18 +82,18 @@ type GoFunc struct {
 
 // Inspect reports which supported TLS implementations a file contains.
 func Inspect(path string) ([]Target, error) {
-	f, err := elf.Open(path)
+	f, file, err := openELF(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer file.Close()
 
 	if f.Machine != hostMachine() {
 		return nil, errWrongArc
 	}
 
 	var targets []Target
-	gi, err := inspectGo(path, f)
+	gi, err := inspectGo(file, f)
 	if errors.Is(err, errQUICGoAEADs) {
 		// Nothing to attach to, but worth saying.
 		return []Target{{Path: path, Library: GoTLS, Problem: err}}, nil
@@ -177,8 +178,8 @@ func definedFuncs(f *elf.File) map[string]bool {
 
 // inspectGo returns nil, nil if the file is not a Go binary or doesn't use
 // crypto/tls.
-func inspectGo(path string, f *elf.File) (*GoInfo, error) {
-	bi, err := buildinfo.ReadFile(path)
+func inspectGo(file io.ReaderAt, f *elf.File) (*GoInfo, error) {
+	bi, err := buildinfo.Read(file)
 	if err != nil {
 		return nil, nil
 	}

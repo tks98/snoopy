@@ -413,7 +413,15 @@ func closeLinks(links []link.Link) {
 }
 
 func (t *Tracer) attach(target discover.Target, pid int) ([]string, error) {
-	ex, err := link.OpenExecutable(target.Path)
+	// The file inspected, held onto: cilium/ebpf opens it again by path to
+	// read its symbols, and the kernel looks the path up for each probe, by
+	// when something else (a FIFO, which would block) could be there.
+	fd, err := discover.OpenPath(target.Path)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(fd)
+	ex, err := link.OpenExecutable(fmt.Sprintf("/proc/self/fd/%d", fd))
 	if err != nil {
 		return nil, err
 	}
@@ -760,28 +768,44 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 	}()
 	go func() { // hold new processes, one at a time
 		defer wg.Done()
-		// ptrace requests have to come from the thread that seized.
+		// ptrace requests have to come from the thread that seized, which
+		// stays locked: when this goroutine ends, so does the thread, and
+		// the kernel lets go of whatever it still traces.
 		runtime.LockOSThread()
+		// Threads seized that didn't stop in time (in an uninterruptible
+		// sleep, say), which can't be detached from until they do stop.
+		var stray []int
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-tick.C:
+				stray = slices.DeleteFunc(stray, letGo)
 			case p := <-holds:
 				// A new process, or a thread that loaded a TLS library.
-				sig, ok := seize(p.tid)
+				sig, ok, attached := seize(p.tid)
 				if !ok {
+					if attached {
+						stray = append(stray, p.tid)
+					}
 					continue
 				}
+				// Held until it's attached to, or for maxHold, also when
+				// the inspector is still busy with another.
 				p.done = make(chan struct{})
+				limit := time.After(p.maxHold())
 				select {
 				case held <- p:
 					select {
 					case <-p.done:
-					case <-time.After(p.maxHold()):
+					case <-limit:
 					}
+				case <-limit:
 				case <-ctx.Done():
 				}
-				release(p.tid, sig)
+				_ = release(p.tid, sig) // stopped, so this works
 			}
 		}
 	}()
@@ -871,14 +895,15 @@ func (p heldProcess) maxHold() time.Duration {
 
 // seize stops a process, or one of its threads (pid is a thread ID), with
 // ptrace, without its parent seeing it stop, and returns the signal it
-// stopped for, if any, which release passes on.
-func seize(pid int) (sig int, ok bool) {
+// stopped for, if any, which release passes on. If it didn't stop (ok is
+// false) but is still traced (attached), it will stop later, when it can,
+// and has to be let go of then (letGo): detaching only works from a stop.
+func seize(pid int) (sig int, ok, attached bool) {
 	if unix.PtraceSeize(pid) != nil {
-		return 0, false // gone, already traced, or not allowed (Yama)
+		return 0, false, false // gone, already traced, or not allowed (Yama)
 	}
 	if unix.PtraceInterrupt(pid) != nil {
-		release(pid, 0)
-		return 0, false
+		return 0, false, !letGo(pid)
 	}
 	// Wait for it to stop, without blocking: another thread waiting for the
 	// process (if it's our own child) can take the notification, and then
@@ -893,18 +918,43 @@ func seize(pid int) (sig int, ok bool) {
 			// PTRACE_INTERRUPT's own stop is a PTRACE_EVENT_STOP; any
 			// other stop is a signal arriving, to deliver when it goes.
 			if ws.TrapCause() == unix.PTRACE_EVENT_STOP {
-				return 0, true
+				return 0, true, true
 			}
-			return int(ws.StopSignal()), true
+			return int(ws.StopSignal()), true, true
 		case n == pid || err != nil && err != unix.ECHILD:
-			return 0, false // it exited
+			return 0, false, false // it exited
 		}
 		if traceStopped(pid) {
-			return 0, true
+			return 0, true, true
 		}
 	}
-	release(pid, 0)
-	return 0, false
+	return 0, false, !letGo(pid)
+}
+
+// letGo detaches from a thread seized that didn't stop when asked, if it
+// has stopped by now or is gone, and reports whether it's let go of.
+func letGo(pid int) bool {
+	var ws unix.WaitStatus
+	n, err := unix.Wait4(pid, &ws, unix.WALL|unix.WNOHANG, nil)
+	sig := 0
+	switch {
+	case n == pid && ws.Stopped():
+		if ws.TrapCause() != unix.PTRACE_EVENT_STOP {
+			sig = int(ws.StopSignal())
+		}
+	case n == pid || err != nil && err != unix.ECHILD && err != unix.EINTR:
+		return true // it exited
+	case !traceStopped(pid):
+		return false // not stopped yet
+	default:
+		// Stopped since: for a signal, which detaching would lose without
+		// it, if the stop's notification came meanwhile.
+		if n, _ := unix.Wait4(pid, &ws, unix.WALL|unix.WNOHANG, nil); n == pid && ws.Stopped() &&
+			ws.TrapCause() != unix.PTRACE_EVENT_STOP {
+			sig = int(ws.StopSignal())
+		}
+	}
+	return release(pid, sig) == nil
 }
 
 // traceStopped reports whether a process is in a ptrace stop: state t in
@@ -918,8 +968,19 @@ func traceStopped(pid int) bool {
 	return i >= 0 && i+2 < len(stat) && stat[i+2] == 't'
 }
 
-func release(pid, sig int) {
-	_, _, _ = unix.Syscall6(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(pid), 0, uintptr(sig), 0, 0)
+// release detaches from a thread. ESRCH means it's gone, or not in a stop,
+// which leaves it traced: the latter is an error.
+func release(pid, sig int) error {
+	_, _, e := unix.Syscall6(unix.SYS_PTRACE, unix.PTRACE_DETACH, uintptr(pid), 0, uintptr(sig), 0, 0)
+	if e == unix.ESRCH {
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err != nil {
+			return nil // gone
+		}
+	}
+	if e != 0 {
+		return e
+	}
+	return nil
 }
 
 // Run delivers events to handle until ctx is cancelled. handle is called

@@ -393,7 +393,7 @@ func (w *Watcher) Needed(pid int) []Target {
 		if path != exe && isTLSLibraryName(filepath.Base(path)) {
 			targets = append(targets, w.inspect(filepath.Join(root, path), "")...)
 		}
-		f, err := elf.Open(filepath.Join(root, path))
+		f, file, err := openELF(filepath.Join(root, path))
 		if err != nil {
 			continue
 		}
@@ -407,7 +407,7 @@ func (w *Watcher) Needed(pid int) []Target {
 				break // RUNPATH, if present, overrides RPATH
 			}
 		}
-		f.Close()
+		file.Close()
 		search = append(append(envPath, search...), libDirs...)
 		for _, name := range needed {
 			if lib := findLibrary(root, name, search); lib != "" {
