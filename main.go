@@ -410,6 +410,12 @@ func (f addrFilter) match(ev *tracer.Event) bool {
 }
 
 func main() {
+	// --serve-exec, kubectl snoopy's pods' waiter (see serveExec), is
+	// hidden: not in --help, and only on its own.
+	if len(os.Args) == 2 && (os.Args[1] == "--serve-exec" || os.Args[1] == "-serve-exec") {
+		serveExec()
+		return
+	}
 	cfg, err := parseFlags(os.Args[1:], os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
 		return
