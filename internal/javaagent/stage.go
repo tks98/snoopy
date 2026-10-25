@@ -79,7 +79,7 @@ func stage(root int, agent, hooks []byte) (string, error) {
 	}
 	defer unix.Close(tmp)
 	if err := unix.Mkdirat(tmp, name, 0o755); errors.Is(err, unix.EROFS) {
-		return "", errors.New("it's read-only (a container with a read-only root?), and the JVM needs it writable to be attached to too: give it a writable /tmp, such as a tmpfs, or start it with -javaagent")
+		return "", errors.New("it's read-only (a container with a read-only root?), and the JVM needs it writable to be attached to too: give it a writable /tmp, such as a tmpfs")
 	} else if err != nil && !errors.Is(err, unix.EEXIST) {
 		return "", err
 	}
