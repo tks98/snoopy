@@ -74,10 +74,17 @@ jobs:
           go-version-file: go.mod
       - name: Install TLS clients
         run: sudo apt-get update && sudo apt-get install -y curl python3 gnutls-bin libnss3-dev libwolfssl-dev libmbedtls-dev pkg-config
+      # For TestJSSE: snoopy's Java agent is built for, and tested on, 21
+      # and later; the runners' own JDK is 17.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
       - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
       - name: Run (as root)
         working-directory: internal/tracer
-        run: sudo ./tracer.test -test.v -test.timeout 5m
+        # With PATH, which sudo would reset, for setup-java's JDK.
+        run: sudo env PATH="$PATH" ./tracer.test -test.v -test.timeout 5m
       # --quiet: the runner's own TLS traffic, including its credentials,
       # must not end up in the (public) log.
       - name: Smoke-test the binary

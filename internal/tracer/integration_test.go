@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1528,8 +1529,14 @@ func TestRustls(t *testing.T) {
 // agent jar's path.
 func javaAgent(t *testing.T) string {
 	t.Helper()
-	requireTool(t, "javac")
+	javac := requireTool(t, "javac")
 	requireTool(t, "jar")
+	// "javac 21.0.13": the agent is built for 21 and later.
+	out, err := exec.Command(javac, "-version").CombinedOutput()
+	major, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimSpace(string(out)), "javac "), ".")
+	if n, _ := strconv.Atoi(major); err != nil || n < 21 {
+		t.Skipf("the Java agent needs JDK 21 or later to build; javac says %q", strings.TrimSpace(string(out)))
+	}
 	if out, err := exec.Command("sh", "../../java/build.sh").CombinedOutput(); err != nil {
 		t.Fatalf("build the Java agent: %v: %s", err, out)
 	}
