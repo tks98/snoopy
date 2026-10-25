@@ -68,9 +68,10 @@ Output:
 
 Capture:
   --max-size BYTES   bytes to capture per call (default 16384, at most 1048576)
-  --java             also Java's own TLS (SunJSSE) in the --pid JVM, by
-                     loading snoopy's agent into it (it stays loaded,
-                     idle, after snoopy stops)
+  --java             also Java's own TLS (SunJSSE) in the --pid JVM, or the
+                     JVMs in the --container containers, by loading
+                     snoopy's agent into them (it stays loaded, idle,
+                     after snoopy stops)
   --java-agent DIR   the directory with the agent's jars (default: next to
                      snoopy, or java/out in a source tree)
   --lib PATH         also attach to this library or program, e.g. one with

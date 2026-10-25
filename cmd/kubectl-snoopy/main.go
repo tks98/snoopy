@@ -46,6 +46,9 @@ const example = `  # What the pod's containers send and receive over TLS
   kubectl snoopy deploy/checkout -n shop --brief
   kubectl snoopy -l app=checkout -n shop --json
 
+  # Java's own TLS (SunJSSE) too, through snoopy's agent in the JVMs
+  kubectl snoopy deploy/checkout -n shop --java
+
   # JSON, only connections to port 443
   kubectl snoopy checkout-7d9f --json --port 443 | jq .
 
@@ -85,7 +88,7 @@ type options struct {
 	version    bool
 
 	// snoopy's own flags, the commonest, passed on.
-	brief, json, full, hex, verbose, redact bool
+	brief, json, full, hex, verbose, redact, java bool
 	hosts, ports                            []string
 	methods, paths, statuses                []string
 	count                                   int
@@ -150,6 +153,7 @@ func newCommand(o *options) *cobra.Command {
 	f.BoolVar(&o.hex, "hex", false, "snoopy: payloads as hex dumps")
 	f.BoolVar(&o.verbose, "verbose", false, "snoopy: also calls that only keep connections going")
 	f.BoolVar(&o.redact, "redact", false, "snoopy: mask credentials, secret fields and recognizable tokens")
+	f.BoolVar(&o.java, "java", false, "snoopy: also Java's own TLS (SunJSSE), by loading snoopy's agent into the containers' JVMs")
 	f.StringArrayVar(&o.hosts, "host", nil, "snoopy: only connections with this address, network or host at either end")
 	f.StringArrayVar(&o.ports, "port", nil, "snoopy: only connections with this port at either end")
 	f.StringArrayVar(&o.methods, "method", nil, "snoopy: only requests with this method, and their responses")
@@ -162,7 +166,7 @@ func newCommand(o *options) *cobra.Command {
 // passed returns snoopy's flags that were given to the plugin.
 func (o *options) passed() []string {
 	var args []string
-	for flag, set := range map[string]bool{"--brief": o.brief, "--json": o.json, "--full": o.full, "--hex": o.hex, "--verbose": o.verbose, "--redact": o.redact} {
+	for flag, set := range map[string]bool{"--brief": o.brief, "--json": o.json, "--full": o.full, "--hex": o.hex, "--verbose": o.verbose, "--redact": o.redact, "--java": o.java} {
 		if set {
 			args = append(args, flag)
 		}

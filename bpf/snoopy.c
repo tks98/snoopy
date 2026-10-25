@@ -1386,9 +1386,10 @@ static __always_inline void note_library_load(struct pt_regs *regs)
 // wrote as frames, a struct java_frame and the payload, to a descriptor for
 // /dev/null, on the calling thread; they're picked up here, before the
 // write goes anywhere. A process's frames count only once user space has
-// registered its session (java_sessions, by host PID), with the nonce the
-// agent was started with, and, with BTF, only on the null device; the first
-// one fixes the descriptor. They're kept out of the socket tracking below.
+// registered its session (java_sessions, by PID as snoopy sees it), with
+// the nonce the agent was started with, and, with BTF, only on the null
+// device; the first one fixes the descriptor. They're kept out of the
+// socket tracking below.
 #define JAVA_FRAME_MAGIC 0x3130564a59504e53ULL // "SNPYJV01"
 #define JAVA_KIND_SOCKET 0
 #define JAVA_KIND_ENGINE 1
@@ -1443,7 +1444,12 @@ static __always_inline bool null_device(__s32 fd)
 static __always_inline bool note_java_frame(struct pt_regs *regs)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u32 tgid = pid_tgid >> 32;
+	// Sessions are by PID as snoopy sees it, in its own PID namespace if
+	// it's in one (a pod with the node's, in kind, is nested).
+	__u64 ns = pidns_ino ? ns_pid_tgid() : pid_tgid;
+	if (!ns)
+		return false;
+	__u32 tgid = ns >> 32;
 	struct java_session *s = bpf_map_lookup_elem(&java_sessions, &tgid);
 	if (!s)
 		return false;
@@ -1463,9 +1469,6 @@ static __always_inline bool note_java_frame(struct pt_regs *regs)
 	if (!f.size)
 		return true; // the agent's first frame, saying it's ready
 
-	__u64 ns = pidns_ino ? ns_pid_tgid() : pid_tgid;
-	if (!ns)
-		return true;
 	struct event_header h;
 	__builtin_memset(&h, 0, sizeof(h));
 	__u64 now = bpf_ktime_get_ns();

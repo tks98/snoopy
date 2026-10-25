@@ -197,8 +197,8 @@ func (t *Tracer) TracePID(pid uint32) error {
 	return nil
 }
 
-// RegisterJava makes the frames of snoopy's Java agent in process pid (a
-// host PID) count, those carrying nonce, the session's secret: the agent
+// RegisterJava makes the frames of snoopy's Java agent in process pid (as
+// snoopy sees it, in its PID namespace) count, those carrying nonce, the session's secret: the agent
 // writes them to /dev/null, and they become events like a TLS library's
 // calls. Register before loading the agent, so its first calls are seen.
 func (t *Tracer) RegisterJava(pid uint32, nonce uint64) error {

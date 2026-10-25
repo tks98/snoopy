@@ -170,9 +170,10 @@ Output:
 
 Capture:
   --max-size BYTES   bytes to capture per call (default %d, at most %d)
-  --java             also Java's own TLS (SunJSSE) in the --pid JVM, by
-                     loading snoopy's agent into it (it stays loaded,
-                     idle, after snoopy stops)
+  --java             also Java's own TLS (SunJSSE) in the --pid JVM, or the
+                     JVMs in the --container containers, by loading
+                     snoopy's agent into them (it stays loaded, idle,
+                     after snoopy stops)
   --java-agent DIR   the directory with the agent's jars (default: next to
                      snoopy, or java/out in a source tree)
   --lib PATH         also attach to this library or program, e.g. one with
@@ -242,8 +243,11 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	if c.count < 0 {
 		return c, errors.New("--count must be positive")
 	}
-	if c.java && c.pid == 0 {
-		return c, errors.New("--java needs --pid: snoopy loads its agent only into a JVM it's given")
+	if c.java && c.pid == 0 && len(c.containers) == 0 {
+		return c, errors.New("--java needs --pid or --container: snoopy loads its agent only into JVMs it's given")
+	}
+	if c.java && c.pid != 0 && len(c.containers) > 0 {
+		return c, errors.New("--java takes --pid or --container, not both")
 	}
 	if c.javaAgent != "" && !c.java {
 		return c, errors.New("--java-agent is for --java")
@@ -516,16 +520,16 @@ func run(cfg config) error {
 	if !t.ResolvesAddresses() {
 		logf("warning: the kernel has no BTF, so socket addresses are looked up in /proc and may be missing for short-lived connections")
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if cfg.java {
-		stopJava, err := startJava(cfg, t)
+		stopJava, err := startJava(ctx, cfg, t)
 		if err != nil {
 			return err
 		}
 		defer stopJava()
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	quic := &quicSeen{pids: map[uint32]bool{}}
 	go watchCounters(ctx, t, quic)
 	if cfg.pid != 0 && !t.ResolvesAddresses() {
