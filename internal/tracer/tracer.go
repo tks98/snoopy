@@ -638,6 +638,11 @@ const loadedLibrary = 0x80000000
 // stripped BoringSSL) can take longer, and it isn't held up for that.
 const maxHold = 2 * time.Second
 
+// maxLibraryHold is how long a thread that loaded a TLS library is held: a
+// stripped BoringSSL (Conscrypt's) is analyzed the first time snoopy sees
+// its build, which takes seconds, and the thread is about to use it.
+const maxLibraryHold = 10 * time.Second
+
 // WatchNewProcesses attaches, in the background, to the TLS libraries and
 // programs of processes that start from now on, as w finds them, and per
 // process (see Options.PerProcess), those forked from a traced one. accept, if
@@ -748,7 +753,7 @@ func (t *Tracer) WatchNewProcesses(w *discover.Watcher, accept, hold func(pid in
 				case held <- p:
 					select {
 					case <-p.done:
-					case <-time.After(maxHold):
+					case <-time.After(p.maxHold()):
 					}
 				case <-ctx.Done():
 				}
@@ -830,6 +835,14 @@ type heldProcess struct {
 	// new process.
 	library bool
 	done    chan struct{} // closed once its files are attached to
+}
+
+// maxHold is how long the thread is held at most.
+func (p heldProcess) maxHold() time.Duration {
+	if p.library {
+		return maxLibraryHold
+	}
+	return maxHold
 }
 
 // seize stops a process, or one of its threads (pid is a thread ID), with
