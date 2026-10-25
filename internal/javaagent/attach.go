@@ -20,10 +20,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Load loads the agent jar into process pid, passing it options, and
@@ -48,7 +51,7 @@ func Load(pid int, jar, options string, timeout time.Duration) (string, error) {
 	if options != "" {
 		arg += "=" + options
 	}
-	return request(sock, deadline, "load", "instrument", "false", arg)
+	return request(p, sock, deadline, "load", "instrument", "false", arg)
 }
 
 type process struct {
@@ -143,8 +146,8 @@ func isSocket(path string) bool {
 
 // request sends a command with its arguments, and returns the output of a
 // command that succeeded.
-func request(sock string, deadline time.Time, cmd string, args ...string) (string, error) {
-	c, err := net.DialTimeout("unix", sock, time.Until(deadline))
+func request(p *process, sock string, deadline time.Time, cmd string, args ...string) (string, error) {
+	c, err := dialAs(sock, p.uid, p.gid)
 	if err != nil {
 		return "", err
 	}
@@ -214,4 +217,45 @@ func attachDisabled(pid int) bool {
 	scan("environ", "JDK_JAVA_OPTIONS=")
 	scan("cmdline", "")
 	return disabled
+}
+
+// dialAs connects to the JVM's attach socket as the JVM's user, uid and gid
+// as the host sees them: the listener takes connections from its own user
+// (and, in some versions, root), as the kernel shows them in its user
+// namespace, where root may be no one (rootless containers).
+//
+// The socket is opened as root, and connected to through /proc/self/fd on a
+// thread whose effective IDs are set to the JVM's: setresuid and setresgid
+// as raw syscalls change only the calling thread, unlike Go's own, which
+// change every one. The thread isn't given back to the runtime (the
+// goroutine exits locked to it), so nothing else runs with its IDs.
+func dialAs(sock string, uid, gid int) (net.Conn, error) {
+	if uid == 0 {
+		return net.Dial("unix", sock)
+	}
+	fd, err := unix.Open(sock, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(fd)
+	type result struct {
+		c   net.Conn
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread() // and never unlocked: the thread goes when this does
+		if _, _, e := unix.RawSyscall(unix.SYS_SETRESGID, ^uintptr(0), uintptr(gid), ^uintptr(0)); e != 0 {
+			done <- result{nil, fmt.Errorf("setresgid: %w", e)}
+			return
+		}
+		if _, _, e := unix.RawSyscall(unix.SYS_SETRESUID, ^uintptr(0), uintptr(uid), ^uintptr(0)); e != 0 {
+			done <- result{nil, fmt.Errorf("setresuid: %w", e)}
+			return
+		}
+		c, err := net.Dial("unix", fmt.Sprintf("/proc/self/fd/%d", fd))
+		done <- result{c, err}
+	}()
+	r := <-done
+	return r.c, r.err
 }

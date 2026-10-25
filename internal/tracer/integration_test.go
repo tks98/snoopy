@@ -1576,6 +1576,7 @@ func javaVersion(t *testing.T, java string) int {
 // first (-javaagent); then, once it prints "ready", before what's
 // measured.
 type javaProgram struct {
+	jvm   uint32 // the JVM's PID, if not the command's
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
 	out   *bufio.Scanner
@@ -1584,8 +1585,16 @@ type javaProgram struct {
 
 func startJava(t *testing.T, java string, javaArgs []string, program string, args ...string) *javaProgram {
 	t.Helper()
-	all := append([]string{"-c", `read x; exec "$@"`, "sh", java}, javaArgs...)
-	all = append(append(all, "testdata/java/"+program), args...)
+	return startJavaWith(t, []string{java}, javaArgs, "testdata/java/"+program, args...)
+}
+
+// startJavaWith starts a program with launcher, the command that runs java
+// (under another user, in a container), and the program's path as java
+// sees it.
+func startJavaWith(t *testing.T, launcher, javaArgs []string, program string, args ...string) *javaProgram {
+	t.Helper()
+	all := append(append([]string{"-c", `read x; exec "$@"`, "sh"}, launcher...), javaArgs...)
+	all = append(append(all, program), args...)
 	cmd := exec.Command("sh", all...)
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()
@@ -1603,7 +1612,31 @@ func startJava(t *testing.T, java string, javaArgs []string, program string, arg
 	return &javaProgram{cmd: cmd, stdin: stdin, out: bufio.NewScanner(stdout)}
 }
 
-func (p *javaProgram) pid() uint32 { return uint32(p.cmd.Process.Pid) }
+func (p *javaProgram) pid() uint32 {
+	if p.jvm != 0 {
+		return p.jvm
+	}
+	return uint32(p.cmd.Process.Pid)
+}
+
+// findJVM sets the program's PID to that of the JVM whose command line has
+// marker in it: in a container, it isn't the command's.
+func (p *javaProgram) findJVM(t *testing.T, marker string) {
+	t.Helper()
+	dirs, _ := os.ReadDir("/proc")
+	for _, d := range dirs {
+		pid, err := strconv.Atoi(d.Name())
+		if err != nil {
+			continue
+		}
+		cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if ok, _ := javaagent.IsHotSpot(pid); ok && bytes.Contains(cmdline, []byte(marker)) {
+			p.jvm = uint32(pid)
+			return
+		}
+	}
+	t.Fatalf("no JVM with %q in its command line", marker)
+}
 
 // exec lets sh exec java, and waits for the program to be ready.
 func (p *javaProgram) exec(t *testing.T) {
@@ -1857,6 +1890,86 @@ func TestJSSE(t *testing.T) {
 			if want := strings.Repeat(fmt.Sprintf("virtual-%d-", id), 50); string(body) != want {
 				t.Errorf("connection %d's body is %d bytes, not its %d", id, len(body), len(want))
 			}
+		}
+	})
+
+	// JVMs of other users, as the kernel shows them in their own user
+	// namespace too (as in rootless containers), and in containers: the
+	// agent's jars are staged where each can read them, and the attach
+	// socket is connected to as the JVM's user.
+	t.Run("elsewhere", func(t *testing.T) {
+		// Somewhere everyone can read the program from.
+		dir, err := os.MkdirTemp("", "jsse")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(dir) })
+		src, err := os.ReadFile("testdata/java/JSSEClient.java")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "JSSEClient.java"), src, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for path, mode := range map[string]os.FileMode{dir: 0o755, filepath.Join(dir, "JSSEClient.java"): 0o644} {
+			if err := os.Chmod(path, mode); err != nil { // not the umask's
+				t.Fatal(err)
+			}
+		}
+		docker, _ := exec.LookPath("docker")
+		image := fmt.Sprintf("eclipse-temurin:%d-jdk", jdk)
+		for _, c := range []struct {
+			name     string
+			launcher []string
+			program  string
+			docker   bool
+		}{
+			{"another user", []string{"setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", java}, dir, false},
+			{"user namespace", []string{"unshare", "--user", "--map-users=0:65534:1", "--map-groups=0:65534:1",
+				"--setuid=0", "--setgid=0", java}, dir, false},
+			{"container", []string{docker, "run", "--rm", "-i", "--network", "host", "--user", "65534:65534",
+				"-v", dir + ":/fx:ro", image, "java"}, "/fx", true},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				if c.docker {
+					if docker == "" {
+						t.Skip("no docker")
+					}
+					if out, err := exec.Command(docker, "pull", "-q", image).CombinedOutput(); err != nil {
+						if os.Getenv("SNOOPY_TEST_JAVA") == "1" {
+							t.Fatalf("docker pull %s: %v: %s", image, err, out)
+						}
+						t.Skipf("docker pull %s: %v", image, err)
+					}
+				}
+				if !c.docker {
+					// The JDK has to be one other users can run (one under
+					// /root isn't).
+					probe := append(slices.Clone(c.launcher), "-version")
+					if out, err := exec.Command(probe[0], probe[1:]...).CombinedOutput(); err != nil {
+						t.Skipf("%s can't run this JDK as nobody: %v: %s", c.name, err, out)
+					}
+				}
+				marker := fmt.Sprintf("jsse-%x", javaNonce(t))
+				p := startJavaWith(t, c.launcher, nil, c.program+"/JSSEClient.java", srv.URL+"/"+marker, "socket", "100", "1", "2")
+				p.exec(t)
+				p.findJVM(t, marker)
+				nonce := session(t, p)
+				jar, err := javaagent.Stage(int(p.pid()), filepath.Dir(agent))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if out, err := javaagent.Load(int(p.pid()), jar, options(nonce), 10*time.Second); err != nil {
+					t.Fatalf("load the agent: %v: %s", err, out)
+				}
+				p.run(t)
+				for i := range 2 {
+					path := fmt.Sprintf("/jsse/socket/%d", i)
+					waitFor(t, events, "the write of "+path, func(ev *Event) bool {
+						return ev.PID == p.pid() && ev.Function == FuncJSSESocketWrite && bytes.Contains(ev.Data, []byte("jsse-body-"+path+"-"))
+					})
+				}
+			})
 		}
 	})
 
