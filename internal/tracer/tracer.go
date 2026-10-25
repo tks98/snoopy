@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -61,6 +62,9 @@ type Options struct {
 	// It needs BTF, to tell forks from threads; without, probes are per
 	// file.
 	PerProcess bool
+	// Java makes the frames of snoopy's Java agent count (see RegisterJava).
+	// Without it, the BPF program doesn't look for them in every write.
+	Java bool
 
 	// ignoreKernelBTF loads the program as if the kernel had no BTF (tests).
 	ignoreKernelBTF bool
@@ -79,6 +83,8 @@ type Tracer struct {
 	clock      func(monoNs uint64) time.Time
 	haveBTF    bool
 	names      map[uint32]string // process names, when the kernel can't tell
+	// tracedFull is set once traced_tgids was found full, which is said once.
+	tracedFull atomic.Bool
 }
 
 // procLinks are the probes attached for one process.
@@ -153,9 +159,10 @@ func New(opts Options) (*Tracer, error) {
 		"max_capture":  uint32(opts.MaxCapture),
 		// Without BTF the kernel only knows thread names, so the process
 		// name is filtered on in user space instead.
-		"filter_comm": opts.Comm != "" && btfErr == nil && !perProcess,
-		"targ_comm":   comm,
-		"have_btf":    btfErr == nil,
+		"filter_comm":  opts.Comm != "" && btfErr == nil && !perProcess,
+		"targ_comm":    comm,
+		"have_btf":     btfErr == nil,
+		"java_enabled": opts.Java,
 	} {
 		if err := spec.Variables[name].Set(value); err != nil {
 			return nil, fmt.Errorf("set %s: %w", name, err)
@@ -174,14 +181,25 @@ func New(opts Options) (*Tracer, error) {
 		return nil, permissionHint(fmt.Errorf("load BPF program: %w", err))
 	}
 
+	if opts.PID != 0 || perProcess || opts.Java {
+		// Processes traced or registered are forgotten when they exit.
+		l, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_exit", Program: t.objs.SchedProcessExit})
+		if err != nil {
+			t.objs.Close()
+			return nil, fmt.Errorf("raw tracepoint sched_process_exit: %w", err)
+		}
+		t.links = append(t.links, l)
+	}
 	if opts.PID != 0 {
 		if err := t.TracePID(uint32(opts.PID)); err != nil {
+			closeLinks(t.links)
 			t.objs.Close()
 			return nil, err
 		}
 	}
 	t.reader, err = ringbuf.NewReader(t.objs.Events)
 	if err != nil {
+		closeLinks(t.links)
 		t.objs.Close()
 		return nil, fmt.Errorf("open ring buffer: %w", err)
 	}
@@ -189,19 +207,52 @@ func New(opts Options) (*Tracer, error) {
 }
 
 // TracePID adds a process to those traced, with Options.PID set: a process
-// that it started, for example.
+// that it started, for example. The BPF program forgets it when it exits.
+// When too many are traced at once, it says so the first time only.
 func (t *Tracer) TracePID(pid uint32) error {
-	if err := t.objs.TracedTgids.Update(pid, uint8(1), ebpf.UpdateAny); err != nil {
+	err := t.objs.TracedTgids.Update(pid, uint8(1), ebpf.UpdateAny)
+	if errors.Is(err, unix.E2BIG) {
+		if t.tracedFull.Swap(true) {
+			return nil
+		}
+		return fmt.Errorf("trace pid %d: %d processes, the most there can be, are traced already; until some exit, new ones are traced only if they descend from one that is",
+			pid, t.objs.TracedTgids.MaxEntries())
+	}
+	if err != nil {
 		return fmt.Errorf("trace pid %d: %w", pid, err)
 	}
+	// If it exited before it was added, the BPF program didn't see it go.
+	if procGone(int(pid)) {
+		_ = t.objs.TracedTgids.Delete(pid)
+	}
 	return nil
+}
+
+// procGone reports whether a process has exited: it's gone from /proc, or
+// it's a zombie without threads left.
+func procGone(pid int) bool {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true
+	}
+	i := bytes.LastIndexByte(stat, ')') // the command name may contain anything
+	if i < 0 {
+		return true
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	// state is field 3, num_threads 20.
+	return len(fields) < 18 || fields[0] == "Z" && fields[17] == "1" || fields[0] == "X"
 }
 
 // RegisterJava makes the frames of snoopy's Java agent in process pid (as
 // snoopy sees it, in its PID namespace) count, those carrying nonce, the session's secret: the agent
 // writes them to /dev/null, and they become events like a TLS library's
 // calls. Register before loading the agent, so its first calls are seen.
+// It needs Options.Java. The session ends when the process exits.
 func (t *Tracer) RegisterJava(pid uint32, nonce uint64) error {
+	if !t.opts.Java {
+		return errors.New("register java session: the tracer was made without Options.Java")
+	}
 	s := snoopyJavaSession{Nonce: nonce, Fd: -1}
 	if err := t.objs.JavaSessions.Update(pid, &s, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("register java session for pid %d: %w", pid, err)
@@ -313,14 +364,15 @@ func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
 	if !t.perProcess {
 		pid = 0
 	}
+	var traceErr error
 	if pid != 0 {
-		if err := t.TracePID(uint32(pid)); err != nil {
-			return nil, err
-		}
+		// Attached to even if it can't be added: a process descending from
+		// one traced still is.
+		traceErr = t.TracePID(uint32(pid))
 	}
 	key, err := targetKey(target)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(traceErr, err)
 	}
 	if pid != 0 {
 		t.mu.Lock()
@@ -332,7 +384,7 @@ func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
 		}
 		t.mu.Unlock()
 		if attached {
-			return funcs, nil
+			return funcs, traceErr
 		}
 	}
 	funcs, err := t.attach(target, pid)
@@ -345,7 +397,7 @@ func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
 		}
 		t.mu.Unlock()
 	}
-	return funcs, err
+	return funcs, errors.Join(traceErr, err)
 }
 
 func targetKey(target discover.Target) (procFile, error) {
