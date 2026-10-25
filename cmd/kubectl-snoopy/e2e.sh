@@ -77,6 +77,31 @@ for target in deploy/clients "-l app=clients"; do
 	echo "$target: $(grep -c '^{' "$tmp/out.json") events, from $pods pods"
 	[ "$pods" -eq 2 ] || fail "$target: events from $pods of the deployment's 2 pods"
 done
+
+echo "== following a rollout: the new pods are traced as they start"
+old_pods=$(kubectl get pods -l app=clients -o jsonpath='{.items[*].metadata.name}')
+"$tmp/kubectl-snoopy" deploy/clients --image "$image" --json > "$tmp/out.json" 2> "$tmp/err" &
+plugin=$!
+for i in $(seq 60); do grep -q tracing "$tmp/err" && break; sleep 1; done
+kubectl rollout restart deployment/clients >/dev/null
+kubectl rollout status deployment/clients --timeout=120s >/dev/null
+sleep 15
+kill -INT $plugin
+wait $plugin || true
+new_pods=$(kubectl get pods -l app=clients -o jsonpath='{.items[*].metadata.name}')
+seen_new=0
+for p in $new_pods; do
+	case " $old_pods " in *" $p "*) continue ;; esac
+	grep -q "\"container_name\":\"$p/curl\"" "$tmp/out.json" && seen_new=$((seen_new + 1))
+done
+echo "events from $seen_new of the rollout's new pods"
+[ "$seen_new" -ge 1 ] || { cat "$tmp/err" >&2; fail "the rollout's new pods weren't traced"; }
+for i in $(seq 30); do
+	left=$(kubectl get pods -A -l app.kubernetes.io/managed-by=kubectl-snoopy --no-headers 2>/dev/null | wc -l)
+	[ "$left" -eq 0 ] && break
+	sleep 1
+done
+[ "$left" -eq 0 ] || fail "$left snoopy pods left behind after following"
 kubectl delete deployment clients --wait=false >/dev/null
 
 echo "== a namespace that doesn't allow privileged pods"

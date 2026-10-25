@@ -80,6 +80,7 @@ type options struct {
 	image      string
 	deadline   time.Duration
 	keep       bool
+	noFollow   bool
 	cleanup    bool
 	version    bool
 
@@ -140,6 +141,7 @@ func newCommand(o *options) *cobra.Command {
 	f.StringVar(&o.image, "image", "", "snoopy's image (default: "+defaultImage+", this plugin's version)")
 	f.DurationVar(&o.deadline, "max-duration", 4*time.Hour, "how long the snoopy pod may run, should the plugin be killed")
 	f.BoolVar(&o.keep, "keep", false, "leave the snoopy pod when done")
+	f.BoolVar(&o.noFollow, "no-follow", false, "don't trace pods that start, or containers that restart, after it did")
 	f.BoolVar(&o.cleanup, "cleanup", false, "delete snoopy pods left behind (in --namespace, or all)")
 	f.BoolVar(&o.version, "version", false, "print the plugin's version")
 	f.BoolVar(&o.brief, "brief", false, "snoopy: one line per call")
@@ -237,68 +239,52 @@ func (o *options) run(ctx context.Context, target string, rest []string) error {
 		name = cmp.Or(name, "selected")
 	}
 	args := append(o.passed(), rest...)
+	// Following new pods, unless told not to, or --count makes each snoopy
+	// pod stop by itself.
+	follow := !o.noFollow && o.count == 0 && !slices.Contains(rest, "--count")
 
-	// One snoopy pod per node, for the containers there.
-	sessions := make([]*session, len(nodes))
-	for i, n := range nodes {
-		spec := snoopyPod(n.node, name, ns+"/"+what, debugNS, image, snoopyArgs(n.targets, args), o.deadline)
-		created, err := cs.CoreV1().Pods(debugNS).Create(ctx, spec, metav1.CreateOptions{})
-		if err != nil {
-			for _, s := range sessions[:i] {
-				s.remove(cs)
-			}
-			return explainCreate(err, debugNS)
-		}
-		sessions[i] = &session{o: o, node: n.node, ns: debugNS, name: created.Name}
-		o.logf("starting snoopy on node %s, as pod %s/%s, for %s", n.node, debugNS, created.Name, plural(n.pods))
-	}
+	blocks := !o.brief && !o.json && !slices.Contains(rest, "--brief") && !slices.Contains(rest, "--json")
+	r := &runner{o: o, cfg: cfg, cs: cs, ns: ns, debugNS: debugNS, image: image, name: name, what: what, args: args,
+		multi: len(nodes) > 1 || follow, out: newMerger(o.streams.Out, blocks), errOut: newMerger(o.streams.ErrOut, false),
+		owner: map[string]*session{}, podOf: map[string]string{}, maxSessions: max(o.maxNodes, len(nodes))}
 
-	// Ctrl-C deletes the snoopy pods, which stops snoopy (SIGTERM): each
-	// prints what it has and its summary, and its stream ends. A second one
-	// gives up.
+	// Ctrl-C stops following and deletes the snoopy pods, which stops
+	// snoopy (SIGTERM): each prints what it has and its summary, and its
+	// stream ends. A second one gives up.
 	stopped := make(chan os.Signal, 2)
 	signal.Notify(stopped, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stopped)
-	removeAll := func() {
-		for _, s := range sessions {
-			s.remove(cs)
-		}
-	}
-	defer removeAll()
+	defer r.removeAll()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	followCtx, stopFollowing := context.WithCancel(ctx)
+	defer stopFollowing()
 	go func() {
 		<-stopped
-		removeAll()
+		stopFollowing()
+		r.removeAll()
 		<-stopped
 		cancel()
 	}()
 
-	// With several, their output is merged a whole event at a time, and
-	// their messages say which node they're from.
-	blocks := !o.brief && !o.json && !slices.Contains(rest, "--brief") && !slices.Contains(rest, "--json")
-	out, errOut := newMerger(o.streams.Out, blocks), newMerger(o.streams.ErrOut, false)
-	var wg sync.WaitGroup
-	errs := make([]error, len(sessions))
-	for i, s := range sessions {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			stdout, stderr := io.Writer(o.streams.Out), io.Writer(o.streams.ErrOut)
-			var flush []interface{ Flush() error }
-			if len(sessions) > 1 {
-				so := out.stream()
-				se := &prefixWriter{m: errOut, prefix: []byte("[" + s.node + "] ")}
-				stdout, stderr, flush = so, se, []interface{ Flush() error }{so, se}
-			}
-			errs[i] = s.run(ctx, cfg, cs, stdout, stderr)
-			for _, f := range flush {
-				_ = f.Flush()
-			}
-		}()
+	// One snoopy pod per node, for the containers there.
+	for _, n := range nodes {
+		if err := r.start(ctx, n); err != nil {
+			r.removeAll()
+			return err
+		}
 	}
-	wg.Wait()
-	return errors.Join(errs...)
+	if follow {
+		opts, err := watchOptions(ctx, cs, ns, target, o.selector)
+		if err != nil {
+			o.logf("can't follow new pods: %v", err)
+		} else {
+			o.logf("following %s: new pods, and restarted containers, are traced as they start (--no-follow not to)", what)
+			r.follow(followCtx, opts, 2*time.Second)
+		}
+	}
+	r.wg.Wait()
+	return errors.Join(r.errs...)
 }
 
 func plural(pods []string) string {
@@ -313,6 +299,7 @@ type session struct {
 	o        *options
 	node     string
 	ns, name string
+	ids      map[string]bool // the containers it traces that are still there; guarded by the runner's mu
 	mu       sync.Mutex
 	deleted  bool
 }
