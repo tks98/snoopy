@@ -139,7 +139,7 @@ func (p *process) trigger(pidfd, root int, name string, deadline time.Time) (int
 	default:
 		_ = unix.Fchown(fd, p.uid, p.gid)
 		unix.Close(fd)
-		defer unix.Unlinkat(tmp, file, 0)
+		defer func() { _ = unix.Unlinkat(tmp, file, 0) }() // once the JVM has seen it
 	}
 	if err := unix.PidfdSendSignal(pidfd, unix.SIGQUIT, nil, 0); err != nil {
 		return -1, fmt.Errorf("process %d: %w", p.pid, err)
