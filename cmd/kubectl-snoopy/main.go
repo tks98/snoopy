@@ -89,9 +89,9 @@ type options struct {
 
 	// snoopy's own flags, the commonest, passed on.
 	brief, json, full, hex, verbose, redact, java bool
-	hosts, ports                            []string
-	methods, paths, statuses                []string
-	count                                   int
+	hosts, ports                                  []string
+	methods, paths, statuses                      []string
+	count                                         int
 }
 
 func main() {
