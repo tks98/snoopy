@@ -37,6 +37,7 @@ Or download `kubectl-snoopy_<version>_<os>_<arch>.tar.gz` from the
 kubectl snoopy POD                       # all of the pod's containers
 kubectl snoopy POD -n shop -c app        # one container
 kubectl snoopy deploy/checkout -n shop   # every pod of a deployment
+kubectl snoopy deploy/checkout -n shop --status 5xx   # only failed responses
 kubectl snoopy -l app=checkout -n shop   # every pod with these labels
 kubectl snoopy POD --brief               # one line per call
 kubectl snoopy POD --json --port 443     # JSON, port 443 only
@@ -53,8 +54,9 @@ snoopy pod per node, for all of the pods there, at most `--max-nodes` (10)
 of them, and merges their output an event at a time, with their messages
 marked by node. `--count` applies to each snoopy pod.
 
-`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--redact`, `--host`,
-`--port` and `--count` are snoopy's own and are passed on; the rest of snoopy's flags go
+`--brief`, `--json`, `--full`, `--hex`, `--verbose`, `--redact`, `--method`,
+`--path`, `--status`, `--host`, `--port` and `--count` are snoopy's own and
+are passed on; the rest of snoopy's flags go
 after `--` ([usage.md](usage.md) has them all). kubectl's usual flags
 (`-n`, `--context`, `--kubeconfig`) work as they do for kubectl. Ctrl-C
 stops it.

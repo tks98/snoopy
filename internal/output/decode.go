@@ -22,6 +22,9 @@ type Options struct {
 	// query parameters and JSON and form fields, and tokens of well-known
 	// kinds (see redact.go). Binary data isn't shown in JSON then.
 	Redact bool
+	// Filter, if set, leaves out the HTTP exchanges that don't match it,
+	// and everything that isn't HTTP.
+	Filter *HTTPFilter
 	// Warn, if set, is told about what the output can't show, such as
 	// headers of connections that started before snoopy. It may be told the
 	// same thing more than once.
@@ -30,6 +33,14 @@ type Options struct {
 
 // startedEarly is what Warn is told when headers can't be decoded.
 const startedEarly = "some HTTP/2 or HTTP/3 connections started before snoopy, so their headers can't be decoded; connections opened from now on can be (restarting a program opens new ones)"
+
+// A Filterer is a Printer that leaves out the events Options.Filter doesn't
+// match.
+type Filterer interface {
+	Printer
+	// Filtered returns how many events were left out so far.
+	Filtered() int
+}
 
 // A Hider is a Printer that leaves some events out.
 type Hider interface {
@@ -46,11 +57,18 @@ type decoders struct {
 	quic   *quicConns
 	warn   func(string)
 	redact bool
+	filter *HTTPFilter
+	ex     *exchangeTracker // with filter
 }
 
 func newDecoders(opts Options) decoders {
 	pool := newBodyPool()
-	return decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool), warn: opts.Warn, redact: opts.Redact}
+	d := decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool), warn: opts.Warn,
+		redact: opts.Redact, filter: opts.Filter}
+	if opts.Filter != nil {
+		d.ex = newExchangeTracker()
+	}
+	return d
 }
 
 // connOf returns the connection an event belongs to, for following its
@@ -67,16 +85,20 @@ func connOf(ev *tracer.Event) uint64 {
 
 // decoded is what an event's data was found to hold.
 type decoded struct {
-	data     []byte // the event's data, to show as it is: redacted, with Options.Redact
-	notice   bool   // a tracer.FuncQUICPacketSent, which isn't to be printed
-	isQUIC   bool
-	quicConn quicKey    // the QUIC connection, for both directions
-	notQUIC  bool       // a QUIC packet that doesn't parse as QUIC frames
-	quic     []quicItem // a QUIC packet's frames and the HTTP/3 they complete
-	isHTTP2  bool
-	http2    []http2Frame
-	note     string         // about the HTTP/2 connection
-	http1    []http1Segment // nil if not HTTP/1
+	data []byte // the event's data, to show as it is: redacted, with Options.Redact
+	// With Options.Filter: whether the event is left out, and if it isn't,
+	// which requests its responses answer, with a status filter.
+	filteredOut bool
+	answers     string
+	notice      bool // a tracer.FuncQUICPacketSent, which isn't to be printed
+	isQUIC      bool
+	quicConn    quicKey    // the QUIC connection, for both directions
+	notQUIC     bool       // a QUIC packet that doesn't parse as QUIC frames
+	quic        []quicItem // a QUIC packet's frames and the HTTP/3 they complete
+	isHTTP2     bool
+	http2       []http2Frame
+	note        string         // about the HTTP/2 connection
+	http1       []http1Segment // nil if not HTTP/1
 }
 
 func (d decoders) decode(ev *tracer.Event) decoded {
@@ -98,6 +120,9 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 		d.warn(startedEarly)
 	}
 	dc.data = ev.Data
+	if d.filter != nil {
+		dc.filteredOut, dc.answers = d.filter.filtered(d.ex, ev, dc)
+	}
 	if d.redact {
 		dc = dc.redact()
 	}

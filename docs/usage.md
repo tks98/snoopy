@@ -33,6 +33,13 @@ Which processes:
                      prefix; repeatable, or comma-separated. ID=NAME shows
                      NAME for the container's events
 
+Which HTTP exchanges (repeatable, or comma-separated):
+  --method METHOD    only requests with this method, and their responses
+  --path PREFIX      only requests whose path starts with this, and their
+                     responses
+  --status STATUS    only responses with this status: 404, 5xx, 400-499;
+                     each says which request it answers
+
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
                      or host name at either end
@@ -253,12 +260,34 @@ Each line is one call to a TLS read or write function:
 | `read_error` | Set when the payload couldn't be read from the process's memory. |
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. With `--redact`, `data` is redacted and `data_base64` left out, since HTTP/2's and HTTP/3's headers are compressed in it. |
 | `redacted` | Set with `--redact`. |
+| `answers` | With `--status`: the request the event's response answers, e.g. `POST /v1/charges`. |
 | `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`), `body` (see below), and on a gRPC stream's DATA frames the `grpc_messages` they completed (`bytes`, `compressed`, and `protobuf`, the decoded fields a line each as in the text output, or an `error`). HPACK compresses headers against a table built up over the connection, so on a connection that started before snoopy, frames are followed from the first call that starts with one, and a header block has `headers_not_decoded` instead of `headers`. |
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 | `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, `ring::aead seal`, `ring::aead open`, `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt`, `cipher.AEAD.Seal`, `cipher.AEAD.Open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
 | `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
 
 Fields that don't apply are left out.
+
+## Finding requests
+
+`--method`, `--path` and `--status` keep the HTTP exchanges (a request and
+its response) that match, and leave out the rest, including calls that
+aren't HTTP:
+
+```bash
+sudo snoopy --comm api --path /v1/charges          # requests to /v1/charges..., and their responses
+sudo snoopy --comm api --method POST,PUT --brief
+sudo snoopy --comm api --status 5xx                # only failed responses
+```
+
+Requests are paired with their responses in order on an HTTP/1.x
+connection, and by stream on HTTP/2 and HTTP/3, so a response's body is
+kept with it. Since a request's status isn't known when it's sent,
+`--status` shows responses only, each with the request it answers (`[for
+POST /v1/charges]`, or `answers` in JSON). A request from before snoopy
+started has no method or path to match. With `--har`, whole entries are
+kept or left out; `--pcap` isn't filtered. The summary at the end says how
+many calls were left out.
 
 ## Sharing output
 
