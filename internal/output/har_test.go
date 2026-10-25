@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -179,5 +180,68 @@ func TestHARRedact(t *testing.T) {
 		if bytes.Contains(out.Bytes(), []byte(s)) {
 			t.Errorf("%q in the log:\n%s", s, out.String())
 		}
+	}
+}
+
+// Interim responses leave the queue as it is: a final response answers the
+// first request, and many of them take linear time.
+func TestHARInterim(t *testing.T) {
+	var out bytes.Buffer
+	h := NewHAR(&out, "test", Options{})
+	h.Print(event(tracer.FuncSSLWrite, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"))
+	h.Print(event(tracer.FuncSSLRead, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\n"))
+	h.Print(event(tracer.FuncSSLRead, "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+	h.Close()
+	l := readHAR(t, out.Bytes())
+	if len(l.Log.Entries) != 2 || l.Log.Entries[0].Response.Status != 201 || l.Log.Entries[1].Response.Status != 200 {
+		t.Errorf("entries:\n%s", out.String())
+	}
+
+	h = NewHAR(nil, "test", Options{})
+	reqs := []byte(strings.Repeat("GET / HTTP/1.1\r\n\r\n", maxQueued))
+	h.Print(&tracer.Event{Function: tracer.FuncSSLWrite, ConnID: 1, Data: reqs, Size: uint32(len(reqs))})
+	interim := []byte(strings.Repeat("HTTP/1.1 100 Continue\r\n\r\n", 1000))
+	start := time.Now()
+	for i := 0; i < 50; i++ {
+		h.Print(&tracer.Event{Function: tracer.FuncSSLRead, ConnID: 1, Data: interim, Size: uint32(len(interim))})
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("50k interim responses took %v", d)
+	}
+}
+
+// A HAR's open state is bounded: the queue of unanswered requests, and
+// streams; and entries past maxHAREntries keep no bodies.
+func TestHARBounded(t *testing.T) {
+	h := NewHAR(nil, "test", Options{})
+	reqs := []byte(strings.Repeat("GET / HTTP/1.1\r\n\r\n", 3*maxQueued))
+	h.Print(&tracer.Event{Function: tracer.FuncSSLWrite, ConnID: 1, Data: reqs, Size: uint32(len(reqs))})
+	if n := len(h.conns[harConnKey{tcp: 1}].queue); n > maxQueued {
+		t.Errorf("%d requests queued", n)
+	}
+
+	client, server := newHTTP2Writer(true), newHTTP2Writer(false)
+	for id := uint32(1); id < 2000; id += 2 {
+		client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, EndStream: true, EndHeaders: true,
+			BlockFragment: client.block(":method", "GET", ":scheme", "https", ":authority", "x", ":path", "/")})
+		server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, EndHeaders: true, BlockFragment: server.block(":status", "200")})
+		server.fr.WriteData(id, true, []byte("ok"))
+	}
+	h = NewHAR(nil, "test", Options{})
+	for _, ev := range append(events(tracer.FuncSSLWrite, client.buf.Bytes(), 1<<20), events(tracer.FuncSSLRead, server.buf.Bytes(), 1<<20)...) {
+		h.Print(ev)
+	}
+	if n := len(h.conns[harConnKey{pid: 7, tcp: 0x1000}].streams.m); n > keepFinished {
+		t.Errorf("%d finished streams kept", n)
+	}
+	if len(h.entries) != 1000 || string(h.entries[999].resp.body) != "ok" {
+		t.Errorf("%d entries", len(h.entries))
+	}
+
+	h = NewHAR(nil, "test", Options{})
+	h.entries = make([]*harEntry, maxHAREntries)
+	h.Print(event(tracer.FuncSSLWrite, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"))
+	if e := h.conns[harConnKey{pid: 42, tcp: 0xbeef}].current[tracer.Write]; e == nil || e.kept || len(e.req.body) != 0 {
+		t.Errorf("an entry past the limit: %+v", e)
 	}
 }

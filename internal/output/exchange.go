@@ -2,6 +2,8 @@ package output
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -60,6 +62,14 @@ func (e *exchange) String() string {
 	return e.method + " " + e.path
 }
 
+// label is String, with the target's secrets masked if redact is set.
+func (e *exchange) label(redact bool) string {
+	if redact && e.method != "" {
+		return e.method + " " + redactTarget(e.path)
+	}
+	return e.String()
+}
+
 func (f *HTTPFilter) match(e *exchange) bool {
 	if len(f.Methods) > 0 {
 		ok := false
@@ -101,7 +111,96 @@ type exchangeTracker struct {
 type exConn struct {
 	queue   []*exchange
 	current map[tracer.Direction]*exchange
-	streams map[uint64]*exchange
+	streams streams[*exchange]
+}
+
+// connKey returns the connection an event belongs to, of the process that
+// made it: connection handles are only unique within a process (Go's are
+// heap addresses, the Java agent numbers connections from 1, and file
+// descriptors are reused across processes).
+func connKey(ev *tracer.Event, dc decoded) harConnKey {
+	if dc.isQUIC {
+		return harConnKey{pid: ev.PID, quic: dc.quicConn}
+	}
+	return harConnKey{pid: ev.PID, tcp: connOf(ev)}
+}
+
+// maxConnStreams bounds how many exchanges are kept by stream on a
+// connection, and keepFinished how many finished ones are kept a while, for
+// the rest of their last DATA frames; maxQueued bounds the HTTP/1.x
+// requests waiting for their responses on one.
+const (
+	maxConnStreams = 4096
+	keepFinished   = 64
+	maxQueued      = 1024
+)
+
+// streams holds what's open on the streams of an HTTP/2 or HTTP/3
+// connection. A stream is forgotten when keepFinished more have finished
+// after it, or, if more than maxConnStreams are open, with the oldest half
+// (streams are numbered in the order they're opened).
+type streams[T any] struct {
+	m        map[uint64]T
+	finished []uint64
+}
+
+func (s *streams[T]) get(id uint64) T { return s.m[id] }
+
+func (s *streams[T]) set(id uint64, v T) {
+	if s.m == nil {
+		s.m = map[uint64]T{}
+	}
+	if _, ok := s.m[id]; !ok && len(s.m) >= maxConnStreams {
+		ids := slices.Sorted(maps.Keys(s.m))
+		for _, old := range ids[:len(ids)/2] {
+			delete(s.m, old)
+		}
+	}
+	s.m[id] = v
+}
+
+func (s *streams[T]) finish(id uint64) {
+	if _, ok := s.m[id]; !ok || slices.Contains(s.finished, id) {
+		return
+	}
+	s.finished = append(s.finished, id)
+	if len(s.finished) > keepFinished {
+		delete(s.m, s.finished[0])
+		s.finished = slices.Delete(s.finished, 0, 1)
+	}
+}
+
+// streamEnd is a stream that an event ends in its direction, or resets.
+type streamEnd struct {
+	id    uint64
+	reset bool
+}
+
+// streamEnds returns the streams an HTTP/2 or HTTP/3 event ends or resets.
+func streamEnds(dc decoded) []streamEnd {
+	var out []streamEnd
+	for _, f := range dc.http2 {
+		switch {
+		case f.Type == "RST_STREAM":
+			out = append(out, streamEnd{uint64(f.Stream), true})
+		case slices.Contains(f.Flags, "END_STREAM"):
+			out = append(out, streamEnd{uint64(f.Stream), false})
+		}
+	}
+	for _, it := range dc.quic {
+		rest, reset := strings.CutPrefix(it.Frame, "RESET_STREAM id=")
+		if !reset {
+			var ok bool
+			if rest, ok = strings.CutPrefix(it.Frame, "STREAM id="); !ok || !strings.HasSuffix(it.Frame, " FIN") {
+				continue
+			}
+		}
+		id, _, _ := strings.Cut(rest, " ")
+		if n, err := strconv.ParseUint(id, 10, 64); err == nil {
+			out = append(out, streamEnd{n, reset})
+		}
+	}
+	return out
 }
 
 func newExchangeTracker() *exchangeTracker {
@@ -110,16 +209,13 @@ func newExchangeTracker() *exchangeTracker {
 
 // touched returns the exchanges an event is part of.
 func (t *exchangeTracker) touched(ev *tracer.Event, dc decoded) []*exchange {
-	key := harConnKey{tcp: connOf(ev)}
-	if dc.isQUIC {
-		key = harConnKey{quic: dc.quicConn}
-	}
+	key := connKey(ev, dc)
 	c := t.conns[key]
 	if c == nil {
 		if len(t.conns) >= maxHARConns {
 			clear(t.conns)
 		}
-		c = &exConn{current: map[tracer.Direction]*exchange{}, streams: map[uint64]*exchange{}}
+		c = &exConn{current: map[tracer.Direction]*exchange{}}
 		t.conns[key] = c
 	}
 	dir := ev.Function.Direction()
@@ -136,7 +232,7 @@ func (t *exchangeTracker) touched(ev *tracer.Event, dc decoded) []*exchange {
 			case it.HTTP3 == "HEADERS" && it.Headers != nil:
 				add(c.headers(dir, it.Stream, it.Headers))
 			case strings.HasPrefix(it.HTTP3, "DATA"):
-				add(c.streams[it.Stream])
+				add(c.streams.get(it.Stream))
 			}
 		}
 	case dc.isHTTP2:
@@ -145,7 +241,7 @@ func (t *exchangeTracker) touched(ev *tracer.Event, dc decoded) []*exchange {
 			case f.Headers != nil:
 				add(c.headers(dir, uint64(f.Stream), f.Headers))
 			case f.Type == "DATA":
-				add(c.streams[uint64(f.Stream)])
+				add(c.streams.get(uint64(f.Stream)))
 			}
 		}
 	default:
@@ -158,6 +254,12 @@ func (t *exchangeTracker) touched(ev *tracer.Event, dc decoded) []*exchange {
 			}
 		}
 	}
+	// A response's end ends its exchange.
+	for _, end := range streamEnds(dc) {
+		if e := c.streams.get(end.id); e != nil && (end.reset || dir != e.reqDir) {
+			c.streams.finish(end.id)
+		}
+	}
 	return out
 }
 
@@ -167,6 +269,9 @@ func (c *exConn) http1(dir tracer.Direction, m *httpMessage) *exchange {
 		target, _, _ := strings.Cut(rest, " ")
 		e := &exchange{method: method, path: target, reqDir: dir}
 		c.queue = append(c.queue, e)
+		if len(c.queue) > maxQueued {
+			c.queue = c.queue[1:]
+		}
 		c.current[dir] = e
 		return e
 	}
@@ -200,15 +305,15 @@ func (c *exConn) headers(dir tracer.Direction, stream uint64, fields []hpack.Hea
 			status = f.Value
 		}
 	}
-	e := c.streams[stream]
+	e := c.streams.get(stream)
 	switch {
 	case method != "":
 		e = &exchange{method: method, path: path, reqDir: dir}
-		c.streams[stream] = e
+		c.streams.set(stream, e)
 	case status != "":
 		if e == nil {
 			e = &exchange{reqDir: opposite(dir)}
-			c.streams[stream] = e
+			c.streams.set(stream, e)
 		}
 		e.status, _ = strconv.Atoi(status)
 	}
@@ -217,15 +322,15 @@ func (c *exConn) headers(dir tracer.Direction, stream uint64, fields []hpack.Hea
 
 // filtered reports whether an event is left out by the filter, and if it
 // isn't, the requests of the responses it carries, to say which they
-// answer when Status is set (else "").
-func (f *HTTPFilter) filtered(t *exchangeTracker, ev *tracer.Event, dc decoded) (out bool, answers string) {
+// answer when Status is set (else ""), their secrets masked with redact.
+func (f *HTTPFilter) filtered(t *exchangeTracker, ev *tracer.Event, dc decoded, redact bool) (out bool, answers string) {
 	var matched []string
 	for _, e := range t.touched(ev, dc) {
 		if !f.match(e) {
 			continue
 		}
 		if len(f.Status) > 0 {
-			matched = append(matched, e.String())
+			matched = append(matched, e.label(redact))
 		} else {
 			return false, ""
 		}

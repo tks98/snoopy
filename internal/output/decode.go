@@ -121,7 +121,7 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 	}
 	dc.data = ev.Data
 	if d.filter != nil {
-		dc.filteredOut, dc.answers = d.filter.filtered(d.ex, ev, dc)
+		dc.filteredOut, dc.answers = d.filter.filtered(d.ex, ev, dc, d.redact)
 	}
 	if d.redact {
 		dc = dc.redact()
