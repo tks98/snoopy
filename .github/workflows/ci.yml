@@ -11,16 +11,18 @@ on:
     paths-ignore: ["**.md", "docs/**"]
   workflow_dispatch:
 
-permissions:
-  contents: read
+# Each job asks for what it needs.
+permissions: {}
 
 jobs:
   test:
     name: Lint, test and build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -33,7 +35,7 @@ jobs:
 
       - run: go vet ./... && go vet -tags integration ./...
 
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.15.0
 
@@ -51,9 +53,11 @@ jobs:
   generate:
     name: BPF objects are up to date
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - run: sudo apt-get update && sudo apt-get install -y clang-18 llvm-18
@@ -77,18 +81,35 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: Install TLS clients
-        run: sudo apt-get update && sudo apt-get install -y curl python3 gnutls-bin libnss3-dev libwolfssl-dev libmbedtls-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y curl python3 gnutls-bin libnss3-dev libwolfssl-dev libmbedtls-dev libssl-dev cmake pkg-config
+      # Ubuntu (and Debian) don't package s2n-tls, so TestS2N gets a release
+      # built from source, into /usr/local. It takes seconds.
+      - name: Build s2n-tls
+        run: |
+          v=1.7.12
+          curl -fsSLo s2n.tar.gz "https://github.com/aws/s2n-tls/archive/refs/tags/v$v.tar.gz"
+          echo "76d3e6125ad8f7d960a62bf1e18c451fb75ed6ab640247b046b5b0f55d39d099  s2n.tar.gz" | sha256sum -c -
+          tar xzf s2n.tar.gz
+          cmake -S "s2n-tls-$v" -B "$RUNNER_TEMP/s2n" -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/s2n" -j "$(nproc)"
+          sudo cmake --install "$RUNNER_TEMP/s2n" && sudo ldconfig
+          rm -rf s2n.tar.gz "s2n-tls-$v"
       - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
       - name: Run (as root)
         working-directory: internal/tracer
-        # TestJSSE has a job of its own, for each JDK.
-        run: sudo ./tracer.test -test.v -test.timeout 5m -test.skip TestJSSE
+        # TestJSSE has a job of its own, for each JDK, and the rustls and
+        # quinn tests a weekly workflow (rust.yml). SNOOPY_TEST_STRICT: a
+        # client or library missing here fails its test rather than skipping
+        # it.
+        run: sudo env SNOOPY_TEST_STRICT=1 ./tracer.test -test.v -test.timeout 5m -test.skip TestJSSE
       # --quiet: the runner's own TLS traffic, including its credentials,
       # must not end up in the (public) log.
       - name: Smoke-test the binary
@@ -105,18 +126,26 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
         jdk: [17, 21, 25]
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: ${{ matrix.jdk }}
       - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      # For TestJSSE's "user namespace" case, whose unshare maps root to
+      # nobody with newuidmap, which only maps the IDs these allow.
+      - name: Let root map nobody's IDs
+        run: |
+          echo root:65534:1 | sudo tee -a /etc/subuid
+          echo root:65534:1 | sudo tee -a /etc/subgid
       - name: Run TestJSSE (as root)
         working-directory: internal/tracer
         # With PATH, which sudo would reset, for setup-java's JDK; and
         # SNOOPY_TEST_JAVA, so that it fails rather than skips without one.
-        run: sudo env PATH="$PATH" SNOOPY_TEST_JAVA=1 ./tracer.test -test.v -test.timeout 5m -test.run TestJSSE
+        run: sudo env PATH="$PATH" SNOOPY_TEST_JAVA=1 SNOOPY_TEST_STRICT=1 ./tracer.test -test.v -test.timeout 5m -test.run TestJSSE

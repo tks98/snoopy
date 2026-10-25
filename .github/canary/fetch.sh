@@ -109,7 +109,10 @@ firefox)
 	;;
 fedora)
 	root=$PWD/root
-	container=$(docker create registry.fedoraproject.org/fedora:latest)
+	# A release, by digest: dnf still installs that release's latest curl,
+	# which is what's checked. Move it on to each new Fedora release (the
+	# digest from docker buildx imagetools inspect).
+	container=$(docker create registry.fedoraproject.org/fedora:44@sha256:40005ed606ff7bbdc5344f3625e043f64493358b3dfaf2cc6b1995282189f3f5)
 	mkdir -p "$root"
 	docker export "$container" | tar -C "$root" -xf -
 	docker rm "$container" > /dev/null
