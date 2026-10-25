@@ -18,6 +18,10 @@ type Options struct {
 	// going: HTTP/2 settings, flow control and pings, QUIC acknowledgments,
 	// and the like.
 	Verbose bool
+	// Redact masks what's likely secret: credentials in headers, secret
+	// query parameters and JSON and form fields, and tokens of well-known
+	// kinds (see redact.go). Binary data isn't shown in JSON then.
+	Redact bool
 	// Warn, if set, is told about what the output can't show, such as
 	// headers of connections that started before snoopy. It may be told the
 	// same thing more than once.
@@ -37,15 +41,16 @@ type Hider interface {
 // decoders follow the protocols in events, whose messages are spread over
 // many events, to find what each event carries.
 type decoders struct {
-	h1   *http1Conns
-	h2   *http2Conns
-	quic *quicConns
-	warn func(string)
+	h1     *http1Conns
+	h2     *http2Conns
+	quic   *quicConns
+	warn   func(string)
+	redact bool
 }
 
-func newDecoders(warn func(string)) decoders {
+func newDecoders(opts Options) decoders {
 	pool := newBodyPool()
-	return decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool), warn: warn}
+	return decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool), warn: opts.Warn, redact: opts.Redact}
 }
 
 // connOf returns the connection an event belongs to, for following its
@@ -62,7 +67,8 @@ func connOf(ev *tracer.Event) uint64 {
 
 // decoded is what an event's data was found to hold.
 type decoded struct {
-	notice   bool // a tracer.FuncQUICPacketSent, which isn't to be printed
+	data     []byte // the event's data, to show as it is: redacted, with Options.Redact
+	notice   bool   // a tracer.FuncQUICPacketSent, which isn't to be printed
 	isQUIC   bool
 	quicConn quicKey    // the QUIC connection, for both directions
 	notQUIC  bool       // a QUIC packet that doesn't parse as QUIC frames
@@ -90,6 +96,10 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 	}
 	if d.warn != nil && dc.startedEarly() {
 		d.warn(startedEarly)
+	}
+	dc.data = ev.Data
+	if d.redact {
+		dc = dc.redact()
 	}
 	return dc
 }

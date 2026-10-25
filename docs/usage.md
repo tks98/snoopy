@@ -44,6 +44,9 @@ Output:
   --full             whole bodies, and binary data as hex dumps (by default,
                      a body's first 2 KiB, and binary data described)
   --hex              payloads as hex dumps
+  --redact           mask what's likely secret: credentials in headers,
+                     secret query parameters and JSON and form fields, and
+                     tokens of well-known kinds, for output to share
   --verbose          also calls that only keep connections going (HTTP/2
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
@@ -222,7 +225,8 @@ request to the response's end. Entries also say which process made them
 (`_process`, `_pid`, and `_container` if it ran in one). A request whose
 response wasn't seen, or a response whose request was sent before snoopy
 started, is kept with a comment saying so. The file is written when snoopy
-stops, by Ctrl-C or `--count`, not as it goes.
+stops, by Ctrl-C or `--count`, not as it goes. `--redact` applies to it as
+to the other outputs.
 
 ## JSON output
 
@@ -247,13 +251,36 @@ Each line is one call to a TLS read or write function:
 | `captured` | Bytes captured; less than `size` when `truncated` is set (see `--max-size`). |
 | `incomplete` | Set when part of the payload was dropped because the ring buffer was full. |
 | `read_error` | Set when the payload couldn't be read from the process's memory. |
-| `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. |
+| `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. With `--redact`, `data` is redacted and `data_base64` left out, since HTTP/2's and HTTP/3's headers are compressed in it. |
+| `redacted` | Set with `--redact`. |
 | `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`), `body` (see below), and on a gRPC stream's DATA frames the `grpc_messages` they completed (`bytes`, `compressed`, and `protobuf`, the decoded fields a line each as in the text output, or an `error`). HPACK compresses headers against a table built up over the connection, so on a connection that started before snoopy, frames are followed from the first call that starts with one, and a header block has `headers_not_decoded` instead of `headers`. |
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 | `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, `ring::aead seal`, `ring::aead open`, `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt`, `cipher.AEAD.Seal`, `cipher.AEAD.Open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
 | `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
 
 Fields that don't apply are left out.
+
+## Sharing output
+
+`--redact` masks what's likely secret, so output can go into an issue or a
+chat:
+
+- the values of headers that carry credentials: `Authorization` (keeping
+  its scheme, as `Bearer [redacted]`), `Proxy-Authorization`, `Cookie` and
+  `Set-Cookie` (keeping the cookies' names and attributes), API key
+  headers, and any header whose name says token, secret, password,
+  session and the like;
+- query parameters with such names, and `key`, `sig`, `code`;
+- JSON and form fields with such names, in bodies;
+- tokens of well-known kinds wherever they appear: bearer tokens, JWTs, AWS
+  access keys, GitHub, GitLab, Slack, Stripe, Google, OpenAI and Anthropic
+  keys, and private keys.
+
+It works on what snoopy decodes, in text, `--brief` and JSON. It can't be
+combined with `--hex` or `--pcap`, which show data as sent: there, HTTP/2's
+and HTTP/3's headers are compressed, and can't be masked reliably. It
+catches what's recognizable, not everything a program might consider
+secret, so read output before sharing it anyway.
 
 ## Containers and Kubernetes
 

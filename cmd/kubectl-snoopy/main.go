@@ -73,9 +73,9 @@ type options struct {
 	version    bool
 
 	// snoopy's own flags, the commonest, passed on.
-	brief, json, full, hex, verbose bool
-	hosts, ports                    []string
-	count                           int
+	brief, json, full, hex, verbose, redact bool
+	hosts, ports                            []string
+	count                                   int
 }
 
 func main() {
@@ -130,6 +130,7 @@ func newCommand(o *options) *cobra.Command {
 	f.BoolVar(&o.full, "full", false, "snoopy: whole bodies, and binary data as hex dumps")
 	f.BoolVar(&o.hex, "hex", false, "snoopy: payloads as hex dumps")
 	f.BoolVar(&o.verbose, "verbose", false, "snoopy: also calls that only keep connections going")
+	f.BoolVar(&o.redact, "redact", false, "snoopy: mask credentials, secret fields and recognizable tokens")
 	f.StringArrayVar(&o.hosts, "host", nil, "snoopy: only connections with this address, network or host at either end")
 	f.StringArrayVar(&o.ports, "port", nil, "snoopy: only connections with this port at either end")
 	f.IntVar(&o.count, "count", 0, "snoopy: stop after N calls")
@@ -139,7 +140,7 @@ func newCommand(o *options) *cobra.Command {
 // passed returns snoopy's flags that were given to the plugin.
 func (o *options) passed() []string {
 	var args []string
-	for flag, set := range map[string]bool{"--brief": o.brief, "--json": o.json, "--full": o.full, "--hex": o.hex, "--verbose": o.verbose} {
+	for flag, set := range map[string]bool{"--brief": o.brief, "--json": o.json, "--full": o.full, "--hex": o.hex, "--verbose": o.verbose, "--redact": o.redact} {
 		if set {
 			args = append(args, flag)
 		}

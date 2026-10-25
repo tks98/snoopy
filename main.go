@@ -49,6 +49,7 @@ type config struct {
 	pcap       string
 	har        string
 	quiet      bool
+	redact     bool
 	noColor    bool
 	verbose    bool
 	version    bool
@@ -139,6 +140,9 @@ Output:
   --full             whole bodies, and binary data as hex dumps (by default,
                      a body's first 2 KiB, and binary data described)
   --hex              payloads as hex dumps
+  --redact           mask what's likely secret: credentials in headers,
+                     secret query parameters and JSON and form fields, and
+                     tokens of well-known kinds, for output to share
   --verbose          also calls that only keep connections going (HTTP/2
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
@@ -193,6 +197,7 @@ func flags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&c.pcap, "pcap", "", "")
 	fs.StringVar(&c.har, "har", "", "")
 	fs.BoolVar(&c.quiet, "quiet", false, "")
+	fs.BoolVar(&c.redact, "redact", false, "")
 	fs.BoolVar(&c.noColor, "no-color", false, "")
 	fs.BoolVar(&c.verbose, "verbose", false, "")
 	fs.BoolVar(&c.version, "version", false, "")
@@ -223,6 +228,14 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	if len(output) > 1 {
 		slices.Sort(output)
 		return c, fmt.Errorf("%s can't be combined", strings.Join(output, " and "))
+	}
+	// These show data as sent, where HTTP/2's and HTTP/3's headers are
+	// compressed: they can't be redacted.
+	if c.redact && c.hex {
+		return c, errors.New("--redact can't be combined with --hex, which shows data as captured")
+	}
+	if c.redact && c.pcap != "" {
+		return c, errors.New("--redact can't be combined with --pcap, which writes data as captured")
 	}
 	return c, nil
 }
@@ -738,7 +751,7 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 			closers = append(closers, f.Close)
 			w = f
 		}
-		h := output.NewHAR(w, versionString(), output.Options{})
+		h := output.NewHAR(w, versionString(), output.Options{Redact: cfg.redact})
 		printers = append(printers, h)
 		closers = append([]func() error{h.Close}, closers...) // written before the file is closed
 	}
@@ -749,11 +762,11 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append(closers, out.Close)
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(out, output.Options{Warn: warn}))
+			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Warn: warn}))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Warn: warn}))
+			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Warn: warn}))
 		default:
-			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Warn: warn}))
+			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Warn: warn}))
 		}
 	}
 

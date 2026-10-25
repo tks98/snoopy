@@ -81,10 +81,10 @@ type harMessage struct {
 }
 
 // NewHAR returns a printer that writes a HAR log to w when it's closed.
-// version is snoopy's, for the log's creator.
+// version is snoopy's, for the log's creator. Of opts, only Redact applies.
 func NewHAR(w io.Writer, version string, opts Options) *HAR {
-	_ = opts
-	return &HAR{w: w, dec: newDecoders(nil), version: version, conns: map[harConnKey]*harConn{}}
+	opts.Warn = nil
+	return &HAR{w: w, dec: newDecoders(opts), version: version, conns: map[harConnKey]*harConn{}}
 }
 
 func (h *HAR) Print(ev *tracer.Event) error {

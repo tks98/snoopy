@@ -168,3 +168,16 @@ func itoa(n int) string {
 	b, _ := json.Marshal(n)
 	return string(b)
 }
+
+// With Redact, the log's secrets are masked as in the other outputs.
+func TestHARRedact(t *testing.T) {
+	var out bytes.Buffer
+	h := NewHAR(&out, "test", Options{Redact: true})
+	h.Print(event(tracer.FuncSSLWrite, "GET /?token=s3cr3t HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer abcdefghij\r\n\r\n"))
+	h.Close()
+	for _, s := range []string{"s3cr3t", "abcdefghij"} {
+		if bytes.Contains(out.Bytes(), []byte(s)) {
+			t.Errorf("%q in the log:\n%s", s, out.String())
+		}
+	}
+}
