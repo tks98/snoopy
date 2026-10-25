@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -13,12 +14,17 @@ import (
 
 // JSON prints one JSON object per line (NDJSON).
 type JSON struct {
-	enc    *json.Encoder
-	dec    decoders
-	redact bool
+	enc      *json.Encoder
+	dec      decoders
+	redact   bool
+	filtered int
 }
 
-// NewJSON returns a printer of NDJSON. Of opts, only Warn and Redact apply.
+// Filtered returns how many events Options.Filter left out so far.
+func (j *JSON) Filtered() int { return j.filtered }
+
+// NewJSON returns a printer of NDJSON. Of opts, only Warn, Redact and Filter
+// apply.
 func NewJSON(w io.Writer, opts Options) *JSON {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
@@ -50,6 +56,8 @@ type jsonEvent struct {
 	// set when bytes were captured.
 	Data       *string `json:"data,omitempty"`
 	DataBase64 []byte  `json:"data_base64,omitempty"`
+	// With --status: which requests the event's responses answer.
+	Answers string `json:"answers,omitempty"`
 	// Set with --redact, which masks secrets in what's shown, and leaves
 	// data that isn't text out.
 	Redacted bool `json:"redacted,omitempty"`
@@ -132,6 +140,10 @@ func (j *JSON) Print(ev *tracer.Event) error {
 	if dc.notice {
 		return nil
 	}
+	if dc.filteredOut {
+		j.filtered++
+		return nil
+	}
 	out := jsonEvent{
 		Time:        ev.Time,
 		Function:    ev.Function.String(),
@@ -161,6 +173,7 @@ func (j *JSON) Print(ev *tracer.Event) error {
 		out.RemoteAddr = ev.Remote.String()
 	}
 	out.Redacted = j.redact
+	out.Answers = strings.TrimPrefix(dc.answers, "for ")
 	if len(dc.data) > 0 {
 		switch {
 		case utf8.Valid(dc.data):

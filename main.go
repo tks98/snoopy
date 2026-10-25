@@ -50,6 +50,10 @@ type config struct {
 	har        string
 	quiet      bool
 	redact     bool
+	methods    stringList
+	paths      stringList
+	statuses   stringList
+	filter     *output.HTTPFilter // from methods, paths and statuses
 	noColor    bool
 	verbose    bool
 	version    bool
@@ -129,6 +133,13 @@ Which processes:
                      prefix; repeatable, or comma-separated. ID=NAME shows
                      NAME for the container's events
 
+Which HTTP exchanges (repeatable, or comma-separated):
+  --method METHOD    only requests with this method, and their responses
+  --path PREFIX      only requests whose path starts with this, and their
+                     responses
+  --status STATUS    only responses with this status: 404, 5xx, 400-499;
+                     each says which request it answers
+
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
                      or host name at either end
@@ -184,6 +195,9 @@ func flags(c *config, stderr io.Writer) *flag.FlagSet {
 	fs.IntVar(&c.pid, "pid", 0, "")
 	fs.StringVar(&c.comm, "comm", "", "")
 	fs.Var(&c.containers, "container", "")
+	fs.Var(&c.methods, "method", "")
+	fs.Var(&c.paths, "path", "")
+	fs.Var(&c.statuses, "status", "")
 	fs.Var(&c.hosts, "host", "")
 	fs.Var(&c.ports, "port", "")
 	fs.Var(&c.libs, "lib", "")
@@ -231,6 +245,11 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	}
 	// These show data as sent, where HTTP/2's and HTTP/3's headers are
 	// compressed: they can't be redacted.
+	if f, err := httpFilter(c); err != nil {
+		return c, err
+	} else {
+		c.filter = f
+	}
 	if c.redact && c.hex {
 		return c, errors.New("--redact can't be combined with --hex, which shows data as captured")
 	}
@@ -238,6 +257,39 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		return c, errors.New("--redact can't be combined with --pcap, which writes data as captured")
 	}
 	return c, nil
+}
+
+// httpFilter returns the filter --method, --path and --status make, or nil
+// if none was given. Each takes several values, comma-separated.
+func httpFilter(c config) (*output.HTTPFilter, error) {
+	split := func(vs []string) []string {
+		var out []string
+		for _, v := range vs {
+			for _, s := range strings.Split(v, ",") {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	}
+	f := &output.HTTPFilter{Methods: split(c.methods), Paths: split(c.paths)}
+	for _, s := range split(c.statuses) {
+		r, err := output.ParseStatus(s)
+		if err != nil {
+			return nil, fmt.Errorf("--status: %w", err)
+		}
+		f.Status = append(f.Status, r)
+	}
+	for _, p := range f.Paths {
+		if !strings.HasPrefix(p, "/") {
+			return nil, fmt.Errorf("--path %s: paths start with /", p)
+		}
+	}
+	if len(f.Methods) == 0 && len(f.Paths) == 0 && len(f.Status) == 0 {
+		return nil, nil
+	}
+	return f, nil
 }
 
 // addrFilter keeps the events of connections with an end among hosts, if
@@ -487,13 +539,13 @@ func run(cfg config) error {
 		}
 		shown := true
 		for _, p := range printers {
-			before := hidden(p)
+			before, beforeFiltered := hidden(p), filtered(p)
 			if err := p.Print(ev); err != nil {
 				logf("error: write output: %v", err)
 				stop()
 				return
 			}
-			shown = shown && hidden(p) == before
+			shown = shown && hidden(p) == before && filtered(p) == beforeFiltered
 		}
 		if !shown {
 			return
@@ -505,6 +557,9 @@ func run(cfg config) error {
 	})
 
 	summary := fmt.Sprintf("captured %d calls", calls)
+	if n := filteredTotal(printers); n > 0 {
+		summary += fmt.Sprintf(", left out %d that --method, --path or --status didn't match", n)
+	}
 	if n := hiddenTotal(printers); n > 0 {
 		summary += fmt.Sprintf(", and hid %d that only kept connections going (--verbose shows them)", n)
 	}
@@ -533,6 +588,22 @@ func hidden(p output.Printer) int {
 		return h.Hidden()
 	}
 	return 0
+}
+
+// filtered returns how many events a printer's filter left out so far.
+func filtered(p output.Printer) int {
+	if f, ok := p.(output.Filterer); ok {
+		return f.Filtered()
+	}
+	return 0
+}
+
+func filteredTotal(printers []output.Printer) int {
+	n := 0
+	for _, p := range printers {
+		n += filtered(p)
+	}
+	return n
 }
 
 func hiddenTotal(printers []output.Printer) int {
@@ -751,7 +822,7 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 			closers = append(closers, f.Close)
 			w = f
 		}
-		h := output.NewHAR(w, versionString(), output.Options{Redact: cfg.redact})
+		h := output.NewHAR(w, versionString(), output.Options{Redact: cfg.redact, Filter: cfg.filter})
 		printers = append(printers, h)
 		closers = append([]func() error{h.Close}, closers...) // written before the file is closed
 	}
@@ -762,11 +833,11 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append(closers, out.Close)
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Warn: warn}))
+			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Warn: warn}))
+			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
 		default:
-			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Warn: warn}))
+			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
 		}
 	}
 

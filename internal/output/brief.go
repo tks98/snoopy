@@ -18,10 +18,11 @@ import (
 //
 //	06:27:36.512901 curl[5565] 192.168.5.15:41794 > 172.66.147.243:443 TLS 74: GET / HTTP/1.1, host example.com
 type Brief struct {
-	w      io.Writer
-	opts   Options
-	dec    decoders
-	hidden int
+	w        io.Writer
+	opts     Options
+	dec      decoders
+	hidden   int
+	filtered int
 
 	dim, title, write, read, warn func(a ...any) string
 }
@@ -51,9 +52,16 @@ func NewBrief(w io.Writer, opts Options) *Brief {
 // connection going.
 func (b *Brief) Hidden() int { return b.hidden }
 
+// Filtered returns how many events Options.Filter left out so far.
+func (b *Brief) Filtered() int { return b.filtered }
+
 func (b *Brief) Print(ev *tracer.Event) error {
 	dc := b.dec.decode(ev)
 	if dc.notice {
+		return nil
+	}
+	if dc.filteredOut {
+		b.filtered++
 		return nil
 	}
 	if !b.opts.Verbose && dc.housekeeping() {
@@ -75,6 +83,9 @@ func (b *Brief) Print(ev *tracer.Event) error {
 		b.title(process), paint(endpoints(ev)), proto, ev.Size)
 	if s := clip(b.summary(ev, dc)); s != "" {
 		line += ": " + s
+	}
+	if dc.answers != "" {
+		line += b.dim(" (" + dc.answers + ")")
 	}
 	if dc.isHTTP2 && dc.note != "" {
 		line += " " + b.warn("[started before snoopy; headers not decoded]")

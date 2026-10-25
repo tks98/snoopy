@@ -86,6 +86,7 @@ type options struct {
 	// snoopy's own flags, the commonest, passed on.
 	brief, json, full, hex, verbose, redact bool
 	hosts, ports                            []string
+	methods, paths, statuses                []string
 	count                                   int
 }
 
@@ -149,6 +150,9 @@ func newCommand(o *options) *cobra.Command {
 	f.BoolVar(&o.redact, "redact", false, "snoopy: mask credentials, secret fields and recognizable tokens")
 	f.StringArrayVar(&o.hosts, "host", nil, "snoopy: only connections with this address, network or host at either end")
 	f.StringArrayVar(&o.ports, "port", nil, "snoopy: only connections with this port at either end")
+	f.StringArrayVar(&o.methods, "method", nil, "snoopy: only requests with this method, and their responses")
+	f.StringArrayVar(&o.paths, "path", nil, "snoopy: only requests whose path starts with this, and their responses")
+	f.StringArrayVar(&o.statuses, "status", nil, "snoopy: only responses with this status (404, 5xx, 400-499)")
 	f.IntVar(&o.count, "count", 0, "snoopy: stop after N calls")
 	return cmd
 }
@@ -167,6 +171,14 @@ func (o *options) passed() []string {
 	}
 	for _, p := range o.ports {
 		args = append(args, "--port", p)
+	}
+	for _, f := range []struct {
+		flag string
+		vs   []string
+	}{{"--method", o.methods}, {"--path", o.paths}, {"--status", o.statuses}} {
+		for _, v := range f.vs {
+			args = append(args, f.flag, v)
+		}
 	}
 	if o.count > 0 {
 		args = append(args, "--count", fmt.Sprint(o.count))
