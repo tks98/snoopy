@@ -3,9 +3,15 @@
 `kubectl snoopy` shows what a pod's containers send and receive over TLS,
 the way snoopy shows a process's:
 
+![kubectl snoopy on a deployment's two pods, decoded with --redact, then one line per call with --brief](kubectl-demo.gif)
+
+A checkout deployment posting charges to a payments service in the
+cluster, recorded with [demo/record-kubectl.sh](demo/record-kubectl.sh) on
+[demo/kubectl-demo.yaml](demo/kubectl-demo.yaml).
+
 ```console
 $ kubectl snoopy checkout-7d9f -n shop --brief
-kubectl snoopy: starting snoopy on node pool-a-3, as pod shop/snoopy-checkout-7d9f-x2k4q
+kubectl snoopy: starting snoopy on node pool-a-3, as pod shop/snoopy-checkout-7d9f-x2k4q, for pod checkout-7d9f
 snoopy: attached to the openssl library (--verbose lists every file)
 snoopy: tracing; press Ctrl-C to stop
 09:14:02.118 checkout-7d9f/app node[4121] 10.0.3.17:41822 > 10.0.9.4:443 TLS 212: POST /v1/charge HTTP/1.1, host payments.internal
