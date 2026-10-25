@@ -746,6 +746,30 @@ func TestHostLibraries(t *testing.T) {
 	}
 }
 
+// --comm matches the program's file name too, for programs that rename
+// themselves, as Node.js's official builds do.
+func TestNameMatches(t *testing.T) {
+	proc := t.TempDir()
+	dir := filepath.Join(proc, "7")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "comm"), []byte("MainThread\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/opt/node-v24/bin/node", filepath.Join(dir, "exe")); err != nil {
+		t.Fatal(err)
+	}
+	for prefix, want := range map[string]bool{"node": true, "no": true, "MainThread": true, "Main": true, "curl": false, "bin": false} {
+		if got := nameMatches(proc, 7, prefix); got != want {
+			t.Errorf("%q: %v", prefix, got)
+		}
+	}
+	if nameMatches(proc, 8, "node") {
+		t.Error("a process that isn't there matched")
+	}
+}
+
 func TestRustInfoDescribe(t *testing.T) {
 	for _, c := range []struct {
 		ri          RustInfo
