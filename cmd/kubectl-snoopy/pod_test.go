@@ -68,13 +68,13 @@ func TestSnoopyPod(t *testing.T) {
 	if want := []string{"--container", "containerd://aaa=checkout-7d9f/app", "--brief"}; !reflect.DeepEqual(args, want) {
 		t.Errorf("args: %q", args)
 	}
-	pod := snoopyPod(testPod(), "kube-system", "ghcr.io/tks98/snoopy:2.6.0", args, time.Hour)
+	pod := snoopyPod("pool-a-3", "checkout-7d9f", "shop/pod checkout-7d9f", "kube-system", "ghcr.io/tks98/snoopy:2.6.0", args, time.Hour)
 	spec := pod.Spec
 	c := spec.Containers[0]
 	switch {
 	case pod.Namespace != "kube-system" || !strings.HasPrefix(pod.GenerateName, "snoopy-checkout-7d9f-"):
 		t.Errorf("name: %s/%s", pod.Namespace, pod.GenerateName)
-	case pod.Labels[managedByLabel] != managedBy || pod.Annotations[targetKey] != "shop/checkout-7d9f":
+	case pod.Labels[managedByLabel] != managedBy || pod.Annotations[targetKey] != "shop/pod checkout-7d9f":
 		t.Errorf("labels %v, annotations %v", pod.Labels, pod.Annotations)
 	case spec.NodeName != "pool-a-3" || !spec.HostPID || spec.RestartPolicy != corev1.RestartPolicyNever:
 		t.Errorf("spec: %+v", spec)
@@ -88,9 +88,7 @@ func TestSnoopyPod(t *testing.T) {
 		t.Errorf("container: %+v", c)
 	}
 
-	long := testPod()
-	long.Name = strings.Repeat("x", 60)
-	if p := snoopyPod(long, "shop", "snoopy", nil, 0); len(p.GenerateName) > 63-5 || p.Spec.ActiveDeadlineSeconds != nil {
+	if p := snoopyPod("n", strings.Repeat("x", 60), "", "shop", "snoopy", nil, 0); len(p.GenerateName) > 63-5 || p.Spec.ActiveDeadlineSeconds != nil {
 		t.Errorf("long name: %q, deadline %v", p.GenerateName, p.Spec.ActiveDeadlineSeconds)
 	}
 }
@@ -104,7 +102,7 @@ func TestImagePull(t *testing.T) {
 		"registry:5000/snoopy:e2e":         corev1.PullIfNotPresent,
 		"ghcr.io/tks98/snoopy@sha256:abcd": corev1.PullIfNotPresent,
 	} {
-		if got := snoopyPod(testPod(), "shop", image, nil, 0).Spec.Containers[0].ImagePullPolicy; got != want {
+		if got := snoopyPod("n", "x", "", "shop", image, nil, 0).Spec.Containers[0].ImagePullPolicy; got != want {
 			t.Errorf("%s: %s, want %s", image, got, want)
 		}
 	}

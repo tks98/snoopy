@@ -5,6 +5,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,6 +42,10 @@ const example = `  # What the pod's containers send and receive over TLS
   # One line per call, for one container
   kubectl snoopy checkout-7d9f -n shop -c app --brief
 
+  # Every pod of a deployment, or with a label
+  kubectl snoopy deploy/checkout -n shop --brief
+  kubectl snoopy -l app=checkout -n shop --json
+
   # JSON, only connections to port 443
   kubectl snoopy checkout-7d9f --json --port 443 | jq .
 
@@ -52,6 +58,9 @@ const example = `  # What the pod's containers send and receive over TLS
 const long = `Shows what a pod's containers send and receive over TLS, decoded, without
 certificates or changes to the pod. It runs snoopy (https://github.com/tks98/snoopy)
 on the pod's node, in a pod of its own, and deletes that pod when you stop it.
+Given a deployment, statefulset, daemonset, replicaset, job or service
+(KIND/NAME), or -l, it traces the pods they select that are running when it
+starts, with one snoopy pod per node.
 
 The snoopy pod is privileged and shares the node's PID namespace, which
 snoopy needs for eBPF. Pod Security Admission allows that only in namespaces
@@ -65,6 +74,8 @@ type options struct {
 	config     *genericclioptions.ConfigFlags
 	streams    genericiooptions.IOStreams
 	containers []string
+	selector   string
+	maxNodes   int
 	debugNS    string
 	image      string
 	deadline   time.Duration
@@ -91,7 +102,7 @@ func main() {
 
 func newCommand(o *options) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:           "kubectl snoopy POD [flags] [-- snoopy flags]",
+		Use:           "kubectl snoopy (POD | KIND/NAME | -l SELECTOR) [flags] [-- snoopy flags]",
 		Short:         "Show what a pod sends and receives over TLS",
 		Long:          long,
 		Example:       example,
@@ -110,15 +121,20 @@ func newCommand(o *options) *cobra.Command {
 			if dash >= 0 {
 				args, rest = args[:dash], args[dash:]
 			}
-			if len(args) != 1 {
-				return errors.New("give one pod: kubectl snoopy POD (see --help)")
+			switch {
+			case len(args) == 0 && o.selector != "":
+				return o.run(cmd.Context(), "", rest)
+			case len(args) != 1:
+				return errors.New("give a pod, KIND/NAME (deploy/checkout) or -l SELECTOR (see --help)")
 			}
 			return o.run(cmd.Context(), args[0], rest)
 		},
 	}
 	f := cmd.Flags()
 	o.config.AddFlags(f)
-	f.StringSliceVarP(&o.containers, "container", "c", nil, "only these containers of the pod (default: all of them)")
+	f.StringSliceVarP(&o.containers, "container", "c", nil, "only these containers of the pods (default: all of them)")
+	f.StringVarP(&o.selector, "selector", "l", "", "the pods with these labels, instead of a pod or KIND/NAME")
+	f.IntVar(&o.maxNodes, "max-nodes", 10, "the most nodes to run snoopy pods on")
 	f.StringVar(&o.debugNS, "debug-namespace", "", "namespace for the snoopy pod (default: the target pod's)")
 	f.StringVar(&o.image, "image", "", "snoopy's image (default: "+defaultImage+", this plugin's version)")
 	f.DurationVar(&o.deadline, "max-duration", 4*time.Hour, "how long the snoopy pod may run, should the plugin be killed")
@@ -175,21 +191,22 @@ func (o *options) logf(format string, a ...any) {
 	fmt.Fprintf(o.streams.ErrOut, "kubectl snoopy: "+format+"\n", a...)
 }
 
-func (o *options) run(ctx context.Context, name string, rest []string) error {
+func (o *options) run(ctx context.Context, target string, rest []string) error {
 	cfg, cs, ns, err := o.clients()
 	if err != nil {
 		return err
 	}
-	pod, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	pods, what, err := resolvePods(ctx, cs, ns, target, o.selector)
 	if err != nil {
 		return err
 	}
-	if pod.Spec.NodeName == "" {
-		return fmt.Errorf("pod %s isn't scheduled on a node yet", name)
-	}
-	tgts, err := targets(pod, o.containers)
+	nodes, err := byNode(pods, o.containers, o.logf)
 	if err != nil {
 		return err
+	}
+	if len(nodes) > o.maxNodes {
+		return fmt.Errorf("%s run on %d nodes, which would take a snoopy pod on each; --max-nodes %d allows it",
+			what, len(nodes), len(nodes))
 	}
 	image := o.image
 	if image == "" {
@@ -202,56 +219,130 @@ func (o *options) run(ctx context.Context, name string, rest []string) error {
 	if debugNS == "" {
 		debugNS = ns
 	}
-
-	spec := snoopyPod(pod, debugNS, image, snoopyArgs(tgts, append(o.passed(), rest...)), o.deadline)
-	created, err := cs.CoreV1().Pods(debugNS).Create(ctx, spec, metav1.CreateOptions{})
-	if err != nil {
-		return explainCreate(err, debugNS)
+	name := target
+	if target == "" || strings.Contains(target, "/") {
+		_, name, _ = strings.Cut(target, "/")
+		name = cmp.Or(name, "selected")
 	}
-	o.logf("starting snoopy on node %s, as pod %s/%s", pod.Spec.NodeName, debugNS, created.Name)
+	args := append(o.passed(), rest...)
 
-	// Ctrl-C deletes the snoopy pod, which stops snoopy (SIGTERM): it prints
-	// what it has and its summary, and the stream ends. A second one gives up.
+	// One snoopy pod per node, for the containers there.
+	sessions := make([]*session, len(nodes))
+	for i, n := range nodes {
+		spec := snoopyPod(n.node, name, ns+"/"+what, debugNS, image, snoopyArgs(n.targets, args), o.deadline)
+		created, err := cs.CoreV1().Pods(debugNS).Create(ctx, spec, metav1.CreateOptions{})
+		if err != nil {
+			for _, s := range sessions[:i] {
+				s.remove(cs)
+			}
+			return explainCreate(err, debugNS)
+		}
+		sessions[i] = &session{o: o, node: n.node, ns: debugNS, name: created.Name}
+		o.logf("starting snoopy on node %s, as pod %s/%s, for %s", n.node, debugNS, created.Name, plural(n.pods))
+	}
+
+	// Ctrl-C deletes the snoopy pods, which stops snoopy (SIGTERM): each
+	// prints what it has and its summary, and its stream ends. A second one
+	// gives up.
 	stopped := make(chan os.Signal, 2)
 	signal.Notify(stopped, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stopped)
-	deleted := false
-	remove := func() {
-		if o.keep || deleted {
-			return
-		}
-		deleted = true
-		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := cs.CoreV1().Pods(debugNS).Delete(dctx, created.Name, metav1.DeleteOptions{}); err != nil {
-			o.logf("couldn't delete pod %s/%s: %v (kubectl snoopy --cleanup deletes it)", debugNS, created.Name, err)
+	removeAll := func() {
+		for _, s := range sessions {
+			s.remove(cs)
 		}
 	}
-	defer remove()
+	defer removeAll()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
 		<-stopped
-		remove()
+		removeAll()
 		<-stopped
 		cancel()
 	}()
 
-	running, err := waitRunning(ctx, cs, debugNS, created.Name)
+	// With several, their output is merged a whole event at a time, and
+	// their messages say which node they're from.
+	blocks := !o.brief && !o.json && !slices.Contains(rest, "--brief") && !slices.Contains(rest, "--json")
+	out, errOut := newMerger(o.streams.Out, blocks), newMerger(o.streams.ErrOut, false)
+	var wg sync.WaitGroup
+	errs := make([]error, len(sessions))
+	for i, s := range sessions {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stdout, stderr := io.Writer(o.streams.Out), io.Writer(o.streams.ErrOut)
+			var flush []interface{ Flush() error }
+			if len(sessions) > 1 {
+				so := out.stream()
+				se := &prefixWriter{m: errOut, prefix: []byte("[" + s.node + "] ")}
+				stdout, stderr, flush = so, se, []interface{ Flush() error }{so, se}
+			}
+			errs[i] = s.run(ctx, cfg, cs, stdout, stderr)
+			for _, f := range flush {
+				_ = f.Flush()
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+func plural(pods []string) string {
+	if len(pods) == 1 {
+		return "pod " + pods[0]
+	}
+	return fmt.Sprintf("%d pods", len(pods))
+}
+
+// session is one snoopy pod.
+type session struct {
+	o        *options
+	node     string
+	ns, name string
+	mu       sync.Mutex
+	deleted  bool
+}
+
+func (s *session) remove(cs kubernetes.Interface) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.o.keep || s.deleted {
+		return
+	}
+	s.deleted = true
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := cs.CoreV1().Pods(s.ns).Delete(ctx, s.name, metav1.DeleteOptions{}); err != nil {
+		s.o.logf("couldn't delete pod %s/%s: %v (kubectl snoopy --cleanup deletes it)", s.ns, s.name, err)
+	}
+}
+
+func (s *session) stopped() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleted
+}
+
+// run waits for the pod, attaches to it until snoopy ends, and returns an
+// error if snoopy failed.
+func (s *session) run(ctx context.Context, cfg *rest.Config, cs kubernetes.Interface, stdout, stderr io.Writer) error {
+	running, err := waitRunning(ctx, cs, s.ns, s.name)
 	if err != nil {
-		return err
+		return fmt.Errorf("node %s: %w", s.node, err)
 	}
 	if running {
-		if err := attach(ctx, cfg, cs, debugNS, created.Name, o.streams.Out, o.streams.ErrOut); err != nil && ctx.Err() == nil {
-			return fmt.Errorf("attach to pod %s/%s: %w", debugNS, created.Name, err)
+		if err := attach(ctx, cfg, cs, s.ns, s.name, stdout, stderr); err != nil && ctx.Err() == nil {
+			return fmt.Errorf("attach to pod %s/%s: %w", s.ns, s.name, err)
 		}
 	} else {
 		// It ended before it could be attached to: what it said is in its log.
-		if err := copyLogs(ctx, cs, debugNS, created.Name, o.streams.ErrOut); err != nil {
-			o.logf("couldn't read its log: %v", err)
+		if err := copyLogs(ctx, cs, s.ns, s.name, stderr); err != nil {
+			s.o.logf("couldn't read pod %s/%s's log: %v", s.ns, s.name, err)
 		}
 	}
-	return exitStatus(ctx, cs, debugNS, created.Name, deleted)
+	return exitStatus(ctx, cs, s.ns, s.name, s.stopped())
 }
 
 // waitRunning waits for the snoopy pod to run, and reports whether it does,

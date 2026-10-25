@@ -63,6 +63,22 @@ done
 [ "$left" -eq 0 ] || fail "$left snoopy pods left behind"
 echo "no snoopy pods left"
 
+echo "== a deployment's pods, and the same with -l"
+kubectl delete deployment clients --ignore-not-found --wait >/dev/null
+kubectl create deployment clients --image=curlimages/curl --replicas=2 -- \
+	sh -c 'while true; do curl -s --http1.1 -o /dev/null https://example.com; sleep 1; done' >/dev/null
+kubectl rollout status deployment/clients --timeout=120s >/dev/null
+for target in deploy/clients "-l app=clients"; do
+	status=0
+	# shellcheck disable=SC2086 # -l and its value are two words
+	timeout 180 "$tmp/kubectl-snoopy" $target --image "$image" --json --count 8 > "$tmp/out.json" 2> "$tmp/err" || status=$?
+	[ "$status" -eq 0 ] || { cat "$tmp/err" >&2; fail "$target: kubectl snoopy exited with $status"; }
+	pods=$(grep -o '"container_name":"clients-[^/"]*/curl"' "$tmp/out.json" | sort -u | wc -l)
+	echo "$target: $(grep -c '^{' "$tmp/out.json") events, from $pods pods"
+	[ "$pods" -eq 2 ] || fail "$target: events from $pods of the deployment's 2 pods"
+done
+kubectl delete deployment clients --wait=false >/dev/null
+
 echo "== a namespace that doesn't allow privileged pods"
 kubectl create namespace restricted --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl label namespace restricted pod-security.kubernetes.io/enforce=baseline --overwrite >/dev/null
