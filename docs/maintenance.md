@@ -816,9 +816,17 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   them as not its own, so `sched_process_fork` reports new processes of
   traced ones, and they get their own (held with ptrace, like execs, until
   then). Links are kept per process (`procLinks`, with its start time against
-  PID reuse) and closed every 5 s once it has exited. A file attached to for
+  PID reuse) and closed every 5 s once it has exited. `sched_process_exit`
+  deletes a process's `traced_tgids` and `java_sessions` entries when its
+  last thread exits, so the maps don't fill up over days (with BTF, from
+  `signal->live`; without, when the main thread exits). A file attached to for
   everyone (`--lib`) isn't attached to again per process, which would show
-  its calls twice. The BPF program still filters too: on `traced_tgids`,
+  its calls twice. Links made for everyone are kept per file (`fileLinks`,
+  with an O_PATH descriptor) and released by `DetachUnused` every 5 s once
+  the file is deleted and no process maps it, or its root filesystem (a
+  container's) has no process left. Detaching costs the kernel tens of ms
+  per uprobe, so it's done in the background, in batches, and at exit all at
+  once. The BPF program still filters too: on `traced_tgids`,
   with BTF adding a process whose parent, or one of its parents up to 8
   levels, is in it (`is_traced_tgid`), and on the name. Without BTF the
   probes are per file, and user space scans `/proc` for new children of
@@ -834,8 +842,9 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   this way, extracted to temporary files and deleted; `TestJavaNativeTLS`
   loads them at start and five seconds later.
 
-- **Java agent frames:** `note_java_frame`, first thing in `sys_enter` for
-  `write`, picks up the agent's frames for a session in `java_sessions`
+- **Java agent frames:** with `--java` only (`java_enabled`, which the
+  verifier drops the code for otherwise), `note_java_frame`, first thing in
+  `sys_enter` for `write`, picks up the agent's frames for a session in `java_sessions`
   (by PID as snoopy sees it, like `traced_tgids`), and returns before the
   socket tracking. `struct java_frame` must match `Hooks.header` in
   `java/agent/src/snoopy/hooks/Hooks.java` (88 bytes, little-endian), and

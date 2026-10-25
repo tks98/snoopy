@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tks98/snoopy/v2/internal/procinfo"
 	"golang.org/x/sys/unix"
 )
 
@@ -116,10 +117,8 @@ func inspect(pid int) (*process, error) {
 	if err != nil {
 		return nil, err
 	}
-	if i := bytes.LastIndexByte(stat, ')'); i >= 0 {
-		if f := strings.Fields(string(stat[i+1:])); len(f) > 19 {
-			p.start = f[19]
-		}
+	if s, ok := procinfo.ParseStat(stat); ok && s.Complete {
+		p.start = strconv.FormatUint(s.Start, 10)
 	}
 	return p, nil
 }

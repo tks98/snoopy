@@ -467,7 +467,7 @@ func run(cfg config) error {
 	// With a process filter, probes go on those processes only, so the
 	// rest don't pay for them; that needs the watcher, for new ones.
 	perProcess := !cfg.noScan && (cfg.pid != 0 || cfg.comm != "" || len(cfg.containers) > 0)
-	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize, PerProcess: perProcess})
+	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize, PerProcess: perProcess, Java: cfg.java})
 	if err != nil {
 		return loadError(err, cfg.verbose)
 	}
@@ -878,8 +878,9 @@ func plural(n int, one, many string) string {
 // opposed to for a process started since, is only listed with --verbose.
 func reportAttach(cfg config, target discover.Target, funcs []string, err error, startup bool) bool {
 	// A file reached through /proc/<pid> is gone if the process exited in
-	// the meantime, which short-lived new processes often do.
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	// the meantime, which short-lived new processes often do, and a probe
+	// for a process that has gone can't be made (ESRCH).
+	if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ESRCH) {
 		logf("warning: %s %s: %v", target.Library, target.Path, err)
 	}
 	if len(funcs) == 0 {

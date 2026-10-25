@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -9,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -285,15 +283,11 @@ func processKey(pid int) (procKey, bool) {
 	if err != nil {
 		return procKey{}, false
 	}
-	i := bytes.LastIndexByte(stat, ')')
-	if i < 0 {
+	s, ok := procinfo.ParseStat(stat)
+	if !ok || !s.Complete {
 		return procKey{}, false
 	}
-	f := strings.Fields(string(stat[i+1:]))
-	if len(f) < 20 {
-		return procKey{}, false
-	}
-	return procKey{pid, f[19]}, true
+	return procKey{pid, strconv.FormatUint(s.Start, 10)}, true
 }
 
 // alive reports whether the process is still running, not another that

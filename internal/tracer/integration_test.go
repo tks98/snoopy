@@ -1770,7 +1770,7 @@ func TestJSSE(t *testing.T) {
 	requireRoot(t)
 	java, agent := javaAgent(t)
 	jdk := javaVersion(t, java)
-	tr, err := New(Options{})
+	tr, err := New(Options{Java: true})
 	if err != nil {
 		t.Fatal(err)
 	}

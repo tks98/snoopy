@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/tks98/snoopy/v2/internal/discover"
+	"github.com/tks98/snoopy/v2/internal/procinfo"
 )
 
 const (
@@ -262,13 +263,8 @@ func procGone(pid int) bool {
 	if err != nil {
 		return true
 	}
-	i := bytes.LastIndexByte(stat, ')') // the command name may contain anything
-	if i < 0 {
-		return true
-	}
-	fields := strings.Fields(string(stat[i+1:]))
-	// state is field 3, num_threads 20.
-	return len(fields) < 18 || fields[0] == "Z" && fields[17] == "1" || fields[0] == "X"
+	s, ok := procinfo.ParseStat(stat)
+	return !ok || s.Threads == 0 || s.State == 'Z' && s.Threads == 1 || s.State == 'X'
 }
 
 // RegisterJava makes the frames of snoopy's Java agent in process pid (as
@@ -514,16 +510,8 @@ func procStart(pid int) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	i := bytes.LastIndexByte(stat, ')') // the command name may contain anything
-	if i < 0 {
-		return 0, false
-	}
-	fields := strings.Fields(string(stat[i+1:]))
-	if len(fields) < 20 {
-		return 0, false
-	}
-	start, err := strconv.ParseUint(fields[19], 10, 64)
-	return start, err == nil
+	s, ok := procinfo.ParseStat(stat)
+	return s.Start, ok && s.Complete
 }
 
 // DetachExited closes the probes of processes that have exited.
@@ -1274,8 +1262,8 @@ func traceStopped(pid int) bool {
 	if err != nil {
 		return false
 	}
-	i := bytes.LastIndexByte(stat, ')')
-	return i >= 0 && i+2 < len(stat) && stat[i+2] == 't'
+	s, ok := procinfo.ParseStat(stat)
+	return ok && s.State == 't'
 }
 
 // release detaches from a thread. ESRCH means it's gone, or not in a stop,

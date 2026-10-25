@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -369,5 +370,23 @@ func TestJavaForgetExited(t *testing.T) {
 	l.forgetExited()
 	if len(l.loaded) != 1 || l.loaded[self] == "" || len(l.failing) != 0 || len(l.reported) != 0 {
 		t.Errorf("loaded %v, failing %v, reported %v", l.loaded, l.failing, l.reported)
+	}
+}
+
+// A process that exits before its probes are made isn't warned about.
+func TestReportAttachGone(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := os.Stderr
+	os.Stderr = w
+	target := discover.Target{Path: "/proc/1/root/usr/lib/libssl.so.3"}
+	reportAttach(config{}, target, nil, fmt.Errorf("SSL_read: opening perf event: %w", syscall.ESRCH), false)
+	reportAttach(config{}, target, nil, fmt.Errorf("open: %w", os.ErrNotExist), false)
+	os.Stderr = stderr
+	w.Close()
+	if out, _ := io.ReadAll(r); len(out) != 0 {
+		t.Errorf("warned: %s", out)
 	}
 }

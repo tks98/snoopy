@@ -1461,7 +1461,7 @@ struct java_frame {
 	__u64 magic;
 	__u64 nonce;
 	__u64 conn;	  // the agent's ID for the SSLSocket or SSLEngine
-	__u64 seq;	  // the agent's frame count, for spotting gaps
+	__u64 seq;	  // the connection's frame count, for spotting gaps
 	__u8 dir;	  // JAVA_READ, or 0 for writes
 	__u8 kind;	  // JAVA_KIND_*
 	__u16 family;	  // AF_INET, AF_INET6, or 0 if the addresses are unknown

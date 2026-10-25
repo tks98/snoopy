@@ -467,7 +467,22 @@ signature finding against real binaries (see
 - **HTTP/1 pipelining:** a response is matched to the last request sent, so
   with pipelined requests a response to HEAD can be taken to have a body.
 - **No socket details** (fd or addresses) for apps that do their own socket
-  I/O around OpenSSL with memory BIOs, e.g. .NET, nor for Java's `SSLEngine`.
+  I/O around OpenSSL with memory BIOs, e.g. .NET and Node.js, nor for Java's
+  `SSLEngine`. (Before 2.10, Node's calls could get the address of a file
+  OpenSSL read, or of a later socket with that fd; now they get none.)
+- **Detaching is slow:** the kernel takes tens of ms per uprobe to detach,
+  under a global lock, so a snoopy with thousands of links takes seconds to
+  exit. uprobe_multi links (Linux 6.6+) would fix it; not done.
+- **Probably duplicate events across containers of one image:** uprobes go
+  on the real (lower layer) inode, but snoopy tells files apart by the
+  overlay's device and inode, so two running containers from one image may
+  get two sets of probes on the same file. Not checked yet.
+- **kubectl snoopy's text merge** of several nodes' output splits events at
+  a blank line followed by a header-shaped line, a heuristic: a body with
+  such a line in it can be split. --json is exact. An event delimiter in
+  snoopy's text output would make it exact.
+- **--redact is slow:** about 10 ms per 15 KB body, mostly regexps; a cheap
+  pre-check before them would help.
 - **Java's JSSE needs `--java`,** which loads snoopy's agent into the JVM
   (docs/how-it-works.md, "Java and JSSE"). It can't be unloaded, only told
   to stop. Not covered: writes that throw part way, kernels without BTF

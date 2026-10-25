@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/tks98/snoopy/v2/internal/procinfo"
 )
 
 // serveExecGrace bounds how long --serve-exec waits for the snoopy runs in
@@ -69,9 +71,6 @@ func zombie(dir string) bool {
 	if err != nil {
 		return true
 	}
-	i := bytes.LastIndexByte(stat, ')')
-	if i < 0 || i+2 >= len(stat) {
-		return true
-	}
-	return stat[i+2] == 'Z' || stat[i+2] == 'X'
+	s, ok := procinfo.ParseStat(stat)
+	return !ok || s.State == 'Z' || s.State == 'X'
 }

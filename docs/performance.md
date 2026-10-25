@@ -79,6 +79,13 @@ The BPF programs' own time per call, for nginx at 1 KiB traced: 180 to
 (`tls_return`, which copies the data out), and 128 ns per syscall
 (`sys_enter`). Before, `tls_return` took 2,024 ns.
 
+`sys_enter` was measured again for 2.10, with byte-at-a-time `dd` reads
+and writes (BPF statistics, the same VM): 54 ns per syscall by default, 53
+ns with `--pid` or `--comm` (63 to 149 ns before), and 52 to 56 ns in a PID
+namespace, as in a Kubernetes pod (90 to 239 ns before). It now checks what
+a syscall can be before the process filter, and only looks for Java frames
+with `--java`.
+
 ## What it means
 
 - **A traced call** costs the program about 5 µs: nginx makes three TLS

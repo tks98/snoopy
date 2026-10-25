@@ -4,7 +4,6 @@ package procinfo
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -95,16 +94,8 @@ func (r *Resolver) startTime(pid uint32) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	i := bytes.LastIndexByte(stat, ')') // the command name may contain anything
-	if i < 0 {
-		return 0, false
-	}
-	fields := strings.Fields(string(stat[i+1:]))
-	if len(fields) < 20 {
-		return 0, false
-	}
-	start, err := strconv.ParseUint(fields[19], 10, 64)
-	return start, err == nil
+	s, ok := ParseStat(stat)
+	return s.Start, ok && s.Complete
 }
 
 // Container runtimes put the 64-hex-digit container ID in the cgroup path,

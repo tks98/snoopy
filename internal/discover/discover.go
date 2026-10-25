@@ -5,7 +5,6 @@ package discover
 
 import (
 	"bufio"
-	"bytes"
 	"debug/elf"
 	"errors"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/tks98/snoopy/v2/internal/procinfo"
 	"golang.org/x/sys/unix"
 )
 
@@ -817,16 +817,8 @@ func parentPID(proc string, pid int) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	i := bytes.LastIndexByte(data, ')')
-	if i < 0 {
-		return 0, false
-	}
-	fields := strings.Fields(string(data[i+1:]))
-	if len(fields) < 2 {
-		return 0, false
-	}
-	ppid, err := strconv.Atoi(fields[1])
-	return ppid, err == nil
+	s, ok := procinfo.ParseStat(data)
+	return s.PPID, ok && s.PPID > 0
 }
 
 // IsDescendant reports whether pid was started by ancestor, directly or not.
