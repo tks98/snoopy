@@ -11,24 +11,35 @@ import (
 
 var errNotRegular = errors.New("not a regular file")
 
-// openRegular opens a file snoopy reads, often in a container, only if it's
-// a regular file. Opening a FIFO blocks, and a device can do things just by
-// being opened, so the path is opened with O_PATH first, which does
-// neither, and the file reopened through that descriptor once it's known
-// to be regular: the same file, whatever the path points to by then.
-func openRegular(path string) (*os.File, error) {
+// OpenPath opens a file snoopy reads or attaches to, often in a container,
+// with O_PATH, which neither blocks (as opening a FIFO does) nor does
+// anything a device might on being opened, and only if it's a regular file.
+// /proc/self/fd/<fd> is then that file, whatever its path points to later:
+// open it through there.
+func OpenPath(path string) (int, error) {
 	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+		return -1, &os.PathError{Op: "open", Path: path, Err: err}
 	}
-	defer unix.Close(fd)
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
-		return nil, &os.PathError{Op: "stat", Path: path, Err: err}
+		unix.Close(fd)
+		return -1, &os.PathError{Op: "stat", Path: path, Err: err}
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, &os.PathError{Op: "open", Path: path, Err: errNotRegular}
+		unix.Close(fd)
+		return -1, &os.PathError{Op: "open", Path: path, Err: errNotRegular}
 	}
+	return fd, nil
+}
+
+// openRegular opens a file with OpenPath, to read it.
+func openRegular(path string) (*os.File, error) {
+	fd, err := OpenPath(path)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(fd)
 	f, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", fd))
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}

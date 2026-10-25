@@ -413,7 +413,15 @@ func closeLinks(links []link.Link) {
 }
 
 func (t *Tracer) attach(target discover.Target, pid int) ([]string, error) {
-	ex, err := link.OpenExecutable(target.Path)
+	// The file inspected, held onto: cilium/ebpf opens it again by path to
+	// read its symbols, and the kernel looks the path up for each probe, by
+	// when something else (a FIFO, which would block) could be there.
+	fd, err := discover.OpenPath(target.Path)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(fd)
+	ex, err := link.OpenExecutable(fmt.Sprintf("/proc/self/fd/%d", fd))
 	if err != nil {
 		return nil, err
 	}
@@ -938,6 +946,13 @@ func letGo(pid int) bool {
 		return true // it exited
 	case !traceStopped(pid):
 		return false // not stopped yet
+	default:
+		// Stopped since: for a signal, which detaching would lose without
+		// it, if the stop's notification came meanwhile.
+		if n, _ := unix.Wait4(pid, &ws, unix.WALL|unix.WNOHANG, nil); n == pid && ws.Stopped() &&
+			ws.TrapCause() != unix.PTRACE_EVENT_STOP {
+			sig = int(ws.StopSignal())
+		}
 	}
 	return release(pid, sig) == nil
 }
