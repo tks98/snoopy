@@ -1,8 +1,14 @@
 name: CI
 
+# On pull requests, and on main once merged; not on every branch push too,
+# which ran everything twice for a pull request's commits. Docs alone don't
+# need it.
 on:
   push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**"]
   workflow_dispatch:
 
 permissions:

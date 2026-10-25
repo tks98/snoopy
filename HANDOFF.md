@@ -67,6 +67,13 @@ compile for darwin, and `go test ./...` fails on macOS. Work inside a Linux VM:
 - From macOS you can still cross-check that things build:
   `GOOS=linux go build ./... && GOOS=linux go vet ./...`.
 
+CI's jobs run locally too, with `tools/act.sh` and act (`brew install act`,
+0.2.89 or later for node24 actions), in Docker Desktop on the Mac, whose
+Linux kernel has the BTF the BPF tests need: `tools/act.sh -W
+.github/workflows/ci.yml -j integration` ran the integration tests on it,
+as root, in about two minutes. Only arm64, the Mac's architecture; jobs
+with x86-64 in their matrix run there only. The script's comments have more.
+
 Running other kernels (vimto) needs QEMU. Without KVM it is slow but works:
 `VIMTO_DISABLE_KVM=true make integration-vm KERNEL=5.10` took about a minute
 per kernel here. Nested virtualization in a Mac VM needs an M3 or newer and

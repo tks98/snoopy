@@ -1,16 +1,13 @@
 name: Benchmark
 
-# Runs docs/benchmark/run.sh on GitHub's x86-64 and arm64 runners, to see
-# what snoopy costs on machines other than a developer's VM, and to catch a
-# change that makes it slower. Its output goes in the job summary. Runners
-# are shared VMs, so compare numbers within a run, not across runs.
-
+# Runs docs/benchmark/run.sh and java.sh on GitHub's x86-64 and arm64
+# runners, to see what snoopy costs on machines other than a developer's VM,
+# and to catch a change that makes it slower. Its output goes in the job
+# summary. Runners are shared VMs, so compare numbers within a run, not
+# across runs. By hand only (Actions, Benchmark, Run workflow): it takes a
+# while, and the scripts run anywhere.
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - .github/workflows/benchmark.yml
-      - docs/benchmark/**
 
 permissions:
   contents: read
