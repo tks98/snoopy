@@ -84,6 +84,12 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
   docs/release-risks.md if it changes how something fails.
 - **Signature-based finding:** bump `boringSSLCacheVersion` whenever its
   answers could change, or users keep stale cached results.
+- **Vulnerabilities:** `vulnscan.yml` fails on any known vulnerability in a
+  dependency, reachable or not, daily too. Fix it by updating the
+  dependency (both modules for one they share). An exception goes in an
+  `osv-scanner.toml` next to the lockfile, with its reason, and only for a
+  test program that has to stay on an old version; nothing shipped gets
+  one. ASM is pinned in `java/build.sh`, which `java/vulncheck.sh` checks.
 
 ## Conventions
 

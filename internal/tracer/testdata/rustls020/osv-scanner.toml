@@ -1,0 +1,20 @@
+# This program is built only by TestRustls, to check that snoopy still
+# traces rustls 0.20 with ring 0.16 (the versions of rustls 0.20 and early
+# 0.21), which programs in use still link. It is never shipped, and it
+# talks only to the test's own server. Upgrading would defeat the test, so
+# OSV-Scanner leaves these two versions' known vulnerabilities out; any
+# other package here, or another version, is still checked.
+
+[[PackageOverrides]]
+name = "rustls"
+ecosystem = "crates.io"
+version = "0.20.9"
+vulnerability.ignore = true
+reason = "Test-only program pinned to rustls 0.20 on purpose; see this file's header."
+
+[[PackageOverrides]]
+name = "ring"
+ecosystem = "crates.io"
+version = "0.16.20"
+vulnerability.ignore = true
+reason = "Test-only program pinned to ring 0.16, which rustls 0.20 needs; see this file's header."
