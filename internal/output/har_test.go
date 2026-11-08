@@ -185,6 +185,10 @@ func TestHARRedact(t *testing.T) {
 
 // Interim responses leave the queue as it is: a final response answers the
 // first request, and many of them take linear time.
+// timingSlack multiplies the time limits of tests that check for quadratic
+// behavior, for the race detector (see race_test.go).
+var timingSlack time.Duration = 1
+
 func TestHARInterim(t *testing.T) {
 	var out bytes.Buffer
 	h := NewHAR(&out, "test", Options{})
@@ -205,7 +209,7 @@ func TestHARInterim(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		h.Print(&tracer.Event{Function: tracer.FuncSSLRead, ConnID: 1, Data: interim, Size: uint32(len(interim))})
 	}
-	if d := time.Since(start); d > 2*time.Second {
+	if d := time.Since(start); d > 2*time.Second*timingSlack {
 		t.Errorf("50k interim responses took %v", d)
 	}
 }
