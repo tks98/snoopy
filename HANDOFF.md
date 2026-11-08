@@ -25,7 +25,7 @@ What CI checks, and when:
 | Check | When |
 | --- | --- |
 | gofmt, vet, golangci-lint, unit and race tests, govulncheck, amd64 and arm64 builds, BPF objects up to date (`ci.yml`) | Each pull request |
-| Integration tests on the runners' kernels, x86_64 and arm64, every C client including s2n-tls (built from source), with `SNOOPY_TEST_STRICT=1` so a missing client fails (`ci.yml`) | Each pull request |
+| Integration tests on the runners' kernels, x86_64 and arm64, every C client including s2n-tls (built from source), with `SNOOPY_TEST_STRICT=1` so a missing client fails, run twice: attaching through uprobe_multi links, and a link per probe as older kernels do (`ci.yml`) | Each pull request |
 | `TestJSSE` on JDK 17, 21 and 25, x86_64 and arm64 (`ci.yml`) | Each pull request |
 | The kubectl plugin, and a kind cluster end to end (`kubectl-snoopy.yml`) | Each pull request |
 | Every BPF program loads under 5.10, 5.15, 6.1, 6.6 and 6.12, in QEMU, x86_64 and arm64 (`loadcheck.yml`) | Changes to the BPF code or how it's loaded |
@@ -97,7 +97,9 @@ gnutls-cli, and cc with libnss3-dev for the NSS client in
 `internal/tracer/testdata`, or with `SNOOPY_TEST_STRICT=1` (CI) fail
 instead. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
 and quinn clients with cargo, and `SNOOPY_TEST_CURL_HTTP3` runs curl's HTTP/3
-from a system that has it (see AGENTS.md). `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
+from a system that has it (see AGENTS.md). `SNOOPY_TEST_LEGACY_UPROBES=1`
+attaches a perf-based link per probe, as kernels before 6.6 do, whatever
+the kernel (see "Attaching" below). `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
 signature finding against real binaries (see
 [CONTRIBUTING.md](CONTRIBUTING.md)).
 
@@ -111,6 +113,7 @@ signature finding against real binaries (see
 | `internal/tracer/gen.go` | `go:generate` → bpf2go (`go tool bpf2go`, declared as a tool in go.mod) |
 | `internal/tracer/snoopy_{x86,arm64}_bpfel.{go,o}` | Generated and committed |
 | `internal/tracer/tracer.go` | Load (BTF detection and fallback), attach, ring buffer loop, lost-event counter |
+| `internal/tracer/uprobes.go` | Making the links: uprobe_multi detection, grouping probes into links, C symbols' file offsets |
 | `internal/tracer/assemble.go` | Decodes records and reassembles chunks into events |
 | `internal/tracer/sockets.go` | Holds writes back until the socket notice for their connection arrives |
 | `internal/tracer/event.go` | `Event`, `Function` (must match `enum fn_id` in C; a test checks) |
@@ -194,6 +197,27 @@ signature finding against real binaries (see
 
 ### Go side
 
+- **Attaching:** each attach function builds a list of probes for the
+  file (`uprobe`), and `Tracer.link` makes the links. Where the kernel has
+  uprobe_multi links with their PID filtering fixed (`HaveUprobeMulti`:
+  6.6 and later, the fix included in 6.6.y), the probes running the same
+  program the same way are one link (`groupUprobes`), so a file takes a
+  few links rather than one per probe, return probes' first. The
+  programs are the same, loaded with `AttachTraceUprobeMulti`, which the
+  kernel then requires (they can't be attached the other way), so the
+  choice is made once, in `New`; should the kernel's verifier refuse them
+  so, they're loaded as before, which `tools/loadcheck` reports as a
+  failure. Otherwise each probe is a perf-based link, as before 2.11. C
+  functions are found by their symbols' file offsets (`symbolOffsets`,
+  as cilium/ebpf finds them, which `TestSymbolOffsets` checks), since a
+  uprobe_multi link takes a list of offsets and fails as a whole on a
+  missing symbol. Why: the kernel detaches a perf-based uprobe in tens of
+  ms, mostly waiting for RCU grace periods, one at a time; with `--comm`
+  and twenty Go programs, snoopy took 75 s to exit (see
+  [docs/performance.md](docs/performance.md#attaching-and-exiting)).
+  Kernels without the PID fix filtered per-process links by thread, so a
+  per-process probe only saw the main thread's calls; libbpf turns
+  uprobe_multi off for them too.
 - **Header layout:** `rawHeader` (Go) must match `struct event_header` (C,
   112 bytes with explicit padding); `TestHeaderMatchesBPFLayout` checks it
   against the bpf2go type.
@@ -470,9 +494,11 @@ signature finding against real binaries (see
   I/O around OpenSSL with memory BIOs, e.g. .NET and Node.js, nor for Java's
   `SSLEngine`. (Before 2.10, Node's calls could get the address of a file
   OpenSSL read, or of a later socket with that fd; now they get none.)
-- **Detaching is slow:** the kernel takes tens of ms per uprobe to detach,
-  under a global lock, so a snoopy with thousands of links takes seconds to
-  exit. uprobe_multi links (Linux 6.6+) would fix it; not done.
+- **Detaching is slow before Linux 6.6:** there, and on kernels without
+  uprobe_multi's PID fix, each probe is a perf-based link, which the kernel
+  takes tens of ms to detach, so a snoopy with thousands of links takes
+  seconds to exit, or more than a minute per-process with many processes.
+  6.6 and later attach through uprobe_multi links (see "Attaching").
 - **Probably duplicate events across containers of one image:** uprobes go
   on the real (lower layer) inode, but snoopy tells files apart by the
   overlay's device and inode, so two running containers from one image may

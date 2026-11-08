@@ -67,6 +67,10 @@ type Options struct {
 	// Java makes the frames of snoopy's Java agent count (see RegisterJava).
 	// Without it, the BPF program doesn't look for them in every write.
 	Java bool
+	// LegacyUprobes attaches a perf-based link per probe even where the
+	// kernel has uprobe_multi links (see UprobeMulti), for tests and
+	// tools/loadcheck, which check both ways.
+	LegacyUprobes bool
 
 	// ignoreKernelBTF loads the program as if the kernel had no BTF (tests).
 	ignoreKernelBTF bool
@@ -81,6 +85,7 @@ type Tracer struct {
 	procs      map[int]*procLinks      // per process, the links of each
 	files      map[procFile]*fileLinks // the files attached to for every process
 	perProcess bool
+	multi      bool // probes are attached through uprobe_multi links
 	reader     *ringbuf.Reader
 	clock      func(monoNs uint64) time.Time
 	haveBTF    bool
@@ -201,7 +206,19 @@ func New(opts Options) (*Tracer, error) {
 	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{},
 		procs: map[int]*procLinks{}, files: map[procFile]*fileLinks{}}
 	t.perProcess = perProcess
-	if err := spec.LoadAndAssign(&t.objs, &loadOpts); err != nil {
+	// With uprobe_multi links, a file's probes are a few links rather than
+	// one each, which the kernel detaches much faster. The programs are the
+	// same, loaded for that kind of link. Should the kernel refuse them so,
+	// they're loaded as before.
+	t.multi = !opts.LegacyUprobes && !legacyUprobesForTests && HaveUprobeMulti()
+	useUprobeMulti(spec, t.multi)
+	err = spec.LoadAndAssign(&t.objs, &loadOpts)
+	if err != nil && t.multi {
+		t.multi = false
+		useUprobeMulti(spec, false)
+		err = spec.LoadAndAssign(&t.objs, &loadOpts)
+	}
+	if err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
 			return nil, fmt.Errorf("the kernel's BPF verifier rejected snoopy's program: %+v", ve)
@@ -320,6 +337,13 @@ func emptyBTFSpec() (*btf.Spec, error) {
 		return nil, err
 	}
 	return btf.LoadSpecFromReader(bytes.NewReader(raw))
+}
+
+// UprobeMulti reports whether probes are attached through uprobe_multi
+// links: on Linux 6.6 and later, when its PID filtering has been fixed
+// (see HaveUprobeMulti), unless Options.LegacyUprobes.
+func (t *Tracer) UprobeMulti() bool {
+	return t.multi
 }
 
 // PerProcess reports whether probes are attached per process (see
@@ -721,7 +745,8 @@ func closeLinks(links []link.Link) {
 // functions it attached to and the links, those it made before an error
 // too.
 func (t *Tracer) attach(target discover.Target, fd, pid int) (attached []string, links []link.Link, err error) {
-	ex, err := link.OpenExecutable(fmt.Sprintf("/proc/self/fd/%d", fd))
+	path := fmt.Sprintf("/proc/self/fd/%d", fd)
+	ex, err := link.OpenExecutable(path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -785,48 +810,35 @@ func (t *Tracer) attach(target discover.Target, fd, pid int) (attached []string,
 		return nil, nil, fmt.Errorf("unsupported library %v", target.Library)
 	}
 
+	var offsets map[string]uint64 // the file's functions, by name
+	if target.Offsets != nil {    // a stripped copy: functions found by signature
+		offsets = target.Offsets
+	} else if offsets, err = symbolOffsets(path); err != nil {
+		return nil, nil, err
+	}
+	var ups []uprobe
 	for _, p := range probes {
-		// Not limited to Options.PID unless per process, since its
-		// descendants are traced too: the BPF program filters on
-		// traced_tgids.
-		opts := &link.UprobeOptions{PID: pid}
-		if target.Offsets != nil { // a stripped copy: functions found by signature
-			off, ok := target.Offsets[p.symbol]
-			if !ok {
-				continue
-			}
-			opts.Address = off
+		off, ok := offsets[p.symbol]
+		if !ok {
+			continue // e.g. SSL_read_ex before OpenSSL 1.1.1
 		}
-		// Attach the return probe first so no entry goes unmatched.
+		// The return probe first, so no entry goes unmatched.
 		if !p.entryOnly {
 			retProg := t.objs.TlsReturn
 			if p.symbol == "AES_CreateContext" { // records the new context's direction
 				retProg = t.objs.AesCreateReturn
 			}
-			ret, err := ex.Uretprobe(p.symbol, retProg, opts)
-			if errors.Is(err, link.ErrNoSymbol) {
-				continue // e.g. SSL_read_ex before OpenSSL 1.1.1
-			}
-			if err != nil {
-				return attached, links, fmt.Errorf("%s: %w", p.symbol, err)
-			}
-			links = append(links, ret)
+			ups = append(ups, uprobe{name: p.symbol, address: off, prog: retProg, ret: true, first: true})
 		}
-
-		entry, err := ex.Uprobe(p.symbol, p.prog, opts)
-		if errors.Is(err, link.ErrNoSymbol) {
-			continue
-		}
-		if err != nil {
-			return attached, links, fmt.Errorf("%s: %w", p.symbol, err)
-		}
-		links = append(links, entry)
-		attached = append(attached, p.symbol)
+		ups = append(ups, uprobe{name: p.symbol, address: off, prog: p.prog})
 	}
-	if len(attached) == 0 {
-		return nil, links, errors.New("none of the expected functions were found")
+	if len(ups) == 0 {
+		return nil, nil, errors.New("none of the expected functions were found")
 	}
-	return attached, links, nil
+	// Not limited to Options.PID unless per process, since its descendants
+	// are traced too: the BPF program filters on traced_tgids.
+	links, attached, err = t.link(ex, ups, pid)
+	return attached, links, err
 }
 
 // attachRustls attaches to rustls's Reader::read and Writer::write, found by
@@ -858,27 +870,18 @@ func (t *Tracer) attachRustls(ex *link.Executable, ri *discover.RustInfo, pid in
 			{"ring::aead open (ring 0.16)", ri.Ring016Opens, t.objs.Ring016OpenEnter, false},
 		}
 	}
+	var ups []uprobe
 	for _, p := range probes {
+		// One function for each version of the library linked in.
 		for _, off := range p.offsets {
-			opts := &link.UprobeOptions{Address: off, PID: pid}
 			if !p.entryOnly {
-				ret, err := ex.Uretprobe("", t.objs.TlsReturn, opts)
-				if err != nil {
-					return attached, links, fmt.Errorf("%s at %#x: %w", p.name, off, err)
-				}
-				links = append(links, ret)
+				ups = append(ups, uprobe{name: p.name, address: off, prog: t.objs.TlsReturn, ret: true, first: true})
 			}
-			entry, err := ex.Uprobe("", p.prog, opts)
-			if err != nil {
-				return attached, links, fmt.Errorf("%s at %#x: %w", p.name, off, err)
-			}
-			links = append(links, entry)
-		}
-		if len(p.offsets) > 0 {
-			attached = append(attached, p.name)
+			ups = append(ups, uprobe{name: p.name, address: off, prog: p.prog})
 		}
 	}
-	return attached, links, nil
+	links, attached, err = t.link(ex, ups, pid)
+	return attached, links, err
 }
 
 func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo, pid int) (attached []string, links []link.Link, err error) {
@@ -903,36 +906,22 @@ func (t *Tracer) attachGo(ex *link.Executable, gi *discover.GoInfo, pid int) (at
 			goProbe{"cipher.AEAD.Seal (QUIC)", gi.Seals[i], t.objs.GoAeadSealEnter, nil},
 			goProbe{"cipher.AEAD.Open (QUIC)", gi.Opens[i], t.objs.GoAeadOpenEnter, t.objs.GoAeadOpenReturn})
 	}
+	var ups []uprobe
 	for _, fn := range probes {
 		// Return probes go on each RET instruction rather than using a
 		// uretprobe, which would corrupt the goroutine's stack.
-		for _, ret := range fn.f.Returns {
-			if fn.retProg == nil {
-				break
+		if fn.retProg != nil {
+			for _, ret := range fn.f.Returns {
+				ups = append(ups, uprobe{name: fn.name, address: fn.f.Offset, offset: ret, prog: fn.retProg, first: true})
 			}
-			l, err := ex.Uprobe("", fn.retProg, &link.UprobeOptions{
-				Address: fn.f.Offset, Offset: ret, PID: pid,
-			})
-			if err != nil {
-				return attached, links, fmt.Errorf("%s+%#x: %w", fn.name, ret, err)
-			}
-			links = append(links, l)
 		}
 		// The entry probe goes after the stack check: when the stack has to
 		// grow, runtime.morestack restarts the function from the top, and a
 		// probe on the first instruction would see the call twice.
-		l, err := ex.Uprobe("", fn.prog, &link.UprobeOptions{
-			Address: fn.f.Offset, Offset: fn.f.Body, PID: pid,
-		})
-		if err != nil {
-			return attached, links, fmt.Errorf("%s+%#x: %w", fn.name, fn.f.Body, err)
-		}
-		links = append(links, l)
-		if !slices.Contains(attached, fn.name) {
-			attached = append(attached, fn.name)
-		}
+		ups = append(ups, uprobe{name: fn.name, address: fn.f.Offset, offset: fn.f.Body, prog: fn.prog})
 	}
-	return attached, links, nil
+	links, attached, err = t.link(ex, ups, pid)
+	return attached, links, err
 }
 
 // AttachSyscalls attaches the syscall tracepoint that tells snoopy which

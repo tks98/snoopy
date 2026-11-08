@@ -824,9 +824,11 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   its calls twice. Links made for everyone are kept per file (`fileLinks`,
   with an O_PATH descriptor) and released by `DetachUnused` every 5 s once
   the file is deleted and no process maps it, or its root filesystem (a
-  container's) has no process left. Detaching costs the kernel tens of ms
-  per uprobe, so it's done in the background, in batches, and at exit all at
-  once. The BPF program still filters too: on `traced_tgids`,
+  container's) has no process left. Detaching a perf-based uprobe costs
+  the kernel tens of ms, so it's done in the background, in batches, and
+  at exit all at once. From Linux 6.6 a file's probes are a few
+  uprobe_multi links instead (`internal/tracer/uprobes.go`), which detach
+  in about as long as one did. The BPF program still filters too: on `traced_tgids`,
   with BTF adding a process whose parent, or one of its parents up to 8
   levels, is in it (`is_traced_tgid`), and on the name. Without BTF the
   probes are per file, and user space scans `/proc` for new children of
