@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.10
 
 require (
-	github.com/andybalholm/brotli v1.2.7
+	github.com/andybalholm/brotli v1.2.8
 	github.com/cilium/ebpf v0.22.0
 	github.com/fatih/color v1.19.0
 	github.com/klauspost/compress v1.20.3
