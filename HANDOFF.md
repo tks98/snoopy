@@ -213,7 +213,7 @@ signature finding against real binaries (see
   uprobe_multi link takes a list of offsets and fails as a whole on a
   missing symbol. Why: the kernel detaches a perf-based uprobe in tens of
   ms, mostly waiting for RCU grace periods, one at a time; with `--comm`
-  and twenty Go programs, snoopy took 75 s to exit (see
+  and twenty Go programs, snoopy took 90 s to exit, 0.3 s now (see
   [docs/performance.md](docs/performance.md#attaching-and-exiting)).
   Kernels without the PID fix filtered per-process links by thread, so a
   per-process probe only saw the main thread's calls; libbpf turns
