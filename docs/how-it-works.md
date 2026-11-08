@@ -110,7 +110,11 @@ example), programs that use OpenSSL only through its BIO layer (e.g.
    connection handle. A return probe copies the bytes actually transferred
    into a ring buffer, in chunks of up to 16 KiB. Go programs can't use return
    probes, because Go moves goroutine stacks, so snoopy disassembles the
-   function and puts a probe on each `RET` instruction instead.
+   function and puts a probe on each `RET` instruction instead. On Linux
+   6.6 and later, a file's probes are attached through a few uprobe_multi
+   links, which the kernel attaches and detaches in one go; on older
+   kernels each probe is a link of its own, which makes snoopy slower to
+   exit.
 3. A `sys_enter` tracepoint records which socket each TLS call uses. Socket
    addresses are read from the kernel's `struct sock`, located with CO-RE
    (BTF-based relocation) so one compiled program works on every kernel

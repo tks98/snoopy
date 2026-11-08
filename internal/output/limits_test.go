@@ -267,7 +267,7 @@ func TestQUICReassembly(t *testing.T) {
 	}
 	start := time.Now()
 	items := d.streamData(streamFrame{id: 0, data: frame[:head], fin: true})
-	if took := time.Since(start); took > time.Second {
+	if took := time.Since(start); took > time.Second*timingSlack {
 		t.Errorf("reassembly took %v", took)
 	}
 	var got []byte

@@ -38,6 +38,9 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
   build with cargo. `SNOOPY_TEST_CURL_HTTP3` (with cargo too) adds curl's
   HTTP/3, given the root of a system whose curl has it: `/` on Fedora, or a
   Fedora root filesystem to chroot into, since Ubuntu's curl doesn't.
+  `SNOOPY_TEST_LEGACY_UPROBES=1` attaches a link per probe, as kernels
+  before 6.6 do, on a kernel that has uprobe_multi links; CI runs the
+  tests both ways.
   `TestQuicGoHTTP3` downloads quic-go with the Go toolchain, for the test
   program in `internal/tracer/testdata/quicgo`, which is its own module.
 - `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the signature-based
@@ -52,7 +55,8 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
   `.o` and `.go` files with the change.
 - The 5.10 verifier is the strictest one supported. After changing
   `bpf/snoopy.c`, run the integration tests on 5.10, 5.15, 6.1, 6.6 and 6.12
-  (`make integration-vm`). The Load check workflow loads every program
+  (`make integration-vm`). From 6.6 the uprobe programs are loaded for
+  uprobe_multi links, which the verifier checks again. The Load check workflow loads every program
   under 5.10 to 6.12 for such changes (`tools/loadcheck`, also runnable by
   hand); CI's other jobs only run their runners' kernels.
 - Rules learned the hard way: zero every struct passed to a helper

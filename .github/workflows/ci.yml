@@ -110,6 +110,12 @@ jobs:
         # client or library missing here fails its test rather than skipping
         # it.
         run: sudo env SNOOPY_TEST_STRICT=1 ./tracer.test -test.v -test.timeout 5m -test.skip TestJSSE
+      # The runners' kernels attach through uprobe_multi links; kernels
+      # before 6.6, and those without its PID filtering fixed, attach a
+      # perf-based link per probe. This runs the tests that way too.
+      - name: Run with a link per probe (as root)
+        working-directory: internal/tracer
+        run: sudo env SNOOPY_TEST_STRICT=1 SNOOPY_TEST_LEGACY_UPROBES=1 ./tracer.test -test.v -test.timeout 5m -test.skip TestJSSE
       # --quiet: the runner's own TLS traffic, including its credentials,
       # must not end up in the (public) log.
       - name: Smoke-test the binary
