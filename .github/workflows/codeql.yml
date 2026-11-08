@@ -1,0 +1,49 @@
+name: CodeQL
+
+# Static analysis for vulnerabilities in snoopy's own code, which parses
+# whatever traffic the programs it traces send (HTTP/1, HTTP/2, HTTP/3,
+# protobuf), and in these workflows (script injection, over-broad
+# permissions). Findings show in the repository's Security tab. On pull
+# requests, on main, and weekly, for queries added since.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 3" # Wednesdays
+  workflow_dispatch:
+
+# Each job asks for what it needs.
+permissions: {}
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [go, actions]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write # to upload the results
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.language == 'go'
+        with:
+          go-version-file: go.mod
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+          # Go's is what the Build step compiles: both modules' shipped code.
+          build-mode: ${{ matrix.language == 'go' && 'manual' || 'none' }}
+      - name: Build
+        if: matrix.language == 'go'
+        run: |
+          go build ./...
+          (cd cmd/kubectl-snoopy && go build ./...)
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}

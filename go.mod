@@ -10,7 +10,7 @@ require (
 	github.com/fatih/color v1.19.0
 	github.com/klauspost/compress v1.20.3
 	golang.org/x/arch v0.32.0
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.49.0
 )
 

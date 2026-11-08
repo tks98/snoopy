@@ -24,7 +24,9 @@ What CI checks, and when:
 
 | Check | When |
 | --- | --- |
-| gofmt, vet, golangci-lint, unit and race tests, govulncheck, amd64 and arm64 builds, BPF objects up to date (`ci.yml`) | Each pull request |
+| gofmt, vet, golangci-lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date (`ci.yml`) | Each pull request |
+| Known vulnerabilities, none allowed, reachable or not: govulncheck on both modules and their release-built binaries, OSV-Scanner on every lockfile (test programs' too), and the Java agent's ASM against OSV (`vulnscan.yml`) | Each pull request, and daily |
+| CodeQL on the Go code and the workflows (`codeql.yml`) | Each pull request, and weekly |
 | Integration tests on the runners' kernels, x86_64 and arm64, every C client including s2n-tls (built from source), with `SNOOPY_TEST_STRICT=1` so a missing client fails, run twice: attaching through uprobe_multi links, and a link per probe as older kernels do (`ci.yml`) | Each pull request |
 | `TestJSSE` on JDK 17, 21 and 25, x86_64 and arm64 (`ci.yml`) | Each pull request |
 | The kubectl plugin, and a kind cluster end to end (`kubectl-snoopy.yml`) | Each pull request |
@@ -126,7 +128,9 @@ signature finding against real binaries (see
 | `main.go` | CLI flags and wiring |
 | `java.go` | `--java`: which JVMs, loading the agent into them, stopping it |
 | `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64), the Java agent per JDK |
-| `.github/workflows/rust.yml`, `canary.yml`, `loadcheck.yml`, `release-check.yml`, `kubectl-snoopy.yml`, `benchmark.yml` | The other checks in the Status table |
+| `.github/workflows/rust.yml`, `canary.yml`, `loadcheck.yml`, `release-check.yml`, `kubectl-snoopy.yml`, `benchmark.yml`, `vulnscan.yml`, `codeql.yml` | The other checks in the Status table |
+| `java/vulncheck.sh` | Checks the ASM release `java/build.sh` bundles against OSV, which no scanner sees |
+| `SECURITY.md`, `**/osv-scanner.toml` | How to report a vulnerability; the scan's exceptions, each with its reason |
 | `.github/workflows/release.yml`, `.goreleaser.yaml`, `Dockerfile` | Releases on `v*` tags, and their attestations |
 | `tools/loadcheck/` | Loads every BPF program under older kernels in QEMU (`fetch.sh`, `run.sh`) |
 | `tools/act.sh` | Runs the workflows' jobs locally with act |
