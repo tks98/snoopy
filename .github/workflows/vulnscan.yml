@@ -69,6 +69,10 @@ jobs:
           go-version-file: go.mod
       # The Go modules and the Rust test programs' Cargo.lock files.
       - run: go run github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.0 scan source -r .
+        env:
+          # OSV-Scanner needs a newer Go than go.mod's to build: let go
+          # fetch the one it asks for (checked against sum.golang.org).
+          GOTOOLCHAIN: auto
 
   java:
     name: ASM in the Java agent
