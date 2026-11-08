@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/tks98/snoopy/v2/internal/discover"
 )
 
@@ -120,7 +122,54 @@ func openFDs(t *testing.T) int {
 func TestDetachUnused(t *testing.T) {
 	requireRoot(t)
 	python := requireTool(t, "python3")
+	testDetachUnused(t, python, privateLibSSL(t))
+}
+
+// The same on overlayfs with its layers on different filesystems, as
+// vimto's root is: then /proc/<pid>/maps and fstat give a file different
+// devices, and snoopy took a deleted library a process still mapped for
+// unused. The file is created through the overlay, so it's in the upper
+// layer. One of the lower layer, deleted through the overlay, keeps a link
+// count of 1 (it's only hidden), so it isn't seen as deleted at all.
+func TestDetachUnusedOverlay(t *testing.T) {
+	requireRoot(t)
+	python := requireTool(t, "python3")
 	lib := privateLibSSL(t)
+	dir := t.TempDir()
+	lower, upper, merged := filepath.Join(dir, "lower"), filepath.Join(dir, "upper"), filepath.Join(dir, "merged")
+	for _, d := range []string{lower, upper, merged} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The upper layer on a tmpfs, the lower one on the test's filesystem.
+	if err := unix.Mount("tmpfs", upper, "tmpfs", 0, ""); err != nil {
+		t.Fatalf("mount tmpfs: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(upper, unix.MNT_DETACH) })
+	for _, d := range []string{"up", "work"} {
+		if err := os.Mkdir(filepath.Join(upper, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(lib.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lower, filepath.Join(upper, "up"), filepath.Join(upper, "work"))
+	if err := unix.Mount("overlay", merged, "overlay", 0, opts); err != nil {
+		missing(t, "mount overlayfs: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(merged, unix.MNT_DETACH) })
+	lib.Path = filepath.Join(merged, filepath.Base(lib.Path))
+	if err := os.WriteFile(lib.Path, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testDetachUnused(t, python, lib)
+}
+
+func testDetachUnused(t *testing.T, python string, lib discover.Target) {
+	t.Helper()
 	tr, err := New(Options{})
 	if err != nil {
 		t.Fatal(err)

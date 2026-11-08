@@ -824,7 +824,11 @@ build with its symbols and `TestFreeblBinaries` on an arm64 freebl.
   its calls twice. Links made for everyone are kept per file (`fileLinks`,
   with an O_PATH descriptor) and released by `DetachUnused` every 5 s once
   the file is deleted and no process maps it, or its root filesystem (a
-  container's) has no process left. Detaching a perf-based uprobe costs
+  container's) has no process left. Whether a process maps a deleted file
+  is read from `/proc/<pid>/maps`, by the device and inode it shows there,
+  which on overlayfs with layers on different filesystems aren't fstat's
+  (vimto's root): `mapsKey` asks the kernel by mapping a page of the file
+  in snoopy and reading its own maps. Detaching a perf-based uprobe costs
   the kernel tens of ms, so it's done in the background, in batches, and
   at exit all at once. From Linux 6.6 a file's probes are a few
   uprobe_multi links instead (`internal/tracer/uprobes.go`), which detach

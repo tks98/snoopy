@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
@@ -127,6 +128,11 @@ type fileLinks struct {
 	root    fileKey
 	hasRoot bool
 	user    int // a process that maps it, while it's deleted
+	// maps is the device and inode /proc/<pid>/maps shows for it, once it
+	// has been looked for (see mapsKey), which on overlayfs can differ from
+	// dev and ino.
+	maps     fileKey
+	haveMaps bool
 }
 
 // fileKey identifies a file or directory.
@@ -570,6 +576,9 @@ func (t *Tracer) DetachUnused() {
 		case f.hasRoot:
 			rooted = append(rooted, f)
 		case unix.Fstat(f.fd, &st) == nil && st.Nlink == 0:
+			if !f.haveMaps {
+				f.maps, f.haveMaps = mapsKey(f.fd, fileKey{f.dev, f.ino}), true
+			}
 			deleted = append(deleted, f)
 		}
 	}
@@ -591,9 +600,8 @@ func (t *Tracer) DetachUnused() {
 	// first; only if it doesn't any more, every process is.
 	want := map[fileKey]bool{}
 	for _, f := range deleted {
-		key := fileKey{f.dev, f.ino}
-		if f.user == 0 || !mapsDeleted(f.user, map[fileKey]bool{key: true}, nil) {
-			want[key] = true
+		if f.user == 0 || !mapsDeleted(f.user, map[fileKey]bool{f.maps: true}, nil) {
+			want[f.maps] = true
 		}
 	}
 	if len(want) > 0 {
@@ -606,8 +614,8 @@ func (t *Tracer) DetachUnused() {
 		}
 		t.mu.Lock()
 		for _, f := range deleted {
-			if key := (fileKey{f.dev, f.ino}); want[key] {
-				f.user = users[key]
+			if want[f.maps] {
+				f.user = users[f.maps]
 				if f.user == 0 {
 					unused[f] = true
 				}
@@ -648,6 +656,56 @@ func liveRoots() map[fileKey]bool {
 	return roots
 }
 
+// mapsKey returns the device and inode /proc/<pid>/maps shows for the file
+// at fd, or else fallback, its fstat's. They can differ on overlayfs: with
+// its layers on different filesystems (vimto's root is so), fstat gives a
+// file the device of the layer it's in, and maps the overlay's. So the
+// kernel is asked: snoopy maps a page of the file and reads its own maps.
+// The page isn't executable, so the file's uprobes aren't put into it.
+func mapsKey(fd int, fallback fileKey) fileKey {
+	rfd, err := unix.Open(fmt.Sprintf("/proc/self/fd/%d", fd), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fallback
+	}
+	defer unix.Close(rfd)
+	mem, err := unix.Mmap(rfd, 0, os.Getpagesize(), unix.PROT_READ, unix.MAP_PRIVATE)
+	if err != nil {
+		return fallback // an empty file, say
+	}
+	defer func() { _ = unix.Munmap(mem) }()
+	start := strconv.FormatUint(uint64(uintptr(unsafe.Pointer(&mem[0]))), 16) + "-"
+	f, err := os.Open("/proc/self/maps")
+	if err != nil {
+		return fallback
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		// address perms offset dev inode path
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 5 || !strings.HasPrefix(fields[0], start) {
+			continue
+		}
+		if key, ok := parseMapsKey(fields[3], fields[4]); ok {
+			return key
+		}
+	}
+	return fallback
+}
+
+// parseMapsKey parses the device (major:minor, in hex) and inode fields of
+// a line of /proc/<pid>/maps.
+func parseMapsKey(dev, inode string) (fileKey, bool) {
+	major, minor, ok := strings.Cut(dev, ":")
+	maj, err1 := strconv.ParseUint(major, 16, 32)
+	mnr, err2 := strconv.ParseUint(minor, 16, 32)
+	ino, err3 := strconv.ParseUint(inode, 10, 64)
+	if !ok || err1 != nil || err2 != nil || err3 != nil {
+		return fileKey{}, false
+	}
+	return fileKey{unix.Mkdev(uint32(maj), uint32(mnr)), ino}, true
+}
+
 // mapsDeleted reports whether process pid maps one of the deleted files in
 // want, and if users isn't nil, records it as their user.
 func mapsDeleted(pid int, want map[fileKey]bool, users map[fileKey]int) bool {
@@ -669,14 +727,10 @@ func mapsDeleted(pid int, want map[fileKey]bool, users map[fileKey]int) bool {
 		if len(fields) < 6 {
 			continue
 		}
-		major, minor, ok := strings.Cut(fields[3], ":")
-		maj, err1 := strconv.ParseUint(major, 16, 32)
-		mnr, err2 := strconv.ParseUint(minor, 16, 32)
-		ino, err3 := strconv.ParseUint(fields[4], 10, 64)
-		if !ok || err1 != nil || err2 != nil || err3 != nil {
+		key, ok := parseMapsKey(fields[3], fields[4])
+		if !ok {
 			continue
 		}
-		key := fileKey{unix.Mkdev(uint32(maj), uint32(mnr)), ino}
 		if want[key] {
 			found = true
 			if users == nil {
