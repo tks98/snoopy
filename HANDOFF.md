@@ -499,6 +499,12 @@ signature finding against real binaries (see
   takes tens of ms to detach, so a snoopy with thousands of links takes
   seconds to exit, or more than a minute per-process with many processes.
   6.6 and later attach through uprobe_multi links (see "Attaching").
+- **A lower-layer file deleted through an overlay keeps its probes** until
+  snoopy exits: the overlay only hides it, its link count stays 1, so
+  `DetachUnused` doesn't take it for deleted. That's the safe way to be
+  wrong (it can still be opened from the lower directory); it costs the
+  links. Files on a container's root (`/proc/<pid>/root/...`) are let go
+  of with the root instead.
 - **Probably duplicate events across containers of one image:** uprobes go
   on the real (lower layer) inode, but snoopy tells files apart by the
   overlay's device and inode, so two running containers from one image may
