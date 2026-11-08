@@ -126,6 +126,8 @@ to inspect, and treat its output and pcap files as sensitive. `--redact`
 masks credentials, secret fields and recognizable tokens in the output, for
 sharing it ([docs/usage.md](docs/usage.md#sharing-output)).
 
+To report a vulnerability in snoopy, see [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT. The eBPF program (`bpf/snoopy.c`) is dual-licensed MIT/GPL-2.0, as the

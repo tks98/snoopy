@@ -18,3 +18,35 @@ updates:
     groups:
       plugin-dependencies:
         patterns: ["*"]
+  # The programs the integration tests build, which aren't shipped, but
+  # which vulnscan.yml checks too.
+  - package-ecosystem: gomod
+    directory: /internal/tracer/testdata/quicgo
+    schedule:
+      interval: weekly
+    groups:
+      test-go-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directories:
+      - /internal/tracer/testdata/quinnh3
+      - /internal/tracer/testdata/rustlsasync
+      - /internal/tracer/testdata/rustlsclient
+    schedule:
+      interval: weekly
+    groups:
+      test-rust-dependencies:
+        patterns: ["*"]
+  # Pinned to rustls 0.20 and ring 0.16 on purpose (its osv-scanner.toml
+  # says why): only its other dependencies are kept up to date.
+  - package-ecosystem: cargo
+    directory: /internal/tracer/testdata/rustls020
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: rustls
+      - dependency-name: tokio-rustls
+      - dependency-name: ring
+    groups:
+      test-rustls020-dependencies:
+        patterns: ["*"]

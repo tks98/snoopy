@@ -6,6 +6,8 @@
 # pinned below.
 set -eu
 cd "$(dirname "$0")"
+# vulncheck.sh checks this release for known vulnerabilities (vulnscan.yml,
+# daily), since nothing else can: Dependabot doesn't see it.
 ASM=9.11.1
 mkdir -p lib out
 # SHA-256 sums pinned here (Maven Central's own are SHA-1), checked

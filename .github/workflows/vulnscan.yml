@@ -1,0 +1,81 @@
+name: Vulnerability scan
+
+# Known vulnerabilities in what snoopy ships (the two binaries, the Java
+# agent's jars, and the image, which holds only those) and in what its
+# tests build. On every pull request and push to main, and daily: advisories
+# are published against code that hasn't changed, and a scheduled run that
+# fails is emailed. The bar is none, whether snoopy's code reaches them or
+# not, since users' scanners count them either way. A test program's
+# exceptions are in an osv-scanner.toml next to it, each with its reason.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+# Each job asks for what it needs.
+permissions: {}
+
+jobs:
+  govulncheck:
+    name: govulncheck (${{ matrix.binary }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binary: snoopy
+            dir: .
+          - binary: kubectl-snoopy
+            dir: cmd/kubectl-snoopy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ matrix.dir }}/go.mod
+      # In the toolchain (go.mod's toolchain line) and every module required,
+      # whether the code calls the vulnerable functions or not: govulncheck
+      # fails only for those it does, so its list is checked too.
+      - name: Source
+        run: |
+          set -o pipefail
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -show verbose ./... | tee "$RUNNER_TEMP/govulncheck.txt"
+          if grep -q '^Vulnerability #' "$RUNNER_TEMP/govulncheck.txt"; then
+            echo "::error::Known vulnerabilities in a module ${{ matrix.binary }} requires; update it (go get <module>@<fixed version>)."
+            exit 1
+          fi
+      # What's compiled into the binary, built as GoReleaser builds it.
+      - name: Binary
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o "$RUNNER_TEMP/${{ matrix.binary }}" .
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "$RUNNER_TEMP/${{ matrix.binary }}"
+
+  osv-scanner:
+    name: OSV-Scanner (every lockfile)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # The Go modules and the Rust test programs' Cargo.lock files.
+      - run: go run github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.0 scan source -r .
+
+  java:
+    name: ASM in the Java agent
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # build.sh copies ASM into snoopy-agent.jar, where no scanner sees it.
+      - run: java/vulncheck.sh
