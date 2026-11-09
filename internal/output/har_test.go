@@ -268,3 +268,17 @@ func TestHARRedactWhole(t *testing.T) {
 		t.Errorf("redirect:\n%s", out.String())
 	}
 }
+
+// A chunked body is kept without its framing, which is counted in
+// bodySize, as sent.
+func TestHARChunked(t *testing.T) {
+	var out bytes.Buffer
+	h := NewHAR(&out, "test", Options{})
+	h.Print(event(tracer.FuncSSLWrite, "GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+	h.Print(event(tracer.FuncSSLRead, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"))
+	h.Close()
+	l := readHAR(t, out.Bytes())
+	if c := l.Log.Entries[0].Response.Content; c.Text != "ok" || c.Size != 2 {
+		t.Errorf("content %+v", c)
+	}
+}

@@ -43,6 +43,7 @@ type config struct {
 	libs       stringList
 	noScan     bool
 	brief      bool
+	requests   bool
 	json       bool
 	hex        bool
 	full       bool
@@ -155,6 +156,8 @@ Which connections (repeatable):
                      (calls whose peer isn't known are left out, counted)
 
 Output:
+  --requests         one line per HTTP request and its response: method,
+                     URL, status, type, size and time, once the response ends
   --brief            one line per call, like tcpdump
   --json             one JSON object per call
   --full             whole bodies, and binary data as hex dumps (by default,
@@ -220,6 +223,7 @@ func flags(c *config) *flag.FlagSet {
 	fs.Var(&c.libs, "lib", "")
 	fs.BoolVar(&c.noScan, "no-scan", false, "")
 	fs.BoolVar(&c.brief, "brief", false, "")
+	fs.BoolVar(&c.requests, "requests", false, "")
 	fs.BoolVar(&c.json, "json", false, "")
 	fs.BoolVar(&c.full, "full", false, "")
 	fs.BoolVar(&c.hex, "hex", false, "")
@@ -272,7 +276,7 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		return c, errors.New("--java-agent is for --java")
 	}
 	var output []string
-	for name, set := range map[string]bool{"--brief": c.brief, "--json": c.json, "--hex": c.hex, "--full": c.full} {
+	for name, set := range map[string]bool{"--brief": c.brief, "--json": c.json, "--hex": c.hex, "--full": c.full, "--requests": c.requests} {
 		if set {
 			output = append(output, name)
 		}
@@ -766,6 +770,9 @@ type pipeline struct {
 	// sent to.
 	peers    output.Printer
 	printers []output.Printer
+	// requests is --requests' printer, whose lines are what --count counts
+	// and the summary reports, rather than calls.
+	requests *output.Requests
 	count    int // --count
 	calls    int
 	// noAddr is how many calls --host and --port left out because their
@@ -775,6 +782,11 @@ type pipeline struct {
 
 func newPipeline(filter addrFilter, printers []output.Printer, count int) *pipeline {
 	p := &pipeline{filter: filter, printers: printers, count: count}
+	for _, pr := range printers {
+		if r, ok := pr.(*output.Requests); ok {
+			p.requests = r
+		}
+	}
 	if filter.active() {
 		p.peers = output.NewBrief(io.Discard, output.Options{})
 	}
@@ -796,7 +808,7 @@ func (p *pipeline) handle(ev *tracer.Event) (done bool, err error) {
 		}
 		return false, nil
 	}
-	if p.count > 0 && p.calls >= p.count {
+	if p.count > 0 && p.done() {
 		return true, nil
 	}
 	if match, unknown := p.filter.check(ev); !match {
@@ -820,12 +832,26 @@ func (p *pipeline) handle(ev *tracer.Event) (done bool, err error) {
 		return false, nil
 	}
 	p.calls++
-	return p.count > 0 && p.calls >= p.count, nil
+	return p.count > 0 && p.done(), nil
+}
+
+// done reports whether --count's calls, or requests, have been shown.
+func (p *pipeline) done() bool {
+	if p.requests != nil {
+		return p.requests.Shown() >= p.count
+	}
+	return p.calls >= p.count
 }
 
 // summary says what was captured and what was left out.
 func (p *pipeline) summary(printers []output.Printer) string {
 	summary := fmt.Sprintf("captured %d %s", p.calls, plural(p.calls, "call", "calls"))
+	if r := p.requests; r != nil {
+		summary += fmt.Sprintf(", shown as %d %s", r.Shown(), plural(r.Shown(), "request", "requests"))
+		if n := r.FilteredRequests(); n > 0 {
+			summary += fmt.Sprintf(" (%d more that --method, --path or --status didn't match)", n)
+		}
+	}
 	if n := p.noAddr; n > 0 {
 		summary += fmt.Sprintf(", left out %d whose peer's address --host or --port needed but wasn't known", n)
 	}
@@ -1130,6 +1156,8 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		switch {
 		case cfg.json:
 			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
+		case cfg.requests:
+			printers = append(printers, output.NewRequests(out, output.Options{Redact: cfg.redact, Filter: cfg.filter}))
 		case cfg.brief:
 			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
 		default:

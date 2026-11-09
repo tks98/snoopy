@@ -31,6 +31,13 @@ type HAR struct {
 	conns   map[harConnKey]*harConn
 	filter  *HTTPFilter
 	redact  bool
+	// maxKept is how many entries are kept, bodies and all, for the log:
+	// maxHAREntries, or 0 for Requests, which only needs each one's end.
+	maxKept int
+	// done, if set, is called once for each exchange whose response has
+	// ended: an HTTP/2 or HTTP/3 stream's end or reset, or an HTTP/1.x
+	// response's last body byte.
+	done func(*harEntry)
 }
 
 // maxHARBody bounds how much of a body a HAR entry keeps, and maxHAREntries
@@ -69,6 +76,8 @@ type harEntry struct {
 	server     netip.AddrPort
 	conn       string
 	kept       bool // in HAR.entries
+	ended      bool // done was called for it
+	reset      bool // its stream was reset
 }
 
 type harMessage struct {
@@ -82,7 +91,10 @@ type harMessage struct {
 	version   string
 	headers   [][2]string
 	body      []byte // as decoded
-	bodySize  int    // as sent
+	bodySize  int    // as sent, HTTP/1.1's chunked framing included
+	length    int    // the body's own bytes (Content-Length's), framing left out
+	decoded   int    // the body's length decoded, if it has a Content-Encoding, kept or not
+	encoding  string // its Content-Encoding, if any
 	truncated bool
 }
 
@@ -91,7 +103,8 @@ type harMessage struct {
 // Filter apply, both to whole entries: secrets are masked in whole bodies,
 // however they were split across calls.
 func NewHAR(w io.Writer, version string, opts Options) *HAR {
-	h := &HAR{w: w, version: version, conns: map[harConnKey]*harConn{}, filter: opts.Filter, redact: opts.Redact}
+	h := &HAR{w: w, version: version, conns: map[harConnKey]*harConn{}, filter: opts.Filter, redact: opts.Redact,
+		maxKept: maxHAREntries}
 	opts.Warn, opts.Filter, opts.Redact = nil, nil, false
 	h.dec = newDecoders(opts)
 	return h
@@ -138,9 +151,12 @@ func (h *HAR) Print(ev *tracer.Event) error {
 				h.http1Message(c, ev, dir, s.msg)
 			case s.inBody || s.body.Encoding != "":
 				if e := c.current[dir]; e != nil {
-					e.add(dir, s.raw, s.body)
+					e.add(dir, s.raw, s.payload, s.body)
 					e.end = ev.Time
 				}
+			}
+			if e := c.current[dir]; s.ends && e != nil && dir != e.reqDir {
+				h.ended(e)
 			}
 		}
 	}
@@ -148,9 +164,19 @@ func (h *HAR) Print(ev *tracer.Event) error {
 	for _, end := range streamEnds(dc) {
 		if e := c.streams.get(end.id); e != nil && (end.reset || dir != e.reqDir) {
 			c.streams.finish(end.id)
+			e.reset = end.reset
+			h.ended(e)
 		}
 	}
 	return nil
+}
+
+// ended tells done, once, that an exchange's response has ended.
+func (h *HAR) ended(e *harEntry) {
+	if !e.ended && h.done != nil {
+		e.ended = true
+		h.done(e)
+	}
 }
 
 // newEntry starts an entry for a request (or a response whose request
@@ -166,18 +192,32 @@ func (h *HAR) newEntry(ev *tracer.Event, version string, reqDir tracer.Direction
 	} else {
 		e.server = ev.Local
 	}
-	if len(h.entries) < maxHAREntries {
+	if len(h.entries) < h.maxKept {
 		h.entries = append(h.entries, e)
 		e.kept = true
 	}
 	return e
 }
 
-// add adds bytes of a message's body, sent in direction dir, if the entry
-// is kept.
-func (e *harEntry) add(dir tracer.Direction, raw []byte, part bodyPart) {
+// add adds bytes of a message's body, sent in direction dir: raw as sent,
+// payload the body's bytes among them (without chunked framing). They're
+// counted, and kept if the entry is.
+func (e *harEntry) add(dir tracer.Direction, raw, payload []byte, part bodyPart) {
+	m := e.side(dir)
 	if e.kept {
-		e.side(dir).add(raw, part)
+		m.add(raw, payload, part)
+		return
+	}
+	m.bodySize += len(raw)
+	m.length += len(payload)
+	m.count(part)
+}
+
+// count counts what a part of the body decoded to, if it's encoded.
+func (m *harMessage) count(part bodyPart) {
+	if part.Encoding != "" {
+		m.encoding = part.Encoding
+		m.decoded += len(part.Decoded)
 	}
 }
 
@@ -274,15 +314,17 @@ func (h *HAR) data(c *harConn, ev *tracer.Event, dir tracer.Direction, stream ui
 	if e == nil {
 		return
 	}
-	e.add(dir, data, part)
+	e.add(dir, data, data, part)
 	e.end = ev.Time
 }
 
 // add adds bytes of the message's body as sent, and what they decoded to
 // if the body has a Content-Encoding.
-func (m *harMessage) add(raw []byte, part bodyPart) {
+func (m *harMessage) add(raw, payload []byte, part bodyPart) {
 	m.bodySize += len(raw)
-	piece := raw
+	m.length += len(payload)
+	m.count(part)
+	piece := payload
 	if part.Encoding != "" {
 		piece = part.Decoded
 	}
@@ -303,6 +345,23 @@ func (m harMessage) redacted() *harMessage {
 	}
 	m.headers, m.body = headers, redactText(m.body)
 	return &m
+}
+
+// url returns the URL an entry's request (req, which may be redacted)
+// was for: from its authority (or Host), or else the server's address.
+func (e *harEntry) url(req *harMessage) url.URL {
+	u := url.URL{Scheme: cmpOr(req.scheme, "https"), Host: req.authority}
+	if u.Host == "" && e.server.IsValid() {
+		u.Host = e.server.String()
+	}
+	target := cmpOr(req.target, "/")
+	if parsed, err := url.ParseRequestURI(target); err == nil && parsed.IsAbs() {
+		u = *parsed // an absolute target, as to a proxy
+	} else {
+		path, query, _ := strings.Cut(target, "?")
+		u.Path, u.RawQuery = path, query
+	}
+	return u
 }
 
 func opposite(d tracer.Direction) tracer.Direction {
@@ -400,17 +459,7 @@ func (h *HAR) Close() error {
 		if h.redact {
 			req, resp = req.redacted(), resp.redacted()
 		}
-		u := url.URL{Scheme: cmpOr(req.scheme, "https"), Host: req.authority}
-		if u.Host == "" && e.server.IsValid() {
-			u.Host = e.server.String()
-		}
-		target := cmpOr(req.target, "/")
-		if parsed, err := url.ParseRequestURI(target); err == nil && parsed.IsAbs() {
-			u = *parsed // an absolute target, as to a proxy
-		} else {
-			path, query, _ := strings.Cut(target, "?")
-			u.Path, u.RawQuery = path, query
-		}
+		u := e.url(req)
 		var query []nv
 		for k, vs := range u.Query() {
 			for _, v := range vs {
