@@ -70,6 +70,35 @@ archives:
       - src: LICENSE
         info: *file
 
+# Packages for apt, dnf and apk systems: snoopy in /usr/bin, with its Java
+# agent built in (internal/javaagent/jars). Their files' times are the
+# commit's, as the archives' are.
+nfpms:
+  - id: snoopy
+    ids: [snoopy]
+    package_name: snoopy
+    file_name_template: "{{ .PackageName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    homepage: https://github.com/tks98/snoopy
+    maintainer: tks98 <70284059+tks98@users.noreply.github.com>
+    description: |-
+      Debug HTTPS without a proxy: see what any Linux program, browsers
+      included, sends and receives over TLS, as plaintext, with eBPF.
+    license: MIT
+    formats: [deb, rpm, apk]
+    bindir: /usr/bin
+    mtime: "{{ .CommitDate }}"
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/snoopy/LICENSE
+        file_info:
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+      - src: README.md
+        dst: /usr/share/doc/snoopy/README.md
+        file_info:
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+
 # An SBOM (SPDX JSON, by syft) for each archive, released next to it.
 sboms:
   - artifacts: archive

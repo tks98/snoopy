@@ -48,7 +48,9 @@ type Options struct {
 	// call; without, only those added with TracePID are traced.
 	PID int
 	// Comm traces only processes whose name, as shown in /proc/<pid>/comm,
-	// starts with this.
+	// starts with this. One longer than the kernel's names (15 bytes) is
+	// matched against the program's file name instead, as
+	// discover.NameMatches does.
 	Comm string
 	// MaxCapture is the maximum number of bytes captured per call.
 	// Zero means DefaultMaxCapture.
@@ -91,6 +93,7 @@ type Tracer struct {
 	clock      func(monoNs uint64) time.Time
 	haveBTF    bool
 	names      map[uint32]string // process names, when the kernel can't tell
+	longComm   map[uint32]bool   // whether a process matches a Comm longer than the kernel's names
 	// tracedFull is set once traced_tgids was found full, which is said once.
 	tracedFull atomic.Bool
 	closing    sync.WaitGroup // closeLater's
@@ -147,9 +150,6 @@ func New(opts Options) (*Tracer, error) {
 	if opts.MaxCapture < 1 || opts.MaxCapture > MaxCaptureLimit {
 		return nil, fmt.Errorf("max capture must be between 1 and %d bytes", MaxCaptureLimit)
 	}
-	if len(opts.Comm) > maxCommLen {
-		return nil, fmt.Errorf("process name %q is longer than the kernel's %d-character limit", opts.Comm, maxCommLen)
-	}
 	if opts.RingBufferSize == 0 {
 		opts.RingBufferSize = defaultRingBufferSize
 	}
@@ -183,8 +183,10 @@ func New(opts Options) (*Tracer, error) {
 		}
 	}
 
+	// The kernel's names are cut at 15 bytes: a longer Comm is matched on
+	// those first, then on the file name in user space (commMatches).
 	var comm [16]byte
-	copy(comm[:], opts.Comm)
+	copy(comm[:maxCommLen], opts.Comm)
 	pidnsDev, pidnsIno := pidNamespace()
 	// Per process, the processes attached for are what's traced (Attach
 	// adds them to traced_tgids): one that renames itself later stays
@@ -209,7 +211,7 @@ func New(opts Options) (*Tracer, error) {
 	}
 	spec.Maps["events"].MaxEntries = uint32(opts.RingBufferSize)
 
-	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{},
+	t := &Tracer{opts: opts, clock: monotonicClock(), haveBTF: btfErr == nil, names: map[uint32]string{}, longComm: map[uint32]bool{},
 		procs: map[int]*procLinks{}, files: map[procFile]*fileLinks{}}
 	t.perProcess = perProcess
 	// With uprobe_multi links, a file's probes are a few links rather than
@@ -383,9 +385,37 @@ func (t *Tracer) processName(pid uint32, fallback string) string {
 	return name
 }
 
+// commMatches reports whether an event's process is one Options.Comm asks
+// for, where the BPF program couldn't tell: without BTF, it only knows the
+// thread's name; and a name longer than the kernel's it only compared on
+// their first 15 bytes. Per process, the processes were picked in user
+// space already.
+func (t *Tracer) commMatches(ev *Event) bool {
+	comm := t.opts.Comm
+	switch {
+	case comm == "" || t.perProcess:
+		return true
+	case len(comm) <= maxCommLen && t.haveBTF:
+		return true // the BPF program compared the whole name
+	case len(comm) <= maxCommLen:
+		return strings.HasPrefix(ev.Comm, comm)
+	}
+	match, ok := t.longComm[ev.PID]
+	if !ok {
+		match = discover.NameMatches(int(ev.PID), comm)
+		if len(t.longComm) >= 4096 {
+			clear(t.longComm)
+		}
+		t.longComm[ev.PID] = match
+	}
+	return match
+}
+
 func permissionHint(err error) error {
 	if errors.Is(err, unix.EPERM) || errors.Is(err, os.ErrPermission) {
-		return fmt.Errorf("%w (snoopy needs root, or at least CAP_BPF, CAP_PERFMON, CAP_SYS_RESOURCE and CAP_SYS_PTRACE)", err)
+		// What to do first: the error itself (a memlock limit, say) means
+		// little to someone who ran snoopy without sudo.
+		return fmt.Errorf("run snoopy as root, or with CAP_BPF, CAP_PERFMON, CAP_SYS_RESOURCE and CAP_SYS_PTRACE: %w", err)
 	}
 	return err
 }
@@ -1345,9 +1375,9 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 	release := func(ev *Event) {
 		if !t.haveBTF {
 			ev.Comm = t.processName(ev.PID, ev.Comm)
-			if t.opts.Comm != "" && !strings.HasPrefix(ev.Comm, t.opts.Comm) {
-				return
-			}
+		}
+		if !t.commMatches(ev) {
+			return
 		}
 		handle(ev)
 	}

@@ -9,6 +9,7 @@ on:
       - .goreleaser.yaml
       - Dockerfile
       - "java/**"
+      - "internal/javaagent/jars/**"
       - .github/workflows/release.yml
       - .github/workflows/release-check.yml
   workflow_dispatch:
@@ -71,6 +72,11 @@ jobs:
             docker cp "$id:/usr/share/snoopy/java/snoopy-agent.jar" - | tar -t
             docker rm "$id" >/dev/null
           done
+      - name: The packages install and run, on Ubuntu, Fedora and Alpine
+        run: |
+          sudo dpkg -i dist/snoopy_*_linux_amd64.deb && /usr/bin/snoopy --version && sudo dpkg -r snoopy
+          docker run --rm -v "$PWD/dist:/dist:ro" fedora:41 sh -c 'rpm -i /dist/snoopy_*_linux_amd64.rpm && snoopy --version'
+          docker run --rm -v "$PWD/dist:/dist:ro" alpine:3.22 sh -c 'apk add -q --allow-untrusted /dist/snoopy_*_linux_amd64.apk && snoopy --version'
       - name: The archives have the Java agent and SBOMs, and its jars are reproducible
         run: |
           for a in dist/snoopy_*_linux_*.tar.gz; do

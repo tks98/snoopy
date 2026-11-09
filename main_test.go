@@ -390,3 +390,64 @@ func TestReportAttachGone(t *testing.T) {
 		t.Errorf("warned: %s", out)
 	}
 }
+
+// A program started with SIGINT ignored, as a script's background job is,
+// still exits on Ctrl-C while starting: the test runs itself again that
+// way, and the copy signals itself before it would start tracing.
+func TestCtrlCWhileStarting(t *testing.T) {
+	if os.Getenv("SNOOPY_TEST_STARTUP_SIGNAL") == "1" {
+		tracing := exitOnSignalUntil()
+		_ = syscall.Kill(os.Getpid(), syscall.SIGINT)
+		time.Sleep(5 * time.Second) // exited by now
+		tracing()
+		os.Exit(0)
+	}
+	// sh -c 'trap "" INT; exec ...' starts it with SIGINT ignored.
+	cmd := exec.Command("sh", "-c", `trap "" INT; exec "$0" -test.run '^TestCtrlCWhileStarting$'`, os.Args[0])
+	cmd.Env = append(os.Environ(), "SNOOPY_TEST_STARTUP_SIGNAL=1")
+	start := time.Now()
+	err := cmd.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 130 {
+		t.Fatalf("got %v, want exit status 130", err)
+	}
+	if d := time.Since(start); d > 4*time.Second {
+		t.Errorf("took %v to exit", d)
+	}
+}
+
+func TestClosestFlag(t *testing.T) {
+	var c config
+	fs := flags(&c)
+	for name, want := range map[string]string{
+		"breif":   "brief", // swapped letters
+		"jsno":    "json",
+		"pi":      "pid", // one left out
+		"comand":  "",    // too far from comm
+		"xyzzy":   "",
+		"verbose": "verbose",
+	} {
+		if got := closestFlag(name, fs); got != want {
+			t.Errorf("closestFlag(%q) = %q, want %q", name, got, want)
+		}
+	}
+	_, err := parseFlags([]string{"--breif"}, io.Discard)
+	if err == nil || err.Error() != "flag provided but not defined: --breif; did you mean --brief?" {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestGrepAndDurationFlags(t *testing.T) {
+	c, err := parseFlags([]string{"--grep", `order/\d+`, "--duration", "90s"}, io.Discard)
+	if err != nil || c.grepRe == nil || !c.grepRe.MatchString("/order/42") || c.duration != 90*time.Second {
+		t.Errorf("got %+v, %v", c, err)
+	}
+	for _, args := range [][]string{{"--grep", "("}, {"--grep", "x", "--requests"}, {"--duration", "-1s"}} {
+		if _, err := parseFlags(args, io.Discard); err == nil {
+			t.Errorf("%q: no error", args)
+		}
+	}
+	if got := filterNames(config{grepRe: c.grepRe, filter: &output.HTTPFilter{}}); got != "--method, --path or --status or --grep" {
+		t.Errorf("filterNames: %q", got)
+	}
+}

@@ -805,3 +805,19 @@ func TestHasQUICStack(t *testing.T) {
 		f.Close()
 	}
 }
+
+func TestDeniedWarning(t *testing.T) {
+	for _, tc := range []struct {
+		denied []string
+		root   bool
+		want   string
+	}{
+		{[]string{"init[1]"}, true, "permission denied inspecting 1 process (init[1]); TLS libraries and Go programs only it uses are missed"},
+		{[]string{"a[2]", "b[3]"}, false, "permission denied inspecting 2 processes (a[2], b[3]); TLS libraries and Go programs only they use are missed; run snoopy as root"},
+		{[]string{"a[1]", "a[2]", "a[3]", "a[4]", "a[5]", "a[6]", "a[7]"}, true, "permission denied inspecting 7 processes (a[1], a[2], a[3], a[4], a[5] and 2 more); TLS libraries and Go programs only they use are missed"},
+	} {
+		if got := deniedWarning(tc.denied, tc.root).Error(); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}

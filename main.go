@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -43,6 +44,7 @@ type config struct {
 	libs       stringList
 	noScan     bool
 	brief      bool
+	requests   bool
 	json       bool
 	hex        bool
 	full       bool
@@ -56,6 +58,11 @@ type config struct {
 	paths      stringList
 	statuses   stringList
 	filter     *output.HTTPFilter // from methods, paths and statuses
+	protos     stringList
+	grep       string
+	grepRe     *regexp.Regexp // from grep
+	duration   time.Duration
+	schemas    *output.ProtoSchemas // from protos
 	noColor    bool
 	verbose    bool
 	version    bool
@@ -148,6 +155,12 @@ Which HTTP exchanges (repeatable, or comma-separated):
   --status STATUS    only responses with this status: 404, 5xx, 400-499;
                      each says which request it answers
 
+Which calls:
+  --grep REGEXP      only calls in which REGEXP (Go's syntax) matches
+                     something shown: the data, decoded HTTP/2 and HTTP/3
+                     headers, decompressed bodies, gRPC fields; not with
+                     --requests, whose lines show no bodies
+
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
                      or host name at either end
@@ -155,11 +168,16 @@ Which connections (repeatable):
                      (calls whose peer isn't known are left out, counted)
 
 Output:
+  --requests         one line per HTTP request and its response: method,
+                     URL, status, type, size and time, once the response ends
   --brief            one line per call, like tcpdump
   --json             one JSON object per call
   --full             whole bodies, and binary data as hex dumps (by default,
                      a body's first 2 KiB, and binary data described)
   --hex              payloads as hex dumps
+  --proto FILE       decode gRPC messages with their fields' names, from a
+                     descriptor set (protoc --descriptor_set_out=FILE
+                     --include_imports, or buf build -o FILE); repeatable
   --redact           mask what's likely secret: credentials in headers,
                      secret query parameters and JSON and form fields, and
                      tokens of well-known kinds, for output to share
@@ -167,11 +185,13 @@ Output:
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
   --count N          stop after N calls (0, the default: don't)
+  --duration TIME    stop after this long: 30s, 5m, 1h
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
-  --har FILE         also write the HTTP requests and responses to a HAR file
-                     when snoopy stops ("-" for stdout), for browsers'
-                     developer tools and other HAR viewers
+  --har FILE         also write the HTTP requests and responses to a HAR file,
+                     for browsers' developer tools and other HAR viewers:
+                     every few seconds as it changes ("-": to stdout, when
+                     snoopy stops)
   --quiet            don't print calls (with --pcap or --har; without them,
                      snoopy only counts the calls)
   --no-color         no colors
@@ -183,7 +203,8 @@ Capture:
                      snoopy's agent into them (it stays loaded, idle,
                      after snoopy stops)
   --java-agent DIR   the directory with the agent's jars (default: next to
-                     snoopy, or java/out in a source tree)
+                     snoopy, or java/out in a source tree, else the ones
+                     built into snoopy)
   --lib PATH         also attach to this library or program, e.g. one with
                      OpenSSL linked in statically (repeatable)
   --no-scan          only attach to system libraries and --lib, not to what
@@ -193,6 +214,7 @@ Capture:
 
 Examples:
   sudo snoopy                                 everything, decoded
+  sudo snoopy --requests                      one line per HTTP request
   sudo snoopy --brief                         one line per call
   sudo snoopy --comm curl                     only processes named curl
   sudo snoopy --host example.com --port 443   only connections to example.com:443
@@ -220,15 +242,19 @@ func flags(c *config) *flag.FlagSet {
 	fs.Var(&c.libs, "lib", "")
 	fs.BoolVar(&c.noScan, "no-scan", false, "")
 	fs.BoolVar(&c.brief, "brief", false, "")
+	fs.BoolVar(&c.requests, "requests", false, "")
 	fs.BoolVar(&c.json, "json", false, "")
 	fs.BoolVar(&c.full, "full", false, "")
 	fs.BoolVar(&c.hex, "hex", false, "")
 	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, "")
 	fs.IntVar(&c.count, "count", 0, "")
+	fs.DurationVar(&c.duration, "duration", 0, "")
+	fs.StringVar(&c.grep, "grep", "", "")
 	fs.StringVar(&c.pcap, "pcap", "", "")
 	fs.StringVar(&c.har, "har", "", "")
 	fs.BoolVar(&c.quiet, "quiet", false, "")
 	fs.BoolVar(&c.redact, "redact", false, "")
+	fs.Var(&c.protos, "proto", "")
 	fs.BoolVar(&c.noColor, "no-color", false, "")
 	fs.BoolVar(&c.verbose, "verbose", false, "")
 	fs.BoolVar(&c.version, "version", false, "")
@@ -246,7 +272,7 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		fmt.Fprint(stderr, usage)
 		return c, err
 	} else if err != nil {
-		return c, flagError(err)
+		return c, flagError(err, fs)
 	}
 	if fs.NArg() > 0 {
 		return c, fmt.Errorf("unexpected argument %q; to trace processes by name, use --comm %[1]s", fs.Arg(0))
@@ -258,6 +284,19 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	}
 	if c.count < 0 {
 		return c, errors.New("--count can't be negative")
+	}
+	if c.duration < 0 {
+		return c, errors.New("--duration can't be negative")
+	}
+	if c.grep != "" {
+		re, err := regexp.Compile(c.grep)
+		if err != nil {
+			return c, fmt.Errorf("--grep: %w", err)
+		}
+		if c.requests {
+			return c, errors.New("--grep can't be combined with --requests, whose lines show no bodies; use --path, --method or --status")
+		}
+		c.grepRe = re
 	}
 	if c.pcap == "-" && c.har == "-" {
 		return c, errors.New("--pcap - and --har - can't both write to stdout")
@@ -271,20 +310,27 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	if c.javaAgent != "" && !c.java {
 		return c, errors.New("--java-agent is for --java")
 	}
-	var output []string
-	for name, set := range map[string]bool{"--brief": c.brief, "--json": c.json, "--hex": c.hex, "--full": c.full} {
+	var modes []string
+	for name, set := range map[string]bool{"--brief": c.brief, "--json": c.json, "--hex": c.hex, "--full": c.full, "--requests": c.requests} {
 		if set {
-			output = append(output, name)
+			modes = append(modes, name)
 		}
 	}
-	if len(output) > 1 {
-		slices.Sort(output)
-		return c, fmt.Errorf("%s can't be combined", strings.Join(output, " and "))
+	if len(modes) > 1 {
+		slices.Sort(modes)
+		return c, fmt.Errorf("%s can't be combined", strings.Join(modes, " and "))
 	}
 	if f, err := httpFilter(c); err != nil {
 		return c, err
 	} else {
 		c.filter = f
+	}
+	if len(c.protos) > 0 {
+		s, err := output.LoadProtoSchemas(c.protos)
+		if err != nil {
+			return c, fmt.Errorf("--proto: %w", err)
+		}
+		c.schemas = s
 	}
 	// These show data as sent, where HTTP/2's and HTTP/3's headers are
 	// compressed: they can't be redacted.
@@ -298,13 +344,64 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 }
 
 // flagError puts an error of the flag package's in the help text's terms:
-// the package names flags with one dash, the help text with two.
-func flagError(err error) error {
+// the package names flags with one dash, the help text with two. For a
+// flag that doesn't exist, it suggests the one meant, if one is close.
+func flagError(err error, fs *flag.FlagSet) error {
 	msg := err.Error()
+	if name, ok := strings.CutPrefix(msg, "flag provided but not defined: -"); ok {
+		if meant := closestFlag(strings.TrimLeft(name, "-"), fs); meant != "" {
+			msg += "; did you mean --" + meant + "?"
+		}
+	}
 	for _, s := range []string{"for flag -", "for -", "not defined: -", "needs an argument: -"} {
 		msg = strings.Replace(msg, s, s+"-", 1)
 	}
 	return errors.New(msg)
+}
+
+// closestFlag returns the flag whose name is closest to name, if it's at
+// most two edits away (a typo, a letter left out or swapped), and the only
+// one that close.
+func closestFlag(name string, fs *flag.FlagSet) string {
+	best, bestDist, ties := "", 3, 0
+	fs.VisitAll(func(f *flag.Flag) {
+		switch d := editDistance(name, f.Name); {
+		case d < bestDist:
+			best, bestDist, ties = f.Name, d, 0
+		case d == bestDist:
+			ties++
+		}
+	})
+	if ties > 0 {
+		return ""
+	}
+	return best
+}
+
+// editDistance is the Damerau-Levenshtein distance between a and b (with
+// adjacent transpositions), on bytes: flag names are ASCII.
+func editDistance(a, b string) int {
+	d := make([][]int, len(a)+1)
+	for i := range d {
+		d[i] = make([]int, len(b)+1)
+		d[i][0] = i
+	}
+	for j := range d[0] {
+		d[0][j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			d[i][j] = min(d[i-1][j]+1, d[i][j-1]+1, d[i-1][j-1]+cost)
+			if i > 1 && j > 1 && a[i-1] == b[j-2] && a[i-2] == b[j-1] {
+				d[i][j] = min(d[i][j], d[i-2][j-2]+1)
+			}
+		}
+	}
+	return d[len(a)][len(b)]
 }
 
 // httpFilter returns the filter --method, --path and --status make, or nil
@@ -449,6 +546,12 @@ func logf(format string, a ...any) {
 }
 
 func run(cfg config) error {
+	// Until tracing starts, Ctrl-C exits at once, as Go's default would.
+	// Asked for here, since a program started with SIGINT ignored (a
+	// script's background job) keeps ignoring it until it asks, and it used
+	// to ask only once tracing started: Ctrl-C while starting was lost.
+	tracing := exitOnSignalUntil()
+
 	if cfg.noColor {
 		color.NoColor = true
 	}
@@ -580,6 +683,14 @@ func run(cfg config) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	tracing() // after NotifyContext, so that no signal goes unhandled between
+	if cfg.duration > 0 {
+		timer := time.AfterFunc(cfg.duration, func() {
+			logf("--duration %v is up", cfg.duration)
+			stop()
+		})
+		defer timer.Stop()
+	}
 	stopJava := func() {}
 	if cfg.java {
 		s, err := startJava(ctx, cfg, t)
@@ -602,10 +713,20 @@ func run(cfg config) error {
 
 	resolver := procinfo.NewResolver("/proc")
 	events := newPipeline(filter, printers, cfg.count)
+	events.filters = filterNames(cfg)
 	if cfg.quiet && cfg.pcap == "" && cfg.har == "" {
 		// For measuring snoopy's overhead, say, or a smoke test that
 		// mustn't show what it captures.
 		logf("--quiet without --pcap or --har: calls are counted, not written anywhere")
+	}
+	if cfg.pid == 0 && cfg.comm == "" && len(cfg.containers) == 0 && !cfg.redact &&
+		(!cfg.quiet || cfg.pcap != "" || cfg.har != "") {
+		// The default is the widest: said once, since what's captured then
+		// includes other programs' secrets, snoopy's own host's included.
+		logf("every process on this machine is traced, so their passwords and tokens show too; --comm, --pid or --container narrows it, --redact masks them")
+	}
+	if cfg.schemas != nil {
+		logf("--proto: gRPC messages of %d %s are decoded with their fields' names", cfg.schemas.Methods(), plural(cfg.schemas.Methods(), "method", "methods"))
 	}
 	logf("tracing; press Ctrl-C to stop")
 	err = t.Run(ctx, func(ev *tracer.Event) {
@@ -651,6 +772,59 @@ func run(cfg config) error {
 	return err
 }
 
+// exitOnSignalUntil makes SIGINT and SIGTERM exit at once, with the shell's
+// code for them (130 and 143), until the function it returns is called.
+func exitOnSignalUntil() (stop func()) {
+	sig := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case s := <-sig:
+			code := 130
+			if s == syscall.SIGTERM {
+				code = 143
+			}
+			os.Exit(code)
+		case <-done:
+		}
+	}()
+	return sync.OnceFunc(func() {
+		signal.Stop(sig)
+		close(done)
+	})
+}
+
+// writeHARPeriodically rewrites the HAR file every few seconds while it
+// changes, less often if writing it takes long (a large log), until stop.
+func writeHARPeriodically(h *output.HAR, path string) (stop func()) {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		interval := harInterval
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(interval):
+			}
+			start := time.Now()
+			if err := h.WriteFile(path); err != nil {
+				logf("warning: --har: %v", err)
+			}
+			interval = max(harInterval, 10*time.Since(start))
+		}
+	}()
+	return sync.OnceFunc(func() {
+		close(done)
+		<-finished
+	})
+}
+
+// harInterval is how often, at most, the HAR file is rewritten.
+const harInterval = 5 * time.Second
+
 // loadError shortens the BPF verifier's rejection of snoopy's program,
 // whose log runs to thousands of lines, to what to do about it, unless
 // --verbose.
@@ -679,8 +853,14 @@ type pipeline struct {
 	// sent to.
 	peers    output.Printer
 	printers []output.Printer
+	// requests is --requests' printer, whose lines are what --count counts
+	// and the summary reports, rather than calls.
+	requests *output.Requests
 	count    int // --count
 	calls    int
+	// filters names the filters printers apply, for the summary: "--grep",
+	// "--method, --path or --status", or both.
+	filters string
 	// noAddr is how many calls --host and --port left out because their
 	// peers' addresses weren't known.
 	noAddr int
@@ -688,6 +868,11 @@ type pipeline struct {
 
 func newPipeline(filter addrFilter, printers []output.Printer, count int) *pipeline {
 	p := &pipeline{filter: filter, printers: printers, count: count}
+	for _, pr := range printers {
+		if r, ok := pr.(*output.Requests); ok {
+			p.requests = r
+		}
+	}
 	if filter.active() {
 		p.peers = output.NewBrief(io.Discard, output.Options{})
 	}
@@ -709,7 +894,7 @@ func (p *pipeline) handle(ev *tracer.Event) (done bool, err error) {
 		}
 		return false, nil
 	}
-	if p.count > 0 && p.calls >= p.count {
+	if p.count > 0 && p.done() {
 		return true, nil
 	}
 	if match, unknown := p.filter.check(ev); !match {
@@ -723,30 +908,63 @@ func (p *pipeline) handle(ev *tracer.Event) (done bool, err error) {
 	}
 	shown := true
 	for _, pr := range p.printers {
-		before, beforeFiltered := hidden(pr), filtered(pr)
+		before, beforeFiltered, beforeFolded := hidden(pr), filtered(pr), folded(pr)
 		if err := pr.Print(ev); err != nil {
 			return true, err
 		}
-		shown = shown && hidden(pr) == before && filtered(pr) == beforeFiltered
+		shown = shown && hidden(pr) == before && filtered(pr) == beforeFiltered && folded(pr) == beforeFolded
 	}
 	if !shown {
 		return false, nil
 	}
 	p.calls++
-	return p.count > 0 && p.calls >= p.count, nil
+	return p.count > 0 && p.done(), nil
+}
+
+// done reports whether --count's calls, or requests, have been shown.
+func (p *pipeline) done() bool {
+	if p.requests != nil {
+		return p.requests.Shown() >= p.count
+	}
+	return p.calls >= p.count
+}
+
+// filterNames names the filters given that printers apply, for saying how
+// many calls they left out.
+func filterNames(cfg config) string {
+	var names []string
+	if cfg.filter != nil {
+		names = append(names, "--method, --path or --status")
+	}
+	if cfg.grepRe != nil {
+		names = append(names, "--grep")
+	}
+	return strings.Join(names, " or ")
 }
 
 // summary says what was captured and what was left out.
 func (p *pipeline) summary(printers []output.Printer) string {
 	summary := fmt.Sprintf("captured %d %s", p.calls, plural(p.calls, "call", "calls"))
+	if r := p.requests; r != nil {
+		summary += fmt.Sprintf(", shown as %d %s", r.Shown(), plural(r.Shown(), "request", "requests"))
+		if n := r.FilteredRequests(); n > 0 {
+			summary += fmt.Sprintf(" (%d more that %s didn't match)", n, p.filters)
+		}
+	}
 	if n := p.noAddr; n > 0 {
 		summary += fmt.Sprintf(", left out %d whose peer's address --host or --port needed but wasn't known", n)
 	}
 	if n := filteredTotal(printers); n > 0 {
-		summary += fmt.Sprintf(", left out %d that --method, --path or --status didn't match", n)
+		summary += fmt.Sprintf(", left out %d that %s didn't match", n, p.filters)
+	}
+	if n := foldedTotal(printers); n > 0 {
+		summary += fmt.Sprintf(", folded %d in the middle of bodies", n)
 	}
 	if n := hiddenTotal(printers); n > 0 {
-		summary += fmt.Sprintf(", and hid %d that only kept connections going (--verbose shows them)", n)
+		summary += fmt.Sprintf(", and hid %d that only kept connections going", n)
+	}
+	if foldedTotal(printers) > 0 || hiddenTotal(printers) > 0 {
+		summary += " (--verbose shows them)"
 	}
 	return summary
 }
@@ -819,6 +1037,23 @@ func filteredTotal(printers []output.Printer) int {
 	n := 0
 	for _, p := range printers {
 		n += filtered(p)
+	}
+	return n
+}
+
+// folded returns how many calls a printer (--brief's) folded into the
+// lines that end their bodies.
+func folded(p output.Printer) int {
+	if f, ok := p.(interface{ Folded() int }); ok {
+		return f.Folded()
+	}
+	return 0
+}
+
+func foldedTotal(printers []output.Printer) int {
+	n := 0
+	for _, p := range printers {
+		n += folded(p)
 	}
 	return n
 }
@@ -1019,21 +1254,25 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append([]func() error{p.Close}, closers...) // flush before closing the file
 	}
 
-	if cfg.har != "" {
-		w := io.Writer(os.Stdout)
-		if cfg.har == "-" {
-			stdoutUsed = true
-		} else {
-			f, err := os.Create(cfg.har)
-			if err != nil {
-				return nil, nil, err
-			}
-			closers = append(closers, f.Close)
-			w = f
-		}
-		h := output.NewHAR(w, versionString(), output.Options{Redact: cfg.redact, Filter: cfg.filter})
+	if cfg.har == "-" {
+		stdoutUsed = true
+		h := output.NewHAR(os.Stdout, versionString(), output.Options{Redact: cfg.redact, Filter: cfg.filter})
 		printers = append(printers, h)
-		closers = append([]func() error{h.Close}, closers...) // written before the file is closed
+		closers = append([]func() error{h.Close}, closers...) // HAR is one document: written at the end
+	} else if cfg.har != "" {
+		// Written now, empty, so that a path that can't be written fails at
+		// once, then rewritten as it changes, so that a long run, or one
+		// that crashes or is killed, doesn't lose it.
+		h := output.NewHAR(nil, versionString(), output.Options{Redact: cfg.redact, Filter: cfg.filter})
+		if err := h.WriteFile(cfg.har); err != nil {
+			return nil, nil, fmt.Errorf("--har: %w", err)
+		}
+		printers = append(printers, h)
+		stop := writeHARPeriodically(h, cfg.har)
+		closers = append(closers, func() error {
+			stop()
+			return h.WriteFile(cfg.har)
+		})
 	}
 
 	if !cfg.quiet && !stdoutUsed {
@@ -1042,11 +1281,13 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append(closers, out.Close)
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
+			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas, Grep: cfg.grepRe}))
+		case cfg.requests:
+			printers = append(printers, output.NewRequests(out, output.Options{Redact: cfg.redact, Filter: cfg.filter}))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
+			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Grep: cfg.grepRe}))
 		default:
-			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
+			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas, Grep: cfg.grepRe}))
 		}
 	}
 

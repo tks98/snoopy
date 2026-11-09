@@ -30,7 +30,10 @@ javac --release 17 -d out/classes -cp "$cp" $(find agent/src -name '*.java')
 cp -r out/classes/snoopy out/hooks/ && rm -rf out/hooks/snoopy/agent
 cp -r out/classes/snoopy out/agent/ && rm -rf out/agent/snoopy/hooks
 (cd out/agent && for j in asm asm-tree asm-commons; do jar xf ../../lib/$j-$ASM.jar org; done)
-epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 946684800)}
+# The jars' file times, fixed (2000-01-01), so that the same sources build
+# the same jars whenever and wherever they're built: snoopy embeds them
+# (internal/javaagent/jars), and CI checks those are what the sources build.
+epoch=${SOURCE_DATE_EPOCH:-946684800}
 date=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$epoch" +%Y-%m-%dT%H:%M:%SZ)
 cat > out/manifest.txt <<MF
 Premain-Class: snoopy.agent.Agent

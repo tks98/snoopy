@@ -17,6 +17,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/net/http2/hpack"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // gRPC runs over HTTP/2: a call's request and response are streams of
@@ -28,8 +29,11 @@ import (
 
 // grpcMessage is a message a DATA frame completed.
 type grpcMessage struct {
-	Length     int  // as framed, compressed if Compressed
-	Compressed bool // with the stream's grpc-encoding
+	Method     string // the call's path, /package.Service/Method, if its request was seen
+	Request    bool   // a request's message, not a response's
+	Type       string // its type, if a --proto schema has the method
+	Length     int    // as framed, compressed if Compressed
+	Compressed bool   // with the stream's grpc-encoding
 	// Fields is the message decoded as protobuf, one line per field, nested
 	// messages indented; nil if it isn't protobuf, or wasn't decoded.
 	Fields []string
@@ -43,9 +47,12 @@ const (
 
 // grpcStream reassembles one stream direction's messages.
 type grpcStream struct {
-	encoding string // grpc-encoding
-	buf      []byte // bytes of the message under way, from its prefix
-	skip     int    // bytes still to skip of a message too large to decode
+	method   string                         // the call's path, if its request was seen
+	request  bool                           // the request's direction
+	typ      protoreflect.MessageDescriptor // its messages' type, if a schema has the method
+	encoding string                         // grpc-encoding
+	buf      []byte                         // bytes of the message under way, from its prefix
+	skip     int                            // bytes still to skip of a message too large to decode
 }
 
 // isGRPC reports whether a content type is gRPC's (application/grpc,
@@ -105,13 +112,20 @@ func (s *grpcStream) add(p []byte) []grpcMessage {
 }
 
 func (s *grpcStream) message(compressed bool, b []byte) grpcMessage {
-	m := grpcMessage{Length: len(b), Compressed: compressed}
+	m := grpcMessage{Method: s.method, Request: s.request, Length: len(b), Compressed: compressed}
 	if compressed {
 		var err error
 		if b, err = decompressGRPC(s.encoding, b); err != nil {
 			m.Err = err.Error()
 			return m
 		}
+	}
+	if s.typ != nil {
+		if fields, err := decodeTyped(s.typ, b); err == nil {
+			m.Fields, m.Type = fields, string(s.typ.FullName())
+			return m
+		}
+		// Not of the schema's type (another version of it, say): shown raw.
 	}
 	if fields, ok := decodeProtobuf(b, 0); ok {
 		m.Fields = fields
@@ -285,4 +299,12 @@ func grpcStatusName(value string) string {
 		return ""
 	}
 	return grpcStatusNames[n]
+}
+
+// grpcKind says whether a message is a call's request or its response.
+func grpcKind(m grpcMessage) string {
+	if m.Request {
+		return "request"
+	}
+	return "response"
 }

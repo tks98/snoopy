@@ -68,6 +68,13 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
 - `enum fn_id` and `struct event_header` are mirrored in
   `internal/tracer/event.go`; tests check they match.
 
+## Changing the Java agent
+
+- snoopy embeds the agent's jars (`internal/javaagent/jars`), for `go
+  install`. After changing `java/agent` or `java/build.sh`, run `make jars`
+  with Temurin 21.0.13+9, the release's JDK (CI fails otherwise: another
+  JDK builds other bytes), and commit the jars with the change.
+
 ## Keeping things in sync
 
 - **Output:** the examples in README.md and docs/usage.md come from real

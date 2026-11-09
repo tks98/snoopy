@@ -9,12 +9,16 @@ containers, and what to do when something doesn't show up. The
 
 ```bash
 sudo snoopy                                 # everything, decoded
+sudo snoopy --requests                      # one line per HTTP request and its response
 sudo snoopy --brief                         # one line per call, like tcpdump
 sudo snoopy --comm curl                     # processes whose name starts with curl
 sudo snoopy --pid 1234                      # one process and those it starts
 sudo snoopy --container 4b825dc642          # one container (ID prefix)
 sudo snoopy --host example.com --port 443   # connections to example.com on port 443
 sudo snoopy --count 20                      # stop after 20 calls
+sudo snoopy --duration 5m --har api.har     # five minutes of requests, for a HAR viewer
+sudo snoopy --comm api --grep 'order_id'    # calls in which order_id shows, bodies decoded
+sudo snoopy --comm api --proto api.binpb    # gRPC messages with their fields' names
 sudo snoopy --full                          # whole bodies, and binary data as hex dumps
 sudo snoopy --json | jq 'select(.direction == "write") | .data'
 sudo snoopy --lib /usr/bin/node             # also attach to a binary with OpenSSL linked in
@@ -41,6 +45,12 @@ Which HTTP exchanges (repeatable, or comma-separated):
   --status STATUS    only responses with this status: 404, 5xx, 400-499;
                      each says which request it answers
 
+Which calls:
+  --grep REGEXP      only calls in which REGEXP (Go's syntax) matches
+                     something shown: the data, decoded HTTP/2 and HTTP/3
+                     headers, decompressed bodies, gRPC fields; not with
+                     --requests, whose lines show no bodies
+
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
                      or host name at either end
@@ -48,11 +58,16 @@ Which connections (repeatable):
                      (calls whose peer isn't known are left out, counted)
 
 Output:
+  --requests         one line per HTTP request and its response: method,
+                     URL, status, type, size and time, once the response ends
   --brief            one line per call, like tcpdump
   --json             one JSON object per call
   --full             whole bodies, and binary data as hex dumps (by default,
                      a body's first 2 KiB, and binary data described)
   --hex              payloads as hex dumps
+  --proto FILE       decode gRPC messages with their fields' names, from a
+                     descriptor set (protoc --descriptor_set_out=FILE
+                     --include_imports, or buf build -o FILE); repeatable
   --redact           mask what's likely secret: credentials in headers,
                      secret query parameters and JSON and form fields, and
                      tokens of well-known kinds, for output to share
@@ -60,11 +75,13 @@ Output:
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
   --count N          stop after N calls (0, the default: don't)
+  --duration TIME    stop after this long: 30s, 5m, 1h
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
-  --har FILE         also write the HTTP requests and responses to a HAR file
-                     when snoopy stops ("-" for stdout), for browsers'
-                     developer tools and other HAR viewers
+  --har FILE         also write the HTTP requests and responses to a HAR file,
+                     for browsers' developer tools and other HAR viewers:
+                     every few seconds as it changes ("-": to stdout, when
+                     snoopy stops)
   --quiet            don't print calls (with --pcap or --har; without them,
                      snoopy only counts the calls)
   --no-color         no colors
@@ -76,7 +93,8 @@ Capture:
                      snoopy's agent into them (it stays loaded, idle,
                      after snoopy stops)
   --java-agent DIR   the directory with the agent's jars (default: next to
-                     snoopy, or java/out in a source tree)
+                     snoopy, or java/out in a source tree, else the ones
+                     built into snoopy)
   --lib PATH         also attach to this library or program, e.g. one with
                      OpenSSL linked in statically (repeatable)
   --no-scan          only attach to system libraries and --lib, not to what
@@ -93,6 +111,7 @@ HTTP/1.1:
 ```console
 $ sudo snoopy
 snoopy: attached to the openssl and gnutls libraries, and to the program chrome (--verbose lists every file)
+snoopy: every process on this machine is traced, so their passwords and tokens show too; --comm, --pid or --container narrows it, --redact masks them
 snoopy: tracing; press Ctrl-C to stop
 06:42:46.026011 curl (pid 32570) SSL_write 192.168.5.15:58278 > 172.66.147.243:443  116 bytes  2.15ms  fd 5, conn 0x5f49f76814f0
 GET / HTTP/1.1
@@ -114,8 +133,9 @@ Content-Encoding: br
 ```
 
 Each call shows where its data went, as tcpdump writes it: from the sender's
-address to the receiver's, so a read shows the server first. An end that
-isn't known shows as `local` or `peer`. Calls also show their process and
+address to the receiver's, so a read shows the server first. An end whose
+address isn't known shows as `local:?` or `peer:?` (see
+[Troubleshooting](#troubleshooting)). Calls also show their process and
 thread, socket and connection, and container when there is one. Traffic sent
 through an HTTPS proxy shows up as the plaintext inside the tunnel, not as
 the TLS records sent to the proxy.
@@ -127,8 +147,9 @@ HTTP is shown as text, or hex-dumped up to 256 bytes. `--full` shows all of
 it, binary data as hex dumps.
 
 gRPC calls, which are HTTP/2 with `content-type: application/grpc`, show
-their messages decoded as protobuf without the service's schema, the way
-`protoc --decode_raw` shows them: each field's number and value, nested
+their messages decoded as protobuf, each saying which call it's the
+request or response of. Without the service's schema, they're shown the
+way `protoc --decode_raw` shows them: each field's number and value, nested
 messages indented, compressed messages decompressed. A trailer's
 `grpc-status` gets its name. Here grpc-go's health check service:
 
@@ -139,7 +160,7 @@ HTTP/2 HEADERS stream=1 length=94 [END_HEADERS]
 :path: /grpc.health.v1.Health/Check
 ...
 HTTP/2 DATA stream=1 length=18 [END_STREAM]
-gRPC message, 13 bytes
+gRPC request /grpc.health.v1.Health/Check, 13 bytes
 1: "snoopy-demo"
 
 23:32:41.374116 grpcdemo (pid 229940) crypto/tls.(*Conn).Read 127.0.0.1:50061 > 127.0.0.1:45960  102 bytes  fd 3, conn 0x55fb8e441c08
@@ -147,14 +168,75 @@ HTTP/2 HEADERS stream=1 length=14 [END_HEADERS]
 :status: 200
 ...
 HTTP/2 DATA stream=1 length=7
-gRPC message, 2 bytes
+gRPC response /grpc.health.v1.Health/Check, 2 bytes
 1: 1
 HTTP/2 HEADERS stream=1 length=24 [END_STREAM,END_HEADERS]
 grpc-status: 0 (OK)
 grpc-message:
 ```
 
+With the service's schema, `--proto FILE` shows fields by name, enums by
+name, and each message's type. It takes a compiled descriptor set, which
+`protoc --descriptor_set_out=FILE --include_imports` or `buf build -o FILE`
+makes from the `.proto` files; give it several times for several. Methods
+it doesn't have are shown as without it. The same call:
+
+```console
+00:50:29.720015 grpcdemo (pid 13148, tid 13153) crypto/tls.(*Conn).Write 127.0.0.1:47444 > 127.0.0.1:39069  83 bytes  7µs  fd 9, conn 0x13055a3ba008
+HTTP/2 HEADERS stream=1 length=74 [END_HEADERS]
+:method: POST
+:scheme: https
+:path: /grpc.health.v1.Health/Check
+...
+00:50:29.720186 grpcdemo (pid 13148, tid 13151) crypto/tls.(*Conn).Write 127.0.0.1:47444 > 127.0.0.1:39069  35 bytes  26µs  fd 9, conn 0x13055a3ba008
+HTTP/2 DATA stream=1 length=26 [END_STREAM]
+gRPC request /grpc.health.v1.Health/Check (grpc.health.v1.HealthCheckRequest), 21 bytes
+service: "payments.v1.Charges"
+
+00:50:29.720760 grpcdemo (pid 13148, tid 13153) crypto/tls.(*Conn).Read 127.0.0.1:39069 > 127.0.0.1:47444  72 bytes  171µs  fd 9, conn 0x13055a3ba008
+HTTP/2 HEADERS stream=1 length=14 [END_HEADERS]
+:status: 200
+content-type: application/grpc
+HTTP/2 DATA stream=1 length=7
+gRPC response /grpc.health.v1.Health/Check (grpc.health.v1.HealthCheckResponse), 2 bytes
+status: SERVING
+HTTP/2 HEADERS stream=1 length=24 [END_STREAM,END_HEADERS]
+grpc-status: 0 (OK)
+```
+
 A message's first 40 lines are shown; `--full` shows all of them.
+
+`--brief` shows a large body's first call and the one that ends it, with
+how many were folded in between; `--verbose` shows each:
+
+```console
+00:50:34.972651 curl[13337] 127.0.0.1:45112 > 127.0.0.1:37119 TLS 47: HTTP/2 HEADERS s1 GET 127.0.0.1:37119/big [END_STREAM]
+00:50:34.972898 curl[13337] 127.0.0.1:37119 > 127.0.0.1:45112 TLS 43: HTTP/2 HEADERS s1 200, text/plain
+00:50:34.972949 curl[13337] 127.0.0.1:37119 > 127.0.0.1:45112 TLS 4105: HTTP/2 DATA s1 4096 bytes
+00:50:34.974185 curl[13337] 127.0.0.1:37119 > 127.0.0.1:45112 TLS 4105: HTTP/2 DATA s1 4096 bytes [END_STREAM] [+30 calls folded, 122880 bytes]
+```
+
+### One line per request
+
+`--requests` shows each HTTP exchange, a request and its response, as one
+line once the response has ended: the method, URL and version, then the
+status, content type, body size (and decompressed, if it was compressed),
+`grpc-status` for gRPC, and the time from request to response. A program
+serving the request (the traced process read it) shows `served` before
+it:
+
+```console
+$ sudo snoopy --comm curl --requests
+00:50:32.666244 curl[13221] GET https://127.0.0.1:37119/api/users HTTP/2 → 200, application/json, 61 bytes (gzip, 48 decoded), 811µs
+00:50:32.752422 curl[13224] POST https://127.0.0.1:37119/login HTTP/2 → 200, application/json, 84 bytes, 424µs
+00:50:32.846872 curl[13225] GET https://127.0.0.1:37119/fail HTTP/2 → 503, text/plain; charset=utf-8, 33 bytes, 778µs
+00:50:32.942369 curl[13219] GET https://127.0.0.1:37119/big HTTP/2 → 200, text/plain, 131072 bytes, 1.66ms
+```
+
+Requests and responses are paired as in [HAR files](#har-files). A response
+that hasn't ended when snoopy stops isn't shown, nor one whose body ends
+only when its connection closes. `--count` counts requests then, and
+`--method`, `--path` and `--status` apply to them.
 
 Calls that carry nothing of the requests and responses, only what keeps the
 connection going (HTTP/2 `SETTINGS`, `WINDOW_UPDATE` and `PING`, QUIC
@@ -241,8 +323,11 @@ request to the response's end. Entries also say which process made them
 (`_process`, `_pid`, and `_container` if it ran in one). A request whose
 response wasn't seen, or a response whose request was sent before snoopy
 started, is kept with a comment saying so. The file is written when snoopy
-stops, by Ctrl-C or `--count`, not as it goes. `--redact` applies to it as
-to the other outputs.
+starts, then rewritten every few seconds as it changes (to a new file that
+replaces it, so it always holds a whole log), and once more when snoopy
+stops: a long run, or one that's killed, keeps what it captured. A large
+log is rewritten less often. `--har -` writes to stdout once, when snoopy
+stops. `--redact` applies to it as to the other outputs.
 
 ## JSON output
 
@@ -270,7 +355,8 @@ Each line is one call to a TLS read or write function:
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. With `--redact`, `data` is redacted and `data_base64` left out, since HTTP/2's and HTTP/3's headers are compressed in it. |
 | `redacted` | Set with `--redact`. |
 | `answers` | With `--status`: the request the event's response answers, e.g. `POST /v1/charges`. |
-| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`), `body` (see below), and on a gRPC stream's DATA frames the `grpc_messages` they completed (`bytes`, `compressed`, and `protobuf`, the decoded fields a line each as in the text output, or an `error`). HPACK compresses headers against a table built up over the connection, so on a connection that started before snoopy, frames are followed from the first call that starts with one, and a header block has `headers_not_decoded` instead of `headers`. |
+| `http1` | The HTTP/1.x in the data, piece by piece: a `request` (`method`, `target`, `version`, `headers`), a `response` (`version`, `status`, `reason`, `headers`), the `body` bytes of one (`bytes`, without chunked framing), or the rest of a header block an earlier event started (`headers`). `headers_incomplete` is set when a header block's end wasn't captured, and `end` on the piece that completes its message. With `--redact`, targets and headers are masked as in the text output. |
+| `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`), `body` (see below), and on a gRPC stream's DATA frames the `grpc_messages` they completed (`method`, the call's path, if its request was seen; `request`, set for a request's messages; `type`, with `--proto`; `bytes`, `compressed`, and `protobuf`, the decoded fields a line each as in the text output, or an `error`). HPACK compresses headers against a table built up over the connection, so on a connection that started before snoopy, frames are followed from the first call that starts with one, and a header block has `headers_not_decoded` instead of `headers`. |
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 | `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, `ring::aead seal`, `ring::aead open`, `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt`, `cipher.AEAD.Seal`, `cipher.AEAD.Open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
 | `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
@@ -297,6 +383,13 @@ POST /v1/charges]`, or `answers` in JSON). A request from before snoopy
 started has no method or path to match. With `--har`, whole entries are
 kept or left out; `--pcap` isn't filtered. The summary at the end says how
 many calls were left out.
+
+`--grep REGEXP` keeps the calls in which a regular expression (Go's syntax)
+matches what they show: the data, HTTP/2's and HTTP/3's headers as
+decoded, bodies decompressed, gRPC messages' fields. So it finds a value in
+a gzipped JSON body or an HTTP/2 header, which a search of the raw bytes
+wouldn't. It matches after `--redact`. `--duration` stops snoopy after a
+while, `--count` after a number of calls.
 
 `--host` and `--port` need a call's peer address. Calls whose peer isn't
 known (SSLEngine's, with `--java`, and those whose socket couldn't be
@@ -346,12 +439,12 @@ with `--pid`, which reports what `SSLSocket` and `SSLEngine` read and wrote
 sudo snoopy --java --pid "$(pgrep -f my-service.jar)"
 ```
 
-The agent is two jars, `snoopy-agent.jar` and `snoopy-hooks.jar`, which
-snoopy looks for next to itself: they're in the release archives, in the
-image (at `/usr/share/snoopy/java`) and attached to each release on their
-own, with checksums. A snoopy from `go install` doesn't have them; take
-them from the release, or build them with `java/build.sh` (JDK 21 or
-later, into `java/out`), and point `--java-agent` at their directory.
+The agent is two jars, `snoopy-agent.jar` and `snoopy-hooks.jar`, built
+into snoopy, also from `go install`. They're also in the release archives,
+in the image (at `/usr/share/snoopy/java`) and attached to each release on
+their own, with checksums; snoopy uses jars next to it, or in
+`--java-agent`'s directory, before its own, for an agent built with
+`java/build.sh` (JDK 21 or later, into `java/out`).
 
 This is experimental: tested with HotSpot 17, 21 and 25 on Linux (x86-64
 and arm64), for JVMs of any user on the host or in containers (Docker, a
@@ -443,8 +536,21 @@ browsers it finds to locate their TLS functions, and says so while it does.
 The result is cached by build ID, in `/root/.cache/snoopy` when run with
 `sudo`.
 
-**`snoopy needs root`.** It loads an eBPF program. The minimal capabilities
-are listed under [Requirements](../README.md#requirements).
+**`run snoopy as root, or with CAP_BPF, CAP_PERFMON, CAP_SYS_RESOURCE and
+CAP_SYS_PTRACE`.** It loads an eBPF program, which needs them (see
+[Requirements](../README.md#requirements)).
+
+**`permission denied inspecting 1 process (name[pid])`.** snoopy couldn't
+read that process's memory map, so TLS libraries and Go programs only it
+uses aren't traced. As root that's usually a process another security
+policy protects, or one in a user namespace snoopy isn't in; if it's one
+you meant to trace, give its file to `--lib`.
+
+**`local:?` or `peer:?` instead of an address.** snoopy didn't learn which
+socket the call was for. Programs that do their own socket I/O around their
+TLS library, such as Node.js and .NET, don't tell it, nor does Java's
+`SSLEngine`; `--host` and `--port` leave such calls out, and say how many
+when snoopy stops.
 
 ## Upgrading from 1.x
 

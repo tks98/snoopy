@@ -31,7 +31,7 @@ func TestHTTP2EncodedBody(t *testing.T) {
 	server.fr.WriteData(3, true, []byte("plain"))
 
 	for _, sizes := range [][]int{{1 << 20}, {1000}, {17, 4000}} {
-		c := newHTTP2Conns(newBodyPool())
+		c := newHTTP2Conns(newBodyPool(), nil)
 		c.start(http2Key{7, 0x1000}, false)
 		var decoded []byte
 		for _, ev := range events(tracer.FuncSSLRead, server.buf.Bytes(), sizes...) {
@@ -58,7 +58,7 @@ func TestHTTP2EncodedBody(t *testing.T) {
 	}
 
 	// Bytes of the body not captured: said once, then the rest is shown as is.
-	c := newHTTP2Conns(newBodyPool())
+	c := newHTTP2Conns(newBodyPool(), nil)
 	c.start(http2Key{7, 0x1000}, false)
 	evs := events(tracer.FuncSSLRead, server.buf.Bytes(), 2000)
 	evs[1].Data = evs[1].Data[:500]

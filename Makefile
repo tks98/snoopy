@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 KERNEL ?= 6.1
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build generate test integration integration-vm lint run clean help
+.PHONY: all build generate jars test integration integration-vm lint run clean help
 
 all: build
 
@@ -11,6 +11,10 @@ build: ## Build ./snoopy (a static binary)
 
 generate: ## Recompile bpf/snoopy.c; needs clang and llvm-strip (CI uses clang 18)
 	go generate ./...
+
+jars: ## Build the Java agent's jars into internal/javaagent/jars, which snoopy embeds; needs Temurin 21.0.13+9 (CI's)
+	sh java/build.sh
+	cp java/out/snoopy-agent.jar java/out/snoopy-hooks.jar internal/javaagent/jars/
 
 test: ## Run unit tests
 	go test ./...

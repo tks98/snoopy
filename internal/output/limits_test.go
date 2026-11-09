@@ -72,7 +72,7 @@ func TestHTTP2HeaderListLimit(t *testing.T) {
 	if len(second) != 300 {
 		t.Fatalf("second block of %d bytes", len(second))
 	}
-	c := newHTTP2Conns(newBodyPool())
+	c := newHTTP2Conns(newBodyPool(), nil)
 	var data []byte
 	data = append(data, http2.ClientPreface...)
 	data = append(data, h2Frame(1, 5, 1, first)...)
@@ -105,7 +105,7 @@ func TestHTTP2HeaderListLimit(t *testing.T) {
 
 	// A table larger than browsers allow isn't followed.
 	first, _ = http2Bomb(1<<20, 1<<19, 0)
-	c = newHTTP2Conns(newBodyPool())
+	c = newHTTP2Conns(newBodyPool(), nil)
 	data = append([]byte(http2.ClientPreface), h2Frame(1, 5, 1, first)...)
 	if _, _, note := c.process(h2Event(data)); !strings.Contains(note, "HTTP/2 decoding stopped") {
 		t.Errorf("1 MiB table: note %q", note)
@@ -123,7 +123,7 @@ func h2Event(data []byte) *tracer.Event {
 }
 
 func TestHTTP2ContinuationLimit(t *testing.T) {
-	c := newHTTP2Conns(newBodyPool())
+	c := newHTTP2Conns(newBodyPool(), nil)
 	c.process(h2Event(append([]byte(http2.ClientPreface), h2Frame(1, 0, 1, []byte{0x82})...)))
 	var many []byte
 	for range 16 {
@@ -147,7 +147,7 @@ func TestHTTP2BodiesBounded(t *testing.T) {
 		w.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: uint32(2*i + 1), EndHeaders: true,
 			BlockFragment: w.block(":method", "POST", ":path", "/", "content-encoding", "gzip")})
 	}
-	c := newHTTP2Conns(newBodyPool())
+	c := newHTTP2Conns(newBodyPool(), nil)
 	if _, ok, note := c.process(h2Event(w.buf.Bytes())); !ok || note != "" {
 		t.Fatalf("%v %q", ok, note)
 	}
