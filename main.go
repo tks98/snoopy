@@ -758,6 +758,36 @@ func exitOnSignalUntil() (stop func()) {
 	})
 }
 
+// writeHARPeriodically rewrites the HAR file every few seconds while it
+// changes, less often if writing it takes long (a large log), until stop.
+func writeHARPeriodically(h *output.HAR, path string) (stop func()) {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		interval := harInterval
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(interval):
+			}
+			start := time.Now()
+			if err := h.WriteFile(path); err != nil {
+				logf("warning: --har: %v", err)
+			}
+			interval = max(harInterval, 10*time.Since(start))
+		}
+	}()
+	return sync.OnceFunc(func() {
+		close(done)
+		<-finished
+	})
+}
+
+// harInterval is how often, at most, the HAR file is rewritten.
+const harInterval = 5 * time.Second
+
 // loadError shortens the BPF verifier's rejection of snoopy's program,
 // whose log runs to thousands of lines, to what to do about it, unless
 // --verbose.
@@ -1171,21 +1201,25 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append([]func() error{p.Close}, closers...) // flush before closing the file
 	}
 
-	if cfg.har != "" {
-		w := io.Writer(os.Stdout)
-		if cfg.har == "-" {
-			stdoutUsed = true
-		} else {
-			f, err := os.Create(cfg.har)
-			if err != nil {
-				return nil, nil, err
-			}
-			closers = append(closers, f.Close)
-			w = f
-		}
-		h := output.NewHAR(w, versionString(), output.Options{Redact: cfg.redact, Filter: cfg.filter})
+	if cfg.har == "-" {
+		stdoutUsed = true
+		h := output.NewHAR(os.Stdout, versionString(), output.Options{Redact: cfg.redact, Filter: cfg.filter})
 		printers = append(printers, h)
-		closers = append([]func() error{h.Close}, closers...) // written before the file is closed
+		closers = append([]func() error{h.Close}, closers...) // HAR is one document: written at the end
+	} else if cfg.har != "" {
+		// Written now, empty, so that a path that can't be written fails at
+		// once, then rewritten as it changes, so that a long run, or one
+		// that crashes or is killed, doesn't lose it.
+		h := output.NewHAR(nil, versionString(), output.Options{Redact: cfg.redact, Filter: cfg.filter})
+		if err := h.WriteFile(cfg.har); err != nil {
+			return nil, nil, fmt.Errorf("--har: %w", err)
+		}
+		printers = append(printers, h)
+		stop := writeHARPeriodically(h, cfg.har)
+		closers = append(closers, func() error {
+			stop()
+			return h.WriteFile(cfg.har)
+		})
 	}
 
 	if !cfg.quiet && !stdoutUsed {

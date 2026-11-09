@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -281,4 +283,45 @@ func TestHARChunked(t *testing.T) {
 	if c := l.Log.Entries[0].Response.Content; c.Text != "ok" || c.Size != 2 {
 		t.Errorf("content %+v", c)
 	}
+}
+
+// WriteFile writes a whole log each time, replacing the last, and only when
+// there's something new (or the file is gone).
+func TestHARWriteFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.har")
+	h := NewHAR(nil, "test", Options{})
+	if err := h.WriteFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if l := readHAR(t, mustRead(t, path)); len(l.Log.Entries) != 0 {
+		t.Fatalf("%d entries", len(l.Log.Entries))
+	}
+	h.Print(event(tracer.FuncSSLWrite, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"))
+	h.Print(event(tracer.FuncSSLRead, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+	if err := h.WriteFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if l := readHAR(t, mustRead(t, path)); len(l.Log.Entries) != 1 || l.Log.Entries[0].Response.Content.Text != "ok" {
+		t.Fatalf("got %+v", l.Log.Entries)
+	}
+	before, _ := os.Stat(path)
+	time.Sleep(10 * time.Millisecond)
+	if err := h.WriteFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := os.Stat(path); !after.ModTime().Equal(before.ModTime()) {
+		t.Error("rewritten with nothing new")
+	}
+	if names, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".out.har.*")); len(names) > 0 {
+		t.Errorf("left behind: %v", names)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

@@ -1,14 +1,19 @@
 package output
 
 import (
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -24,6 +29,8 @@ import (
 // are paired in order on an HTTP/1.x connection, and by stream on HTTP/2
 // and HTTP/3. Bodies are shown decompressed, up to maxHARBody each.
 type HAR struct {
+	mu      sync.Mutex // Print, WriteFile and Close may run at once
+	dirty   bool       // entries changed since the last WriteFile
 	w       io.Writer
 	dec     decoders
 	version string
@@ -111,6 +118,8 @@ func NewHAR(w io.Writer, version string, opts Options) *HAR {
 }
 
 func (h *HAR) Print(ev *tracer.Event) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	dc := h.dec.decode(ev)
 	if dc.notice {
 		return nil
@@ -125,6 +134,7 @@ func (h *HAR) Print(ev *tracer.Event) error {
 		h.conns[key] = c
 	}
 	dir := ev.Function.Direction()
+	h.dirty = true
 	switch {
 	case dc.isQUIC:
 		for _, it := range dc.quic {
@@ -378,8 +388,47 @@ func cmpOr(a, b string) string {
 	return b
 }
 
-// Close writes the log.
+// Close writes the log to the writer NewHAR was given, if any.
 func (h *HAR) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.w == nil {
+		return nil
+	}
+	return h.encode(h.w)
+}
+
+// WriteFile writes the log to path, if it changed since the last time:
+// to a temporary file in its directory first, renamed over it, so that
+// path always holds a whole log, even if snoopy is killed while writing.
+func (h *HAR) WriteFile(path string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.dirty {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name()) // if it wasn't renamed
+	bw := bufio.NewWriter(f)
+	err = h.encode(bw)
+	err = errors.Join(err, bw.Flush(), f.Chmod(0o644), f.Close())
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	h.dirty = false
+	return nil
+}
+
+// encode writes the log as one JSON document. h.mu is held.
+func (h *HAR) encode(w io.Writer) error {
 	type nv struct {
 		Name  string `json:"name"`
 		Value string `json:"value"`
@@ -512,7 +561,7 @@ func (h *HAR) Close() error {
 		"creator": map[string]string{"name": "snoopy", "version": h.version},
 		"entries": entries,
 	}}
-	enc := json.NewEncoder(h.w)
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(log)
 }
