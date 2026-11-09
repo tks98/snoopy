@@ -85,6 +85,8 @@ func (r *Requests) print(e *harEntry) {
 	switch {
 	case e.reset && !resp.seen:
 		status = r.warn("reset before a response")
+	case !resp.seen: // its stream ended or was given up on
+		status = r.warn("no response seen")
 	case resp.status >= 400:
 		status = r.bad(status)
 	default:
