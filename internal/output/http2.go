@@ -119,9 +119,10 @@ const maxBodyInfos = 1024
 // that started before snoopy is followed from the first call that starts
 // with a frame, without its headers.
 type http2Conns struct {
-	conns map[http2Key]*http2Conn
-	clock uint64 // for evicting the least recently used connection
-	pool  *bodyPool
+	conns   map[http2Key]*http2Conn
+	clock   uint64 // for evicting the least recently used connection
+	pool    *bodyPool
+	schemas *ProtoSchemas // --proto's
 }
 
 type http2Key struct {
@@ -130,9 +131,14 @@ type http2Key struct {
 }
 
 type http2Conn struct {
-	dirs     [2]http2Dir // by tracer.Direction
-	late     bool        // started before snoopy: no preface, no headers
-	noted    bool        // the note saying so was returned
+	dirs [2]http2Dir // by tracer.Direction
+	// paths are the streams' requests' :paths, which their responses'
+	// gRPC messages are named by: the request's and the response's headers
+	// come in different directions.
+	paths    map[uint32]string
+	schemas  *ProtoSchemas
+	late     bool // started before snoopy: no preface, no headers
+	noted    bool // the note saying so was returned
 	lastUsed uint64
 }
 
@@ -158,6 +164,7 @@ type http2Dir struct {
 	bodies         map[uint32]*bodyDecoder // by stream, for encoded bodies
 	infos          map[uint32]*bodyInfo    // by stream
 	grpc           map[uint32]*grpcStream  // by stream, for gRPC calls
+	conn           *http2Conn
 }
 
 // dataFrame is the DATA frame being read, to find its body bytes: a padded
@@ -201,8 +208,8 @@ const (
 	maxHeaderList = 256 << 10
 )
 
-func newHTTP2Conns(pool *bodyPool) *http2Conns {
-	return &http2Conns{conns: map[http2Key]*http2Conn{}, pool: pool}
+func newHTTP2Conns(pool *bodyPool, schemas *ProtoSchemas) *http2Conns {
+	return &http2Conns{conns: map[http2Key]*http2Conn{}, pool: pool, schemas: schemas}
 }
 
 // process returns the frames in an event of an HTTP/2 connection, and ok.
@@ -282,9 +289,10 @@ func (c *http2Conns) start(key http2Key, late bool) *http2Conn {
 		c.conns[oldest].close()
 		delete(c.conns, oldest)
 	}
-	conn := &http2Conn{late: late}
+	conn := &http2Conn{late: late, paths: map[uint32]string{}, schemas: c.schemas}
 	for i := range conn.dirs {
 		d := &conn.dirs[i]
+		d.conn = conn
 		if !late {
 			d.dec = hpack.NewDecoder(4096, d.field)
 			// The peer's SETTINGS may allow a larger table; we only listen.
@@ -547,11 +555,20 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 			delete(d.grpc, stream) // trailers, or a call without messages
 		} else if typ := contentType(fields); typ != "" {
 			d.info(stream).contentType = typ
+			path, request := headerField(fields, ":path")
+			if request {
+				if len(d.conn.paths) >= maxBodyInfos {
+					clear(d.conn.paths)
+				}
+				d.conn.paths[stream] = path
+			}
 			if isGRPC(typ) && d.grpc[stream] == nil {
 				if len(d.grpc) >= maxBodyInfos {
 					clear(d.grpc)
 				}
-				d.grpc[stream] = &grpcStream{encoding: grpcEncoding(fields)}
+				method := d.conn.paths[stream]
+				d.grpc[stream] = &grpcStream{encoding: grpcEncoding(fields), method: method, request: request,
+					typ: d.conn.schemas.message(method, request)}
 			}
 		}
 		dec := d.bodies[stream]
@@ -571,4 +588,15 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 		}
 	}
 	return nil
+}
+
+// headerField returns a header block's field's value, and whether it has
+// it.
+func headerField(fields []hpack.HeaderField, name string) (string, bool) {
+	for _, f := range fields {
+		if f.Name == name {
+			return f.Value, true
+		}
+	}
+	return "", false
 }

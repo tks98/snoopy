@@ -29,6 +29,9 @@ type Options struct {
 	// headers of connections that started before snoopy. It may be told the
 	// same thing more than once.
 	Warn func(msg string)
+	// Proto, if set, decodes the gRPC messages of the methods it has with
+	// their fields' names (--proto).
+	Proto *ProtoSchemas
 }
 
 // startedEarly is what Warn is told when headers can't be decoded.
@@ -64,7 +67,7 @@ type decoders struct {
 
 func newDecoders(opts Options) decoders {
 	pool := newBodyPool()
-	d := decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool), quic: newQUICConns(pool), warn: opts.Warn,
+	d := decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool, opts.Proto), quic: newQUICConns(pool), warn: opts.Warn,
 		redact: opts.Redact, filter: opts.Filter}
 	if opts.Filter != nil {
 		d.ex = newExchangeTracker()

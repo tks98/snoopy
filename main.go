@@ -57,6 +57,8 @@ type config struct {
 	paths      stringList
 	statuses   stringList
 	filter     *output.HTTPFilter // from methods, paths and statuses
+	protos     stringList
+	schemas    *output.ProtoSchemas // from protos
 	noColor    bool
 	verbose    bool
 	version    bool
@@ -163,6 +165,9 @@ Output:
   --full             whole bodies, and binary data as hex dumps (by default,
                      a body's first 2 KiB, and binary data described)
   --hex              payloads as hex dumps
+  --proto FILE       decode gRPC messages with their fields' names, from a
+                     descriptor set (protoc --descriptor_set_out=FILE
+                     --include_imports, or buf build -o FILE); repeatable
   --redact           mask what's likely secret: credentials in headers,
                      secret query parameters and JSON and form fields, and
                      tokens of well-known kinds, for output to share
@@ -233,6 +238,7 @@ func flags(c *config) *flag.FlagSet {
 	fs.StringVar(&c.har, "har", "", "")
 	fs.BoolVar(&c.quiet, "quiet", false, "")
 	fs.BoolVar(&c.redact, "redact", false, "")
+	fs.Var(&c.protos, "proto", "")
 	fs.BoolVar(&c.noColor, "no-color", false, "")
 	fs.BoolVar(&c.verbose, "verbose", false, "")
 	fs.BoolVar(&c.version, "version", false, "")
@@ -275,20 +281,27 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	if c.javaAgent != "" && !c.java {
 		return c, errors.New("--java-agent is for --java")
 	}
-	var output []string
+	var modes []string
 	for name, set := range map[string]bool{"--brief": c.brief, "--json": c.json, "--hex": c.hex, "--full": c.full, "--requests": c.requests} {
 		if set {
-			output = append(output, name)
+			modes = append(modes, name)
 		}
 	}
-	if len(output) > 1 {
-		slices.Sort(output)
-		return c, fmt.Errorf("%s can't be combined", strings.Join(output, " and "))
+	if len(modes) > 1 {
+		slices.Sort(modes)
+		return c, fmt.Errorf("%s can't be combined", strings.Join(modes, " and "))
 	}
 	if f, err := httpFilter(c); err != nil {
 		return c, err
 	} else {
 		c.filter = f
+	}
+	if len(c.protos) > 0 {
+		s, err := output.LoadProtoSchemas(c.protos)
+		if err != nil {
+			return c, fmt.Errorf("--proto: %w", err)
+		}
+		c.schemas = s
 	}
 	// These show data as sent, where HTTP/2's and HTTP/3's headers are
 	// compressed: they can't be redacted.
@@ -674,6 +687,9 @@ func run(cfg config) error {
 		// The default is the widest: said once, since what's captured then
 		// includes other programs' secrets, snoopy's own host's included.
 		logf("every process on this machine is traced, so their passwords and tokens show too; --comm, --pid or --container narrows it, --redact masks them")
+	}
+	if cfg.schemas != nil {
+		logf("--proto: gRPC messages of %d %s are decoded with their fields' names", cfg.schemas.Methods(), plural(cfg.schemas.Methods(), "method", "methods"))
 	}
 	logf("tracing; press Ctrl-C to stop")
 	err = t.Run(ctx, func(ev *tracer.Event) {
@@ -1178,13 +1194,13 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append(closers, out.Close)
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
+			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas}))
 		case cfg.requests:
 			printers = append(printers, output.NewRequests(out, output.Options{Redact: cfg.redact, Filter: cfg.filter}))
 		case cfg.brief:
 			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
 		default:
-			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
+			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas}))
 		}
 	}
 

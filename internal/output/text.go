@@ -330,6 +330,13 @@ func (t *Text) writeGRPC(b *strings.Builder, f http2Frame) {
 	}
 	for _, m := range f.GRPC {
 		line := fmt.Sprintf("gRPC message, %d bytes", m.Length)
+		if m.Method != "" {
+			line = fmt.Sprintf("gRPC %s %s", grpcKind(m), m.Method)
+			if m.Type != "" {
+				line += " (" + m.Type + ")"
+			}
+			line += fmt.Sprintf(", %d bytes", m.Length)
+		}
 		if m.Compressed {
 			line += ", compressed"
 		}

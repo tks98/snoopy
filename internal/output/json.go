@@ -190,6 +190,9 @@ type jsonHTTP2Frame struct {
 }
 
 type jsonGRPCMessage struct {
+	Method     string   `json:"method,omitempty"`  // the call's path, /package.Service/Method
+	Request    bool     `json:"request,omitempty"` // a request's message, not a response's
+	Type       string   `json:"type,omitempty"`    // with --proto, the message's type
 	Bytes      int      `json:"bytes"`
 	Compressed bool     `json:"compressed,omitempty"`
 	Protobuf   []string `json:"protobuf,omitempty"` // as protoc --decode_raw shows it, a line per field
@@ -285,7 +288,8 @@ func (j *JSON) Print(ev *tracer.Event) error {
 			jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
 		}
 		for _, m := range f.GRPC {
-			jf.GRPC = append(jf.GRPC, jsonGRPCMessage{Bytes: m.Length, Compressed: m.Compressed, Protobuf: m.Fields, Error: m.Err})
+			jf.GRPC = append(jf.GRPC, jsonGRPCMessage{Method: m.Method, Request: m.Request, Type: m.Type,
+				Bytes: m.Length, Compressed: m.Compressed, Protobuf: m.Fields, Error: m.Err})
 		}
 		out.HTTP2 = append(out.HTTP2, jf)
 	}

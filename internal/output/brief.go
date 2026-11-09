@@ -179,6 +179,12 @@ func briefHTTP2(frames []http2Frame, verbose bool) string {
 			p = fmt.Sprintf("%s s%d %s", f.Type, f.Stream, briefFields(f.Headers))
 		case f.HeadersLost:
 			p = fmt.Sprintf("%s s%d (not decoded)", f.Type, f.Stream)
+		case f.Type == "DATA" && len(f.GRPC) > 0 && f.GRPC[0].Method != "":
+			m := f.GRPC[0]
+			p = fmt.Sprintf("DATA s%d gRPC %s %s", f.Stream, grpcKind(m), m.Method)
+			if len(f.GRPC) > 1 {
+				p += fmt.Sprintf(" ×%d", len(f.GRPC))
+			}
 		case f.Type == "DATA" && len(f.GRPC) > 0:
 			p = fmt.Sprintf("DATA s%d gRPC %d message", f.Stream, len(f.GRPC))
 			if len(f.GRPC) > 1 {
