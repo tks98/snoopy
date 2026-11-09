@@ -183,7 +183,7 @@ func streamEnds(dc decoded) []streamEnd {
 		switch {
 		case f.Type == "RST_STREAM":
 			out = append(out, streamEnd{uint64(f.Stream), true})
-		case slices.Contains(f.Flags, "END_STREAM"):
+		case f.EndsStream:
 			out = append(out, streamEnd{uint64(f.Stream), false})
 		}
 	}

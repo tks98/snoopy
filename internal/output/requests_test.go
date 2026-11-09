@@ -98,6 +98,30 @@ func TestRequestsHTTP2(t *testing.T) {
 	}
 }
 
+// A DATA frame with END_STREAM can be read in pieces, as Chrome reads 8 KiB
+// at a time: its exchange ends with the frame's last byte, not its header.
+func TestRequestsHTTP2SplitLastFrame(t *testing.T) {
+	text := strings.Repeat("snoopy reads frames in pieces. ", 200)
+	body := gzipBytes(text)
+	client := newHTTP2Writer(true)
+	client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndStream: true, EndHeaders: true,
+		BlockFragment: client.block(":method", "GET", ":scheme", "https", ":authority", "example.com", ":path", "/page")})
+	server := newHTTP2Writer(false)
+	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndHeaders: true,
+		BlockFragment: server.block(":status", "200", "content-type", "text/html", "content-encoding", "gzip")})
+	server.fr.WriteData(1, true, body)
+	evs := append(events(tracer.FuncSSLWrite, client.buf.Bytes(), 1<<20), events(tracer.FuncSSLRead, server.buf.Bytes(), 16)...)
+	after := requestLines(t, Options{}, evs...)
+	if printed := after[len(after)-2]; printed != "" {
+		t.Errorf("printed before the last DATA frame ended:\n%s", printed)
+	}
+	want := "GET https://example.com/page HTTP/2 → 200, text/html, " + itoa(len(body)) +
+		" bytes (gzip, " + itoa(len(text)) + " decoded)"
+	if got := after[len(after)-1]; !strings.Contains(got, want) {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
 func TestRequestsFilterAndRedact(t *testing.T) {
 	evs := []*tracer.Event{
 		event(tracer.FuncSSLWrite, "GET /ok?token=s3cr3t HTTP/1.1\r\nHost: a\r\n\r\n"),
