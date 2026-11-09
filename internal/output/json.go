@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -69,8 +70,74 @@ type jsonEvent struct {
 	// For QUIC packets: the frames, and the HTTP/3 frames they completed.
 	QUICFrames []string         `json:"quic_frames,omitempty"`
 	HTTP3      []jsonHTTP3Frame `json:"http3,omitempty"`
-	// For HTTP/1.x: what the bytes of an encoded body in the data decoded to.
-	Body *jsonBody `json:"body,omitempty"`
+	// For HTTP/1.x: the messages and body bytes in the data, and what the
+	// bytes of an encoded body in it decoded to.
+	HTTP1 []jsonHTTP1 `json:"http1,omitempty"`
+	Body  *jsonBody   `json:"body,omitempty"`
+}
+
+// jsonHTTP1 is a piece of HTTP/1.x in an event: a request's or response's
+// start line and headers, or bytes of a body. End is set on the piece that
+// completes its message: headers with no body after them, or a body's last
+// bytes.
+type jsonHTTP1 struct {
+	// "request", "response", "body", or "headers": the rest of a header
+	// block an earlier event started.
+	Type    string       `json:"type"`
+	Method  string       `json:"method,omitempty"`
+	Target  string       `json:"target,omitempty"`
+	Version string       `json:"version,omitempty"`
+	Status  int          `json:"status,omitempty"`
+	Reason  string       `json:"reason,omitempty"`
+	Headers []jsonHeader `json:"headers,omitempty"`
+	// Set when the header block's end wasn't in the captured bytes.
+	HeadersIncomplete bool `json:"headers_incomplete,omitempty"`
+	Bytes             int  `json:"bytes,omitempty"` // a body's, without chunked framing
+	End               bool `json:"end,omitempty"`
+}
+
+// jsonHTTP1Pieces returns an event's HTTP/1.x messages and body bytes,
+// with secrets masked if redact is set.
+func jsonHTTP1Pieces(segs []http1Segment, redact bool) []jsonHTTP1 {
+	var out []jsonHTTP1
+	for _, s := range segs {
+		switch {
+		case s.msg != nil:
+			m := s.msg
+			p := jsonHTTP1{HeadersIncomplete: !m.complete, End: s.ends}
+			if version, status, ok := strings.Cut(m.startLine, " "); ok && strings.HasPrefix(version, "HTTP/") {
+				code, reason, _ := strings.Cut(status, " ")
+				p.Type, p.Version, p.Reason = "response", version, reason
+				p.Status, _ = strconv.Atoi(code)
+			} else {
+				method, rest, _ := strings.Cut(m.startLine, " ")
+				target, version, _ := strings.Cut(rest, " ")
+				if redact {
+					target = redactTarget(target)
+				}
+				p.Type, p.Method, p.Target, p.Version = "request", method, target, version
+			}
+			for _, h := range m.headers {
+				value := h[1]
+				if redact {
+					value = redactHeader(h[0], value)
+				}
+				p.Headers = append(p.Headers, jsonHeader{h[0], value})
+			}
+			out = append(out, p)
+		case s.inBody:
+			if n := len(out); n > 0 && out[n-1].Type == "body" && !out[n-1].End {
+				out[n-1].Bytes += len(s.payload) // one piece per body per event
+				out[n-1].End = s.ends
+				continue
+			}
+			out = append(out, jsonHTTP1{Type: "body", Bytes: len(s.payload), End: s.ends})
+		case s.ends:
+			// The end of a header block an earlier call started.
+			out = append(out, jsonHTTP1{Type: "headers", End: true})
+		}
+	}
+	return out
 }
 
 // jsonBody is what a piece of a body with a Content-Encoding decoded to.
@@ -199,6 +266,7 @@ func (j *JSON) Print(ev *tracer.Event) error {
 	}
 	if !dc.isHTTP2 {
 		out.HTTP2Error = dc.note
+		out.HTTP1 = jsonHTTP1Pieces(dc.http1, j.redact)
 		// Encoded bodies' pieces in the event, decoded, as one.
 		var body bodyPart
 		for _, s := range dc.http1 {

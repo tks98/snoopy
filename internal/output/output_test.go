@@ -463,3 +463,41 @@ func TestPcapIPv6AndLargePayload(t *testing.T) {
 		t.Errorf("got %d packets with %d bytes", len(pkts), payload)
 	}
 }
+
+// HTTP/1.x has its messages parsed in JSON, as HTTP/2 has: start lines,
+// headers (redacted with --redact), body bytes, and where messages end.
+func TestJSONHTTP1(t *testing.T) {
+	var out bytes.Buffer
+	j := NewJSON(&out, Options{Redact: true})
+	j.Print(event(tracer.FuncSSLWrite, "POST /login?token=abc HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer xyz\r\nContent-Length: 4\r\n\r\nab"))
+	j.Print(event(tracer.FuncSSLWrite, "cd"))
+	j.Print(event(tracer.FuncSSLRead, "HTTP/1.1 204 No Content\r\n\r\n"))
+	var got [][]jsonHTTP1
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var ev struct {
+			HTTP1 []jsonHTTP1 `json:"http1"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev.HTTP1)
+	}
+	if len(got) != 3 || len(got[0]) != 2 || len(got[1]) != 1 || len(got[2]) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	req, body, rest, resp := got[0][0], got[0][1], got[1][0], got[2][0]
+	if req.Type != "request" || req.Method != "POST" || req.Version != "HTTP/1.1" || strings.Contains(req.Target, "abc") || req.End {
+		t.Errorf("request %+v", req)
+	}
+	for _, h := range req.Headers {
+		if h.Name == "Authorization" && strings.Contains(h.Value, "xyz") {
+			t.Errorf("not redacted: %+v", h)
+		}
+	}
+	if body.Type != "body" || body.Bytes != 2 || body.End || rest.Type != "body" || rest.Bytes != 2 || !rest.End {
+		t.Errorf("body %+v, then %+v", body, rest)
+	}
+	if resp.Type != "response" || resp.Status != 204 || resp.Reason != "No Content" || !resp.End {
+		t.Errorf("response %+v", resp)
+	}
+}
