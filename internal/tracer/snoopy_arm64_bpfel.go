@@ -181,6 +181,7 @@ const (
 	snoopyProgNgtcp2DecryptEnter    = "ngtcp2_decrypt_enter"
 	snoopyProgNgtcp2EncryptEnter    = "ngtcp2_encrypt_enter"
 	snoopyProgQuicOpenEnter         = "quic_open_enter"
+	snoopyProgQuicOpenvEnter        = "quic_openv_enter"
 	snoopyProgQuicSealEnter         = "quic_seal_enter"
 	snoopyProgRing016OpenEnter      = "ring016_open_enter"
 	snoopyProgRingOpenEnter         = "ring_open_enter"
@@ -276,6 +277,7 @@ type snoopyProgramSpecs struct {
 	Ngtcp2DecryptEnter    *ebpf.ProgramSpec `ebpf:"ngtcp2_decrypt_enter"`
 	Ngtcp2EncryptEnter    *ebpf.ProgramSpec `ebpf:"ngtcp2_encrypt_enter"`
 	QuicOpenEnter         *ebpf.ProgramSpec `ebpf:"quic_open_enter"`
+	QuicOpenvEnter        *ebpf.ProgramSpec `ebpf:"quic_openv_enter"`
 	QuicSealEnter         *ebpf.ProgramSpec `ebpf:"quic_seal_enter"`
 	Ring016OpenEnter      *ebpf.ProgramSpec `ebpf:"ring016_open_enter"`
 	RingOpenEnter         *ebpf.ProgramSpec `ebpf:"ring_open_enter"`
@@ -435,6 +437,7 @@ type snoopyPrograms struct {
 	Ngtcp2DecryptEnter    *ebpf.Program `ebpf:"ngtcp2_decrypt_enter"`
 	Ngtcp2EncryptEnter    *ebpf.Program `ebpf:"ngtcp2_encrypt_enter"`
 	QuicOpenEnter         *ebpf.Program `ebpf:"quic_open_enter"`
+	QuicOpenvEnter        *ebpf.Program `ebpf:"quic_openv_enter"`
 	QuicSealEnter         *ebpf.Program `ebpf:"quic_seal_enter"`
 	Ring016OpenEnter      *ebpf.Program `ebpf:"ring016_open_enter"`
 	RingOpenEnter         *ebpf.Program `ebpf:"ring_open_enter"`
@@ -481,6 +484,7 @@ func (p *snoopyPrograms) Close() error {
 		p.Ngtcp2DecryptEnter,
 		p.Ngtcp2EncryptEnter,
 		p.QuicOpenEnter,
+		p.QuicOpenvEnter,
 		p.QuicSealEnter,
 		p.Ring016OpenEnter,
 		p.RingOpenEnter,

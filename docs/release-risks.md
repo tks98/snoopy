@@ -53,7 +53,12 @@ thing it depends on ships.
 - **Already seen:** Chrome 156 stopped inlining `ssl_read_impl` into
   `SSL_read`. Ubuntu's Chromium snap keeps `EVP_AEAD_CTX_open_gather`
   separate, where Google's and Electron's builds inline it, so the rule
-  telling seal from open had to change.
+  telling seal from open had to change. Chrome 157 inlined open into QUIC's
+  decryption, so HTTP/3 responses went missing while requests still showed;
+  received packets are now also seen at the ciphers' `openv_detached`
+  methods. The test checks those against the symbols too, but only where
+  they are; nothing short of running Chrome shows that QUIC stopped calling
+  what's attached to.
 - **Guarded by:** `TestBoringSSLBinaries` against published symbols, run by
   hand.
 

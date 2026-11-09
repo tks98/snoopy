@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -426,14 +427,17 @@ func TestBoringSSLBinaries(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Logf("SSL_read %#x, SSL_write %#x, EVP_AEAD_CTX_seal %#x, EVP_AEAD_CTX_open %#x",
-				got["SSL_read"], got["SSL_write"], got["EVP_AEAD_CTX_seal"], got["EVP_AEAD_CTX_open"])
+			t.Logf("SSL_read %#x, SSL_write %#x, EVP_AEAD_CTX_seal %#x, EVP_AEAD_CTX_open %#x, AES-GCM openv %#x, ChaCha20 openv %#x",
+				got["SSL_read"], got["SSL_write"], got["EVP_AEAD_CTX_seal"], got["EVP_AEAD_CTX_open"],
+				got["aead_aes_gcm_openv_detached"], got["chacha20_poly1305_openv_detached"])
 			if debug == "" {
 				return
 			}
+			// The openv_detached methods only in BoringSSL that has them.
+			required := []string{"SSL_read", "SSL_write", "EVP_AEAD_CTX_seal", "EVP_AEAD_CTX_open"}
 			checked := 0
 			for name, addr := range debugSymbols(t, debug) {
-				if name != "SSL_read" && name != "SSL_write" && name != "EVP_AEAD_CTX_seal" && name != "EVP_AEAD_CTX_open" {
+				if !slices.Contains(required, name) && openvFiles[name] == "" {
 					continue
 				}
 				want, err := fileOffset(f, addr)
@@ -443,10 +447,12 @@ func TestBoringSSLBinaries(t *testing.T) {
 				if got[name] != want {
 					t.Errorf("%s at %#x, debug symbols say %#x", name, got[name], want)
 				}
-				checked++
+				if slices.Contains(required, name) {
+					checked++
+				}
 			}
-			if checked != 4 {
-				t.Errorf("debug file has %d of the 4 functions", checked)
+			if checked != len(required) {
+				t.Errorf("debug file has %d of the %d functions", checked, len(required))
 			}
 		})
 	}
@@ -454,7 +460,9 @@ func TestBoringSSLBinaries(t *testing.T) {
 
 // debugSymbols returns the function addresses in an ELF debug file or a
 // Breakpad symbol file (what Electron publishes; Chrome's are on
-// chrome-symbols too).
+// chrome-symbols too). A C++ function file-local to its source, like
+// BoringSSL's AEAD methods, is there by its name too, without its
+// parameters.
 func debugSymbols(t *testing.T, path string) map[string]uint64 {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -462,6 +470,23 @@ func debugSymbols(t *testing.T, path string) map[string]uint64 {
 		t.Fatal(err)
 	}
 	out := map[string]uint64{}
+	sizes := map[string]uint64{}
+	add := func(name string, addr, size uint64) {
+		out[name] = addr
+		short := name
+		if m := mangledLocal.FindStringSubmatch(name); m != nil {
+			if n, err := strconv.Atoi(m[1]); err == nil && len(m[0])+n <= len(name) {
+				short = name[len(m[0]) : len(m[0])+n]
+			}
+		} else if i := strings.IndexByte(name, '('); i > 0 {
+			short = name[:i]
+		}
+		// With control-flow integrity, a function called through a pointer
+		// also names its entry in the jump table, which is smaller.
+		if short != name && size >= sizes[short] {
+			out[short], sizes[short] = addr, size
+		}
+	}
 	if bytes.HasPrefix(data, []byte("MODULE ")) {
 		// FUNC [m] address size parameter_size name
 		for _, line := range strings.Split(string(data), "\n") {
@@ -472,8 +497,10 @@ func debugSymbols(t *testing.T, path string) map[string]uint64 {
 			if fields[1] == "m" {
 				fields = fields[1:]
 			}
-			if addr, err := strconv.ParseUint(fields[1], 16, 64); err == nil {
-				out[strings.Join(fields[4:], " ")] = addr
+			addr, err := strconv.ParseUint(fields[1], 16, 64)
+			size, err2 := strconv.ParseUint(fields[2], 16, 64)
+			if err == nil && err2 == nil {
+				add(strings.Join(fields[4:], " "), addr, size)
 			}
 		}
 		return out
@@ -487,10 +514,14 @@ func debugSymbols(t *testing.T, path string) map[string]uint64 {
 		t.Fatal(err)
 	}
 	for _, s := range syms {
-		out[s.Name] = s.Value
+		add(s.Name, s.Value, s.Size)
 	}
 	return out
 }
+
+// mangledLocal is the start of a file-local C++ function's mangled name,
+// _ZL27aead_aes_gcm_openv_detachedPK15evp_aead_ctx_st...: its name's length.
+var mangledLocal = regexp.MustCompile(`^_ZL(\d+)`)
 
 // TestFreeblBinaries runs findFreebl on real freebl libraries:
 //

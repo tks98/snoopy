@@ -249,6 +249,51 @@ func TestStackArgs(t *testing.T) {
 	}
 }
 
+// A function only called through a pointer, like an AEAD's method, has no
+// direct callers: FuncAt doesn't find it, nor take it for the end of the one
+// before it, and IndirectFuncAt finds it by its entry after int3 padding.
+func TestIndirectFuncAt(t *testing.T) {
+	a := newAsm(textAddr)
+	a.label("main")
+	a.call("before")
+	a.bytes(0xc3)
+	a.align()
+	// before: a call that doesn't return, then int3, then more of it.
+	a.label("before")
+	a.bytes(0x55, 0x48, 0x89, 0xe5)
+	a.call("before")
+	a.bytes(0xcc)
+	a.align()
+	a.label("later")
+	a.bytes(0x31, 0xc0, 0x5d, 0xc3) // xor eax, eax; pop rbp; ret
+	a.align()
+	a.label("method")
+	a.bytes(0x55, 0x48, 0x89, 0xe5)
+	a.leaRCX(str)
+	a.bytes(0x5d, 0xc3)
+	a.align()
+	a.label("end")
+	code := a.finish()
+	b := &Binary{text: code, textAddr: textAddr,
+		data: []segment{{dataAddr, []byte("\x00x/ssl/ssl_lib.cc\x00")}}}
+	at := a.labels
+
+	refs := b.Refs(str)
+	if !reflect.DeepEqual(refs, []uint64{at["method"] + 4}) {
+		t.Fatalf("Refs: %#x", refs)
+	}
+	if fn, ok := b.FuncAt(refs[0]); ok {
+		t.Errorf("FuncAt found %+v, which isn't called directly", fn)
+	}
+	fn, ok := b.IndirectFuncAt(refs[0])
+	if !ok || fn.Start != at["method"] || fn.End != at["end"] || fn.Callers != 0 {
+		t.Errorf("IndirectFuncAt: %+v %v", fn, ok)
+	}
+	if fn, ok := b.FuncAt(at["later"]); !ok || fn.Start != at["before"] || fn.End != at["method"] {
+		t.Errorf("FuncAt past int3 in a function: %+v %v", fn, ok)
+	}
+}
+
 // An executable that isn't position-independent (Bun's) loads addresses as
 // 32-bit immediates; a position-independent one's mov imm32 is a number.
 func TestAbsoluteRefs(t *testing.T) {

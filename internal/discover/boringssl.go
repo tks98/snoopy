@@ -38,7 +38,7 @@ var Progress func(msg string)
 
 // boringSSLCacheVersion is part of cached results' names: bump it when
 // findBoringSSL would answer differently, so that older answers aren't used.
-const boringSSLCacheVersion = 6
+const boringSSLCacheVersion = 7
 
 // cachedFindBoringSSL is findBoringSSL with its results kept by build ID in
 // the user's cache directory, so a large program (Chrome is 300 MB) is
@@ -214,6 +214,9 @@ func findBoringSSL(f *elf.File, onBoringSSL func()) (map[string]uint64, error) {
 	found := map[string]*funcfind.Func{"SSL_read": read, "SSL_write": writes[0]}
 	if seal, open, err := findAEAD(b); err == nil {
 		found["EVP_AEAD_CTX_seal"], found["EVP_AEAD_CTX_open"] = seal, open
+		for name, fn := range findOpenv(b) {
+			found[name] = fn
+		}
 	}
 	out := map[string]uint64{}
 	for name, fn := range found {
@@ -293,4 +296,48 @@ func findAEAD(b *funcfind.Binary) (seal, open *funcfind.Func, err error) {
 		return nil, nil, fmt.Errorf("BoringSSL: %d candidates for EVP_AEAD_CTX_seal, %d for open", len(seals), len(opens))
 	}
 	return seals[0], opens[0], nil
+}
+
+// openvFiles are where the openv_detached methods of the AEADs QUIC uses
+// are, by the names findOpenv gives them: AES-GCM's, and the function
+// ChaCha20-Poly1305's calls with its key.
+var openvFiles = map[string]string{
+	"aead_aes_gcm_openv_detached":      "/cipher/e_aes.cc.inc",
+	"chacha20_poly1305_openv_detached": "/cipher/e_chacha20poly1305.cc",
+}
+
+// findOpenv locates the AEADs' openv_detached methods, which decrypt what
+// EVP_AEAD_CTX_open is given. Chrome 157 inlined open into QUIC's packet
+// decryption, which calls them through the EVP_AEAD's table, so its
+// packets only pass through them. In its file, each is the one function
+// that reports a bad decrypt itself (with the AES-GCM one's implementation
+// inlined into it). They're only called through the table, so they start
+// where their entry is recognizable. Older BoringSSL's open_gather methods
+// report the same codes with other arguments, which the BPF program checks
+// for. A method not found, or not told apart, is left out.
+func findOpenv(b *funcfind.Binary) map[string]*funcfind.Func {
+	out := map[string]*funcfind.Func{}
+	for name, path := range openvFiles {
+		file, ok := b.FindString(path)
+		if !ok {
+			continue
+		}
+		var found []*funcfind.Func
+		seen := map[uint64]bool{}
+		for _, ref := range b.Refs(file) {
+			fn, ok := b.IndirectFuncAt(ref)
+			if !ok || seen[fn.Start] {
+				continue
+			}
+			seen[fn.Start] = true
+			reasons, err := b.ConstArgsNear(fn, file, 2)
+			if err == nil && slices.Contains(reasons, aeadReasonBadDecrypt) && b.ReadsArgs(fn, 5) {
+				found = append(found, fn)
+			}
+		}
+		if len(found) == 1 {
+			out[name] = found[0]
+		}
+	}
+	return out
 }
