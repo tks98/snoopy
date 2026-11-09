@@ -79,7 +79,7 @@ func TestBriefHTTP2AndHTTP3(t *testing.T) {
 	q := quicEvent(tracer.FuncQUICRecv, streamFrameBytes(1, 0, stream, true))
 	q.Time, q.Comm = ev.Time, "chrome"
 	got := briefLines(t, q)[0]
-	if !strings.Contains(got, "chrome[9] peer > local QUIC ") || !strings.HasSuffix(got, ": HTTP/3 HEADERS s1 200, br; DATA s1 9 bytes (br, 5 decoded)") {
+	if !strings.Contains(got, "chrome[9] peer:? > local:? QUIC ") || !strings.HasSuffix(got, ": HTTP/3 HEADERS s1 200, br; DATA s1 9 bytes (br, 5 decoded)") {
 		t.Errorf("HTTP/3: %q", got)
 	}
 }
@@ -96,7 +96,7 @@ func TestBriefOther(t *testing.T) {
 	for i, want := range []string{
 		": hello world",
 		"TLS 100: binary [truncated]",
-		"local > peer TLS 4: PING",
+		"local:? > peer:? TLS 4: PING",
 		"aaa…",
 	} {
 		if !strings.HasSuffix(got[i], want) {

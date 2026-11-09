@@ -443,8 +443,21 @@ browsers it finds to locate their TLS functions, and says so while it does.
 The result is cached by build ID, in `/root/.cache/snoopy` when run with
 `sudo`.
 
-**`snoopy needs root`.** It loads an eBPF program. The minimal capabilities
-are listed under [Requirements](../README.md#requirements).
+**`run snoopy as root, or with CAP_BPF, CAP_PERFMON, CAP_SYS_RESOURCE and
+CAP_SYS_PTRACE`.** It loads an eBPF program, which needs them (see
+[Requirements](../README.md#requirements)).
+
+**`permission denied inspecting 1 process (name[pid])`.** snoopy couldn't
+read that process's memory map, so TLS libraries and Go programs only it
+uses aren't traced. As root that's usually a process another security
+policy protects, or one in a user namespace snoopy isn't in; if it's one
+you meant to trace, give its file to `--lib`.
+
+**`local:?` or `peer:?` instead of an address.** snoopy didn't learn which
+socket the call was for. Programs that do their own socket I/O around their
+TLS library, such as Node.js and .NET, don't tell it, nor does Java's
+`SSLEngine`; `--host` and `--port` leave such calls out, and say how many
+when snoopy stops.
 
 ## Upgrading from 1.x
 

@@ -246,7 +246,7 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		fmt.Fprint(stderr, usage)
 		return c, err
 	} else if err != nil {
-		return c, flagError(err)
+		return c, flagError(err, fs)
 	}
 	if fs.NArg() > 0 {
 		return c, fmt.Errorf("unexpected argument %q; to trace processes by name, use --comm %[1]s", fs.Arg(0))
@@ -298,13 +298,64 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 }
 
 // flagError puts an error of the flag package's in the help text's terms:
-// the package names flags with one dash, the help text with two.
-func flagError(err error) error {
+// the package names flags with one dash, the help text with two. For a
+// flag that doesn't exist, it suggests the one meant, if one is close.
+func flagError(err error, fs *flag.FlagSet) error {
 	msg := err.Error()
+	if name, ok := strings.CutPrefix(msg, "flag provided but not defined: -"); ok {
+		if meant := closestFlag(strings.TrimLeft(name, "-"), fs); meant != "" {
+			msg += "; did you mean --" + meant + "?"
+		}
+	}
 	for _, s := range []string{"for flag -", "for -", "not defined: -", "needs an argument: -"} {
 		msg = strings.Replace(msg, s, s+"-", 1)
 	}
 	return errors.New(msg)
+}
+
+// closestFlag returns the flag whose name is closest to name, if it's at
+// most two edits away (a typo, a letter left out or swapped), and the only
+// one that close.
+func closestFlag(name string, fs *flag.FlagSet) string {
+	best, bestDist, ties := "", 3, 0
+	fs.VisitAll(func(f *flag.Flag) {
+		switch d := editDistance(name, f.Name); {
+		case d < bestDist:
+			best, bestDist, ties = f.Name, d, 0
+		case d == bestDist:
+			ties++
+		}
+	})
+	if ties > 0 {
+		return ""
+	}
+	return best
+}
+
+// editDistance is the Damerau-Levenshtein distance between a and b (with
+// adjacent transpositions), on bytes: flag names are ASCII.
+func editDistance(a, b string) int {
+	d := make([][]int, len(a)+1)
+	for i := range d {
+		d[i] = make([]int, len(b)+1)
+		d[i][0] = i
+	}
+	for j := range d[0] {
+		d[0][j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			d[i][j] = min(d[i-1][j]+1, d[i][j-1]+1, d[i-1][j-1]+cost)
+			if i > 1 && j > 1 && a[i-1] == b[j-2] && a[i-2] == b[j-1] {
+				d[i][j] = min(d[i][j], d[i-2][j-2]+1)
+			}
+		}
+	}
+	return d[len(a)][len(b)]
 }
 
 // httpFilter returns the filter --method, --path and --status make, or nil
@@ -449,6 +500,12 @@ func logf(format string, a ...any) {
 }
 
 func run(cfg config) error {
+	// Until tracing starts, Ctrl-C exits at once, as Go's default would.
+	// Asked for here, since a program started with SIGINT ignored (a
+	// script's background job) keeps ignoring it until it asks, and it used
+	// to ask only once tracing started: Ctrl-C while starting was lost.
+	tracing := exitOnSignalUntil()
+
 	if cfg.noColor {
 		color.NoColor = true
 	}
@@ -580,6 +637,7 @@ func run(cfg config) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	tracing() // after NotifyContext, so that no signal goes unhandled between
 	stopJava := func() {}
 	if cfg.java {
 		s, err := startJava(ctx, cfg, t)
@@ -606,6 +664,12 @@ func run(cfg config) error {
 		// For measuring snoopy's overhead, say, or a smoke test that
 		// mustn't show what it captures.
 		logf("--quiet without --pcap or --har: calls are counted, not written anywhere")
+	}
+	if cfg.pid == 0 && cfg.comm == "" && len(cfg.containers) == 0 && !cfg.redact &&
+		!(cfg.quiet && cfg.pcap == "" && cfg.har == "") {
+		// The default is the widest: said once, since what's captured then
+		// includes other programs' secrets, snoopy's own host's included.
+		logf("every process on this machine is traced, so their passwords and tokens show too; --comm, --pid or --container narrows it, --redact masks them")
 	}
 	logf("tracing; press Ctrl-C to stop")
 	err = t.Run(ctx, func(ev *tracer.Event) {
@@ -649,6 +713,29 @@ func run(cfg config) error {
 	closePrinters()
 	stopJava()
 	return err
+}
+
+// exitOnSignalUntil makes SIGINT and SIGTERM exit at once, with the shell's
+// code for them (130 and 143), until the function it returns is called.
+func exitOnSignalUntil() (stop func()) {
+	sig := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case s := <-sig:
+			code := 130
+			if s == syscall.SIGTERM {
+				code = 143
+			}
+			os.Exit(code)
+		case <-done:
+		}
+	}()
+	return sync.OnceFunc(func() {
+		signal.Stop(sig)
+		close(done)
+	})
 }
 
 // loadError shortens the BPF verifier's rejection of snoopy's program,

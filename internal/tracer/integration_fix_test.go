@@ -410,3 +410,28 @@ get(process.argv[1] + '/node', () => get(process.argv[2] + '/other', () => setTi
 		})
 	}
 }
+
+// A --comm name longer than the kernel's (15 bytes) is matched on the
+// program's file name: of two curls whose names share their first 15
+// bytes, which is all the kernel keeps, only the one asked for is traced.
+// Without BTF too, where names are compared in user space.
+func TestLongComm(t *testing.T) {
+	requireRoot(t)
+	wanted := renamedTool(t, "curl", "longcurlnameabcwanted")
+	other := renamedTool(t, "curl", "longcurlnameabcother")
+	for _, noBTF := range []bool{false, true} {
+		t.Run(fmt.Sprintf("without BTF %v", noBTF), func(t *testing.T) {
+			events := startTracer(t, Options{Comm: "longcurlnameabcwanted", ignoreKernelBTF: noBTF}, systemTargets(t, discover.OpenSSL))
+			srv, _ := newServer(t)
+			for _, c := range []struct{ path, curl string }{{"/other", other}, {"/wanted", wanted}} {
+				if out, err := exec.Command(c.curl, "-sk", "--http1.1", srv.URL+c.path).CombinedOutput(); err != nil {
+					t.Fatalf("%s: %v: %s", c.curl, err, out)
+				}
+			}
+			waitFor(t, events, "the wanted curl's request", contains("GET /wanted"))
+			if n := events.count(contains("GET /other")); n > 0 {
+				t.Errorf("%d calls of the other curl traced", n)
+			}
+		})
+	}
+}

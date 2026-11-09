@@ -201,12 +201,8 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 		if !opts.NoScan {
 			files, denied := allProcessFiles(proc, opts.Comm)
 			candidates = append(candidates, files...)
-			if denied > 0 {
-				msg := fmt.Sprintf("permission denied inspecting %d processes; TLS libraries and Go programs only they use are missed", denied)
-				if os.Geteuid() != 0 {
-					msg += " (run as root)"
-				}
-				warnings = append(warnings, errors.New(msg))
+			if len(denied) > 0 {
+				warnings = append(warnings, deniedWarning(denied, os.Geteuid() == 0))
 			}
 		}
 	}
@@ -843,10 +839,10 @@ func isDescendant(proc string, pid, ancestor int) bool {
 // allProcessFiles runs processFiles for every process whose name starts
 // with comm, ignoring processes that exit. It also returns how many
 // processes it wasn't allowed to inspect.
-func allProcessFiles(proc, comm string) (files []candidate, denied int) {
+func allProcessFiles(proc, comm string) (files []candidate, denied []string) {
 	entries, err := os.ReadDir(proc)
 	if err != nil {
-		return nil, 0
+		return nil, nil
 	}
 	self := os.Getpid()
 	for _, e := range entries {
@@ -859,11 +855,32 @@ func allProcessFiles(proc, comm string) (files []candidate, denied int) {
 		}
 		f, err := processFiles(proc, pid)
 		if errors.Is(err, os.ErrPermission) {
-			denied++
+			name, _ := os.ReadFile(filepath.Join(proc, e.Name(), "comm"))
+			denied = append(denied, fmt.Sprintf("%s[%d]", strings.TrimSpace(string(name)), pid))
 		}
 		files = append(files, f...)
 	}
 	return files, denied
+}
+
+// deniedWarning says which processes snoopy couldn't inspect (as
+// "name[pid]", the first few of them), so that it's clear whether one that
+// matters is among them.
+func deniedWarning(denied []string, root bool) error {
+	const shown = 5
+	list := strings.Join(denied[:min(len(denied), shown)], ", ")
+	if len(denied) > shown {
+		list += fmt.Sprintf(" and %d more", len(denied)-shown)
+	}
+	what, them := "processes", "they use"
+	if len(denied) == 1 {
+		what, them = "process", "it uses"
+	}
+	msg := fmt.Sprintf("permission denied inspecting %d %s (%s); TLS libraries and Go programs only %s are missed", len(denied), what, list, them)
+	if !root {
+		msg += "; run snoopy as root"
+	}
+	return errors.New(msg)
 }
 
 // Mapping is a file mapped into a process.

@@ -132,7 +132,7 @@ func TestTextBinaryAndNotes(t *testing.T) {
 	}
 	out := buf.String()
 	for _, want := range []string{
-		"curl (pid 42, tid 43) crypto/tls.(*Conn).Read peer > 10.0.0.2:51234  100 bytes",
+		"curl (pid 42, tid 43) crypto/tls.(*Conn).Read peer:? > 10.0.0.2:51234  100 bytes",
 		"conn 0xbeef, container 4b825dc642cb",
 		"00000000  00 01 02 03",
 		"[truncated: captured 4 of 100 bytes; raise with --max-size]",

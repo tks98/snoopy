@@ -397,10 +397,12 @@ func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
 }
 
 // endpoints says where an event's data went, from sender to receiver, as
-// tcpdump writes it. An end that isn't known is "local" (the traced
-// process's socket) or "peer".
+// tcpdump writes it. An end whose address isn't known is "local:?" (the
+// traced process's socket) or "peer:?": a program that does its own socket
+// I/O around its TLS library (Node.js, .NET) doesn't tell which socket a
+// call is for, nor does Java's SSLEngine.
 func endpoints(ev *tracer.Event) string {
-	local, remote := "local", "peer"
+	local, remote := "local:?", "peer:?"
 	if knownAddr(ev.Local) {
 		local = ev.Local.String()
 	}
