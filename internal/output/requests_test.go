@@ -122,6 +122,35 @@ func TestRequestsHTTP2SplitLastFrame(t *testing.T) {
 	}
 }
 
+// QUIC packets can arrive out of order: an HTTP/3 exchange ends once its
+// response's data has all arrived, not with the packet carrying its FIN.
+func TestRequestsHTTP3FINFirst(t *testing.T) {
+	text := strings.Repeat("snoopy waits for the whole stream. ", 300)
+	body := gzipBytes(text)
+	// QPACK, no dynamic table: :method GET, :scheme https and :path / from
+	// the static table, :authority as a literal; then :status 200.
+	req := append([]byte{0x00, 0x00, 0xd1, 0xd7, 0xc1}, literalField(":authority", "example.com")...)
+	resp := append([]byte{0x00, 0x00, 0xd9}, literalField("content-encoding", "gzip")...)
+	stream := append(h3Frame(0x01, resp), h3Frame(0x00, body)...)
+	third := len(stream) / 3
+	packet := func(from, to int) *tracer.Event {
+		return quicEvent(tracer.FuncQUICRecv, streamFrameBytes(0, uint64(from), stream[from:to], to == len(stream)))
+	}
+	after := requestLines(t, Options{},
+		quicEvent(tracer.FuncQUICSend, streamFrameBytes(0, 0, h3Frame(0x01, req), true)),
+		packet(0, third),
+		packet(2*third, len(stream)), // the FIN, ahead of the middle
+		packet(third, 2*third),
+	)
+	if after[2] != "" {
+		t.Errorf("printed before the stream's data had all arrived:\n%s", after[2])
+	}
+	want := "GET https://example.com/ HTTP/3 → 200, " + itoa(len(body)) + " bytes (gzip, " + itoa(len(text)) + " decoded)"
+	if got := after[3]; !strings.Contains(got, want) {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
 func TestRequestsFilterAndRedact(t *testing.T) {
 	evs := []*tracer.Event{
 		event(tracer.FuncSSLWrite, "GET /ok?token=s3cr3t HTTP/1.1\r\nHost: a\r\n\r\n"),

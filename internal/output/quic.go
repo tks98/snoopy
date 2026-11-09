@@ -46,7 +46,10 @@ type quicItem struct {
 type quicConns struct {
 	// last is the connection of the last packet processed, as both of its
 	// directions know it (send unset).
-	last   quicKey
+	last quicKey
+	// ended are the streams the last packet processed finished: all their
+	// data delivered, up to the final size a FIN gave, or given up on.
+	ended  []uint64
 	dirs   map[quicKey]*quicDir // several keys share one after a migration
 	locals map[quicKey]netip.AddrPort
 	cids   *cidConns
@@ -68,6 +71,7 @@ type quicDir struct {
 	qpack    qpackDecoder
 	blocked  []blockedSection // HEADERS waiting for encoder stream data
 	lastUsed uint64
+	ended    []uint64  // streams streamData finished, for process to collect
 	lastCtx  uint64    // the encryption context of the last packet
 	lastTime time.Time // and when it was
 	closed   bool      // a CONNECTION_CLOSE was seen
@@ -269,6 +273,7 @@ func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 	}
 	c.last = key
 	c.last.send = false
+	c.ended = nil
 	d := c.dir(key, ev)
 	c.clock++
 	d.lastUsed, d.lastCtx, d.lastTime = c.clock, ev.ConnID, ev.Time
@@ -318,6 +323,7 @@ func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 	for _, sd := range streamData {
 		items = append(items, d.streamData(sd)...)
 	}
+	c.ended, d.ended = d.ended, nil
 	return items, true
 }
 
@@ -581,8 +587,10 @@ func (d *quicDir) streamData(sf streamFrame) []quicItem {
 	switch {
 	case s.broken, s.finSeen && s.next >= s.final:
 		d.forget(sf.id, s, errors.New("the stream was given up"))
+		d.ended = append(d.ended, sf.id)
 	case d.held > maxQUICDirHeld:
 		d.forget(sf.id, s, errors.New("too much data waiting across the connection's streams"))
+		d.ended = append(d.ended, sf.id)
 		items = append(items, quicItem{HTTP3: "(stream given up)", Stream: sf.id,
 			Err: "too much data waiting across the connection's streams"})
 	}
