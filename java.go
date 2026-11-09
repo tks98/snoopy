@@ -39,7 +39,7 @@ const (
 type javaLoader struct {
 	cfg      config
 	t        *tracer.Tracer
-	dir      string // the agent's jars
+	jars     javaagent.Jars
 	resolver *procinfo.Resolver
 
 	mu       sync.Mutex
@@ -65,11 +65,11 @@ func startJava(ctx context.Context, cfg config, t *tracer.Tracer) (stop func(), 
 			return nil, err
 		}
 	}
-	dir, err := javaAgentDir(cfg.javaAgent)
+	jars, err := javaAgentJars(cfg.javaAgent)
 	if err != nil {
 		return nil, err
 	}
-	l := &javaLoader{cfg: cfg, t: t, dir: dir, resolver: procinfo.NewResolver("/proc"),
+	l := &javaLoader{cfg: cfg, t: t, jars: jars, resolver: procinfo.NewResolver("/proc"),
 		loaded: map[procKey]string{}, failing: map[procKey]time.Time{}, reported: map[procKey]bool{}}
 	if cfg.pid != 0 {
 		if err := l.load(ctx, cfg.pid); err != nil {
@@ -200,7 +200,7 @@ func (l *javaLoader) load(ctx context.Context, pid int) error {
 	if err := isJVM(pid); err != nil {
 		return err
 	}
-	jar, err := javaagent.Stage(pid, l.dir)
+	jar, err := javaagent.Stage(pid, l.jars)
 	if err != nil {
 		return fmt.Errorf("--java: %w", err)
 	}
@@ -297,21 +297,21 @@ func (k procKey) alive() bool {
 	return ok && now == k
 }
 
-// javaAgentDir finds the agent's jars: in dir if given, else next to
-// snoopy's executable, or in java/out beside it (a source tree's build).
-func javaAgentDir(dir string) (string, error) {
+// javaAgentJars finds the agent's jars: in dir if given, else next to
+// snoopy's executable (a release archive's), in java/out beside it (a
+// source tree's build) or ../share/snoopy/java (the image's, a package's),
+// else the ones built into snoopy.
+func javaAgentJars(dir string) (javaagent.Jars, error) {
 	if dir != "" {
-		return dir, nil
+		return javaagent.LoadJars(dir)
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	exeDir := filepath.Dir(exe)
-	for _, d := range []string{exeDir, filepath.Join(exeDir, "java", "out"), filepath.Join(exeDir, "..", "share", "snoopy", "java")} {
-		if _, err := os.Stat(filepath.Join(d, javaagent.AgentJar)); err == nil {
-			return d, nil
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		for _, d := range []string{exeDir, filepath.Join(exeDir, "java", "out"), filepath.Join(exeDir, "..", "share", "snoopy", "java")} {
+			if _, err := os.Stat(filepath.Join(d, javaagent.AgentJar)); err == nil {
+				return javaagent.LoadJars(d)
+			}
 		}
 	}
-	return "", fmt.Errorf("--java: snoopy's Java agent (%s and %s) isn't next to snoopy: they're in the release archives and the image, or build them with java/build.sh; then point --java-agent at their directory", javaagent.AgentJar, javaagent.HooksJar)
+	return javaagent.Embedded(), nil
 }

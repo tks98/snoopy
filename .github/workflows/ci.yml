@@ -71,6 +71,27 @@ jobs:
             exit 1
           fi
 
+  jars:
+    name: Java agent jars are up to date
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The JDK the committed jars were built with, as the release's:
+      # another builds other (but equivalent) bytes.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21.0.13+9
+      - run: make jars
+      - name: Check for differences
+        run: |
+          if ! git diff --exit-code --stat internal/javaagent/jars; then
+            echo "::error::The embedded Java agent is stale; run 'make jars' with Temurin 21.0.13+9 and commit the result."
+            exit 1
+          fi
+
   integration:
     name: Integration tests (${{ matrix.runner }})
     strategy:

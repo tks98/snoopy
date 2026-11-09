@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -40,25 +39,17 @@ func IsHotSpot(pid int) (bool, error) {
 	return false, s.Err()
 }
 
-// Stage copies the agent's jars from dir to where process pid can read
-// them, a directory in its /tmp named for their contents, and returns the
-// agent jar's path as the process sees it. The files stay: the JVM reads
-// them for as long as it runs, and a later snoopy uses them again.
-func Stage(pid int, dir string) (string, error) {
-	var files [][]byte
-	for _, name := range []string{AgentJar, HooksJar} {
-		data, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			return "", fmt.Errorf("the Java agent: %w", err)
-		}
-		files = append(files, data)
-	}
+// Stage puts the agent's jars where process pid can read them, a
+// directory in its /tmp named for their contents, and returns the agent
+// jar's path as the process sees it. The files stay: the JVM reads them for
+// as long as it runs, and a later snoopy uses them again.
+func Stage(pid int, jars Jars) (string, error) {
 	root, err := openRoot(pid)
 	if err != nil {
 		return "", err
 	}
 	defer unix.Close(root)
-	path, err := stage(root, files[0], files[1])
+	path, err := stage(root, jars.Agent, jars.Hooks)
 	if err != nil {
 		return "", fmt.Errorf("stage the Java agent in process %d's /tmp: %w", pid, err)
 	}

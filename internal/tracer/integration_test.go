@@ -2021,7 +2021,11 @@ func TestJSSE(t *testing.T) {
 				p.exec(t)
 				p.findJVM(t, marker)
 				nonce := session(t, p)
-				jar, err := javaagent.Stage(int(p.pid()), filepath.Dir(agent))
+				jars, err := javaagent.LoadJars(filepath.Dir(agent))
+				if err != nil {
+					t.Fatal(err)
+				}
+				jar, err := javaagent.Stage(int(p.pid()), jars)
 				if err != nil {
 					t.Fatal(err)
 				}
