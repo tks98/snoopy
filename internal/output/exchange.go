@@ -183,22 +183,24 @@ func streamEnds(dc decoded) []streamEnd {
 		switch {
 		case f.Type == "RST_STREAM":
 			out = append(out, streamEnd{uint64(f.Stream), true})
-		case slices.Contains(f.Flags, "END_STREAM"):
+		case f.EndsStream:
 			out = append(out, streamEnd{uint64(f.Stream), false})
 		}
 	}
+	// A QUIC stream ends once its data has all arrived, which may be after
+	// the packet with its FIN: packets can come out of order.
 	for _, it := range dc.quic {
 		rest, reset := strings.CutPrefix(it.Frame, "RESET_STREAM id=")
 		if !reset {
-			var ok bool
-			if rest, ok = strings.CutPrefix(it.Frame, "STREAM id="); !ok || !strings.HasSuffix(it.Frame, " FIN") {
-				continue
-			}
+			continue
 		}
 		id, _, _ := strings.Cut(rest, " ")
 		if n, err := strconv.ParseUint(id, 10, 64); err == nil {
-			out = append(out, streamEnd{n, reset})
+			out = append(out, streamEnd{n, true})
 		}
+	}
+	for _, id := range dc.quicEnded {
+		out = append(out, streamEnd{id, false})
 	}
 	return out
 }

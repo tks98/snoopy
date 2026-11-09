@@ -5,10 +5,11 @@ receives over TLS, browsers included, without certificates or changes to the
 program. It uses eBPF to read the data where the program hands it to its TLS
 library, before it's encrypted and after it's decrypted.
 
-![snoopy in one terminal and Chromium, opened from another, loading pages while their requests and responses scroll by](docs/demo.gif)
+![snoopy in one terminal and Chromium, opened from another, loading pages while a line for each request and its response scrolls by](docs/demo.gif)
 
-Chromium loading example.com and Cloudflare's test page over HTTP/3, and
-Wikipedia over HTTP/2, recorded with
+`snoopy --requests` while Chromium loads example.com and Cloudflare's test
+page over HTTP/3, and Wikipedia over HTTP/2: one line per request, with its
+status, type, size and time. Recorded with
 [docs/demo/record.sh](docs/demo/record.sh).
 
 ## Quick start

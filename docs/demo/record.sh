@@ -72,7 +72,7 @@ chromium() {
 		--password-store=basic --hide-crash-restore-bubble --force-device-scale-factor=1 \\
 		--disable-background-networking --disable-component-update --disable-sync \\
 		--disable-domain-reliability --no-pings \\
-		--disable-features=OptimizationHints,OptimizationGuideModelDownloading,OptimizationHintsFetching,Translate,MediaRouter \\
+		--disable-features=OptimizationHints,OptimizationGuideModelDownloading,OptimizationHintsFetching,Translate,MediaRouter,AutofillServerCommunication \\
 		--window-position=$left,0 --window-size=$((width - left)),$browser "\$@" >/dev/null 2>&1 & )
 }
 EOF
@@ -89,7 +89,7 @@ sleep 4
 
 start_display
 # The same capture as the one on screen, to check what the GIF shows.
-snoopy --comm chrome --brief --no-color > "$capture" 2> "$tmp/audit.err" &
+snoopy --comm chrome --requests --no-color > "$capture" 2> "$tmp/audit.err" &
 audit=$!
 until grep -qs tracing "$tmp/audit.err"; do
 	kill -0 $audit 2>/dev/null || { cat "$tmp/audit.err" >&2; exit 1; }
@@ -99,7 +99,7 @@ ffmpeg -loglevel error -y -f x11grab -draw_mouse 0 -framerate 10 -video_size ${w
 	-c:v libx264rgb -qp 0 -preset ultrafast "$tmp/recording.mkv" &
 recorder=$!
 sleep 1.5
-type_in snoopy 'sudo snoopy --comm chrome --brief'
+type_in snoopy 'sudo snoopy --comm chrome --requests'
 sleep 3
 type_in chromium 'chromium https://example.com'
 sleep 10
@@ -116,4 +116,4 @@ kill -INT $audit; wait $audit || true
 ffmpeg -loglevel error -y -i "$tmp/recording.mkv" -vf "setpts=PTS/1.5,fps=10,split[a][b];[a]palettegen=max_colors=128:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" "$tmp/demo.gif"
 gifsicle -O3 "$tmp/demo.gif" -o "$out"
 chmod 644 "$out"
-echo "wrote $out ($(du -h "$out" | cut -f1)); what snoopy printed is in $capture ($(wc -l < "$capture") calls)"
+echo "wrote $out ($(du -h "$out" | cut -f1)); what snoopy printed is in $capture ($(wc -l < "$capture") requests)"

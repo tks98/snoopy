@@ -174,12 +174,13 @@ func TestExchangeStreamsBounded(t *testing.T) {
 	conn := func() *exConn { return ex.conns[harConnKey{tcp: 1}] }
 	for i := uint32(1); i < 20000; i += 2 {
 		ex.touched(req, decoded{isHTTP2: true, http2: []http2Frame{{Type: "HEADERS", Stream: i, Flags: []string{"END_STREAM"},
-			Headers: fields(":method", "GET", ":path", "/x")}}})
+			EndsStream: true, Headers: fields(":method", "GET", ":path", "/x")}}})
 		ex.touched(resp, decoded{isHTTP2: true, http2: []http2Frame{{Type: "HEADERS", Stream: i,
 			Headers: fields(":status", "200")}}})
-		// The response's last DATA, in two calls.
+		// The response's last DATA, in two calls: it ends with the second.
 		ex.touched(resp, decoded{isHTTP2: true, http2: []http2Frame{{Type: "DATA", Stream: i, Flags: []string{"END_STREAM"}}}})
-		if got := ex.touched(resp, decoded{isHTTP2: true, http2: []http2Frame{{Type: "DATA", Stream: i, Continued: true}}}); len(got) != 1 {
+		if got := ex.touched(resp, decoded{isHTTP2: true, http2: []http2Frame{{Type: "DATA", Stream: i, Continued: true,
+			EndsStream: true}}}); len(got) != 1 {
 			t.Fatalf("stream %d: the rest of its DATA wasn't followed", i)
 		}
 	}

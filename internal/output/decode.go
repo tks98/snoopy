@@ -111,6 +111,7 @@ type decoded struct {
 	quicConn    quicKey    // the QUIC connection, for both directions
 	notQUIC     bool       // a QUIC packet that doesn't parse as QUIC frames
 	quic        []quicItem // a QUIC packet's frames and the HTTP/3 they complete
+	quicEnded   []uint64   // the streams it finished (see quicConns.ended)
 	isHTTP2     bool
 	http2       []http2Frame
 	note        string         // about the HTTP/2 connection
@@ -125,7 +126,7 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 	var dc decoded
 	if ev.Function.IsQUIC() {
 		items, ok := d.quic.process(ev)
-		dc = decoded{isQUIC: true, notQUIC: !ok, quic: items, quicConn: d.quic.last}
+		dc = decoded{isQUIC: true, notQUIC: !ok, quic: items, quicConn: d.quic.last, quicEnded: d.quic.ended}
 	} else {
 		dc.http2, dc.isHTTP2, dc.note = d.h2.process(ev)
 		if !dc.isHTTP2 {
