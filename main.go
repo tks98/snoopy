@@ -822,11 +822,11 @@ func (p *pipeline) handle(ev *tracer.Event) (done bool, err error) {
 	}
 	shown := true
 	for _, pr := range p.printers {
-		before, beforeFiltered := hidden(pr), filtered(pr)
+		before, beforeFiltered, beforeFolded := hidden(pr), filtered(pr), folded(pr)
 		if err := pr.Print(ev); err != nil {
 			return true, err
 		}
-		shown = shown && hidden(pr) == before && filtered(pr) == beforeFiltered
+		shown = shown && hidden(pr) == before && filtered(pr) == beforeFiltered && folded(pr) == beforeFolded
 	}
 	if !shown {
 		return false, nil
@@ -858,8 +858,14 @@ func (p *pipeline) summary(printers []output.Printer) string {
 	if n := filteredTotal(printers); n > 0 {
 		summary += fmt.Sprintf(", left out %d that --method, --path or --status didn't match", n)
 	}
+	if n := foldedTotal(printers); n > 0 {
+		summary += fmt.Sprintf(", folded %d in the middle of bodies", n)
+	}
 	if n := hiddenTotal(printers); n > 0 {
-		summary += fmt.Sprintf(", and hid %d that only kept connections going (--verbose shows them)", n)
+		summary += fmt.Sprintf(", and hid %d that only kept connections going", n)
+	}
+	if foldedTotal(printers) > 0 || hiddenTotal(printers) > 0 {
+		summary += " (--verbose shows them)"
 	}
 	return summary
 }
@@ -932,6 +938,23 @@ func filteredTotal(printers []output.Printer) int {
 	n := 0
 	for _, p := range printers {
 		n += filtered(p)
+	}
+	return n
+}
+
+// folded returns how many calls a printer (--brief's) folded into the
+// lines that end their bodies.
+func folded(p output.Printer) int {
+	if f, ok := p.(interface{ Folded() int }); ok {
+		return f.Folded()
+	}
+	return 0
+}
+
+func foldedTotal(printers []output.Printer) int {
+	n := 0
+	for _, p := range printers {
+		n += folded(p)
 	}
 	return n
 }

@@ -23,6 +23,7 @@ type Brief struct {
 	dec      decoders
 	hidden   int
 	filtered int
+	fold     folding
 
 	dim, title, write, read, warn func(a ...any) string
 }
@@ -55,6 +56,9 @@ func (b *Brief) Hidden() int { return b.hidden }
 // Filtered returns how many events Options.Filter left out so far.
 func (b *Brief) Filtered() int { return b.filtered }
 
+// Folded returns how many calls in the middle of bodies weren't shown.
+func (b *Brief) Folded() int { return b.fold.folded }
+
 func (b *Brief) Print(ev *tracer.Event) error {
 	dc := b.dec.decode(ev)
 	if dc.notice {
@@ -66,6 +70,9 @@ func (b *Brief) Print(ev *tracer.Event) error {
 	}
 	if !b.opts.Verbose && dc.housekeeping() {
 		b.hidden++
+		return nil
+	}
+	if !b.opts.Verbose && b.fold.fold(ev, dc) {
 		return nil
 	}
 	paint, proto := b.read, "TLS"
@@ -83,6 +90,9 @@ func (b *Brief) Print(ev *tracer.Event) error {
 		b.title(process), paint(endpoints(ev)), proto, ev.Size)
 	if s := clip(b.summary(ev, dc)); s != "" {
 		line += ": " + s
+	}
+	if !b.opts.Verbose {
+		line += b.dim(b.fold.shown(ev, dc))
 	}
 	if dc.answers != "" {
 		line += b.dim(" (" + dc.answers + ")")
