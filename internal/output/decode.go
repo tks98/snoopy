@@ -1,8 +1,11 @@
 package output
 
 import (
+	"regexp"
 	"slices"
 	"strings"
+
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/tks98/snoopy/v2/internal/tracer"
 )
@@ -32,6 +35,10 @@ type Options struct {
 	// Proto, if set, decodes the gRPC messages of the methods it has with
 	// their fields' names (--proto).
 	Proto *ProtoSchemas
+	// Grep, if set, leaves out the events in which it matches nothing of
+	// what's shown: the data, decoded headers, decompressed bodies, gRPC
+	// messages' fields; after Redact, so that it can't find what's masked.
+	Grep *regexp.Regexp
 }
 
 // startedEarly is what Warn is told when headers can't be decoded.
@@ -63,6 +70,7 @@ type decoders struct {
 	filter *HTTPFilter
 	ex     *exchangeTracker // with filter
 	rs     *redactStreams   // with redact
+	grep   *regexp.Regexp
 }
 
 func newDecoders(opts Options) decoders {
@@ -75,6 +83,7 @@ func newDecoders(opts Options) decoders {
 	if opts.Redact {
 		d.rs = newRedactStreams()
 	}
+	d.grep = opts.Grep
 	return d
 }
 
@@ -133,7 +142,46 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 	if d.redact {
 		dc = dc.redact(d.rs, connKey(ev, dc), ev.Function.Direction())
 	}
+	if d.grep != nil && !dc.filteredOut && !dc.matches(d.grep) {
+		dc.filteredOut = true
+	}
 	return dc
+}
+
+// matches reports whether re matches something of what an event shows.
+func (dc decoded) matches(re *regexp.Regexp) bool {
+	if re.Match(dc.data) {
+		return true
+	}
+	headers := func(fields []hpack.HeaderField) bool {
+		for _, f := range fields {
+			if re.MatchString(f.Name + ": " + f.Value) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, s := range dc.http1 {
+		if re.Match(s.body.Decoded) {
+			return true
+		}
+	}
+	for _, f := range dc.http2 {
+		if headers(f.Headers) || re.Match(f.Data) || re.Match(f.Body.Decoded) {
+			return true
+		}
+		for _, m := range f.GRPC {
+			if slices.ContainsFunc(m.Fields, re.MatchString) {
+				return true
+			}
+		}
+	}
+	for _, it := range dc.quic {
+		if headers(it.Headers) || re.Match(it.Data) || re.Match(it.Body.Decoded) {
+			return true
+		}
+	}
+	return false
 }
 
 // startedEarly reports whether the event's connection started before

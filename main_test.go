@@ -436,3 +436,18 @@ func TestClosestFlag(t *testing.T) {
 		t.Errorf("got %v", err)
 	}
 }
+
+func TestGrepAndDurationFlags(t *testing.T) {
+	c, err := parseFlags([]string{"--grep", `order/\d+`, "--duration", "90s"}, io.Discard)
+	if err != nil || c.grepRe == nil || !c.grepRe.MatchString("/order/42") || c.duration != 90*time.Second {
+		t.Errorf("got %+v, %v", c, err)
+	}
+	for _, args := range [][]string{{"--grep", "("}, {"--grep", "x", "--requests"}, {"--duration", "-1s"}} {
+		if _, err := parseFlags(args, io.Discard); err == nil {
+			t.Errorf("%q: no error", args)
+		}
+	}
+	if got := filterNames(config{grepRe: c.grepRe, filter: &output.HTTPFilter{}}); got != "--method, --path or --status or --grep" {
+		t.Errorf("filterNames: %q", got)
+	}
+}

@@ -2,16 +2,19 @@ package output
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/netip"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/fatih/color"
+	"golang.org/x/net/http2"
 
 	"github.com/tks98/snoopy/v2/internal/tracer"
 )
@@ -499,5 +502,45 @@ func TestJSONHTTP1(t *testing.T) {
 	}
 	if resp.Type != "response" || resp.Status != 204 || resp.Reason != "No Content" || !resp.End {
 		t.Errorf("response %+v", resp)
+	}
+}
+
+// Grep keeps the calls it matches something of what they show in:
+// decoded HTTP/2 headers and decompressed bodies too, not only raw bytes.
+func TestGrep(t *testing.T) {
+	client := newHTTP2Writer(true)
+	client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndStream: true, EndHeaders: true,
+		BlockFragment: client.block(":method", "GET", ":scheme", "https", ":authority", "example.com", ":path", "/orders/42")})
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte(`{"order":42,"status":"shipped"}`))
+	zw.Close()
+	server := newHTTP2Writer(false)
+	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndHeaders: true,
+		BlockFragment: server.block(":status", "200", "content-encoding", "gzip")})
+	server.fr.WriteData(1, true, gz.Bytes())
+	evs := append(events(tracer.FuncSSLWrite, client.buf.Bytes(), 1<<20), events(tracer.FuncSSLRead, server.buf.Bytes(), 1<<20)...)
+	for pattern, want := range map[string][]string{
+		`/orders/\d+`: {"/orders/42"},         // in compressed headers
+		`shipped`:     {`"status":"shipped"`}, // in a gzipped body
+	} {
+		var out bytes.Buffer
+		b := NewBrief(&out, Options{Grep: regexp.MustCompile(pattern)})
+		for _, ev := range evs {
+			b.Print(ev)
+		}
+		if strings.Count(out.String(), "\n") != 1 || b.Filtered() == 0 {
+			t.Errorf("%s: %d filtered, got:\n%s", pattern, b.Filtered(), out.String())
+		}
+		var text bytes.Buffer
+		p := NewText(&text, Options{Grep: regexp.MustCompile(pattern)})
+		for _, ev := range evs {
+			p.Print(ev)
+		}
+		for _, w := range want {
+			if !strings.Contains(text.String(), w) {
+				t.Errorf("%s: no %q in:\n%s", pattern, w, text.String())
+			}
+		}
 	}
 }

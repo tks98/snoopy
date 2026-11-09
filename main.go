@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -58,6 +59,9 @@ type config struct {
 	statuses   stringList
 	filter     *output.HTTPFilter // from methods, paths and statuses
 	protos     stringList
+	grep       string
+	grepRe     *regexp.Regexp // from grep
+	duration   time.Duration
 	schemas    *output.ProtoSchemas // from protos
 	noColor    bool
 	verbose    bool
@@ -151,6 +155,12 @@ Which HTTP exchanges (repeatable, or comma-separated):
   --status STATUS    only responses with this status: 404, 5xx, 400-499;
                      each says which request it answers
 
+Which calls:
+  --grep REGEXP      only calls in which REGEXP (Go's syntax) matches
+                     something shown: the data, decoded HTTP/2 and HTTP/3
+                     headers, decompressed bodies, gRPC fields; not with
+                     --requests, whose lines show no bodies
+
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
                      or host name at either end
@@ -175,6 +185,7 @@ Output:
                      settings and flow control, QUIC acknowledgments), and
                      every file attached to
   --count N          stop after N calls (0, the default: don't)
+  --duration TIME    stop after this long: 30s, 5m, 1h
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
   --har FILE         also write the HTTP requests and responses to a HAR file
@@ -234,6 +245,8 @@ func flags(c *config) *flag.FlagSet {
 	fs.BoolVar(&c.hex, "hex", false, "")
 	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, "")
 	fs.IntVar(&c.count, "count", 0, "")
+	fs.DurationVar(&c.duration, "duration", 0, "")
+	fs.StringVar(&c.grep, "grep", "", "")
 	fs.StringVar(&c.pcap, "pcap", "", "")
 	fs.StringVar(&c.har, "har", "", "")
 	fs.BoolVar(&c.quiet, "quiet", false, "")
@@ -268,6 +281,19 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	}
 	if c.count < 0 {
 		return c, errors.New("--count can't be negative")
+	}
+	if c.duration < 0 {
+		return c, errors.New("--duration can't be negative")
+	}
+	if c.grep != "" {
+		re, err := regexp.Compile(c.grep)
+		if err != nil {
+			return c, fmt.Errorf("--grep: %w", err)
+		}
+		if c.requests {
+			return c, errors.New("--grep can't be combined with --requests, whose lines show no bodies; use --path, --method or --status")
+		}
+		c.grepRe = re
 	}
 	if c.pcap == "-" && c.har == "-" {
 		return c, errors.New("--pcap - and --har - can't both write to stdout")
@@ -655,6 +681,13 @@ func run(cfg config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	tracing() // after NotifyContext, so that no signal goes unhandled between
+	if cfg.duration > 0 {
+		timer := time.AfterFunc(cfg.duration, func() {
+			logf("--duration %v is up", cfg.duration)
+			stop()
+		})
+		defer timer.Stop()
+	}
 	stopJava := func() {}
 	if cfg.java {
 		s, err := startJava(ctx, cfg, t)
@@ -677,6 +710,7 @@ func run(cfg config) error {
 
 	resolver := procinfo.NewResolver("/proc")
 	events := newPipeline(filter, printers, cfg.count)
+	events.filters = filterNames(cfg)
 	if cfg.quiet && cfg.pcap == "" && cfg.har == "" {
 		// For measuring snoopy's overhead, say, or a smoke test that
 		// mustn't show what it captures.
@@ -821,6 +855,9 @@ type pipeline struct {
 	requests *output.Requests
 	count    int // --count
 	calls    int
+	// filters names the filters printers apply, for the summary: "--grep",
+	// "--method, --path or --status", or both.
+	filters string
 	// noAddr is how many calls --host and --port left out because their
 	// peers' addresses weren't known.
 	noAddr int
@@ -889,20 +926,33 @@ func (p *pipeline) done() bool {
 	return p.calls >= p.count
 }
 
+// filterNames names the filters given that printers apply, for saying how
+// many calls they left out.
+func filterNames(cfg config) string {
+	var names []string
+	if cfg.filter != nil {
+		names = append(names, "--method, --path or --status")
+	}
+	if cfg.grepRe != nil {
+		names = append(names, "--grep")
+	}
+	return strings.Join(names, " or ")
+}
+
 // summary says what was captured and what was left out.
 func (p *pipeline) summary(printers []output.Printer) string {
 	summary := fmt.Sprintf("captured %d %s", p.calls, plural(p.calls, "call", "calls"))
 	if r := p.requests; r != nil {
 		summary += fmt.Sprintf(", shown as %d %s", r.Shown(), plural(r.Shown(), "request", "requests"))
 		if n := r.FilteredRequests(); n > 0 {
-			summary += fmt.Sprintf(" (%d more that --method, --path or --status didn't match)", n)
+			summary += fmt.Sprintf(" (%d more that %s didn't match)", n, p.filters)
 		}
 	}
 	if n := p.noAddr; n > 0 {
 		summary += fmt.Sprintf(", left out %d whose peer's address --host or --port needed but wasn't known", n)
 	}
 	if n := filteredTotal(printers); n > 0 {
-		summary += fmt.Sprintf(", left out %d that --method, --path or --status didn't match", n)
+		summary += fmt.Sprintf(", left out %d that %s didn't match", n, p.filters)
 	}
 	if n := foldedTotal(printers); n > 0 {
 		summary += fmt.Sprintf(", folded %d in the middle of bodies", n)
@@ -1228,13 +1278,13 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append(closers, out.Close)
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas}))
+			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas, Grep: cfg.grepRe}))
 		case cfg.requests:
 			printers = append(printers, output.NewRequests(out, output.Options{Redact: cfg.redact, Filter: cfg.filter}))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn}))
+			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Grep: cfg.grepRe}))
 		default:
-			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas}))
+			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas, Grep: cfg.grepRe}))
 		}
 	}
 
