@@ -9,7 +9,7 @@ What snoopy can trace, and how it does it.
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Also copies linked into a program that exports them, like Node.js. |
 | BoringSSL in Chrome, Brave, Edge, Electron apps, Bun and Envoy | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. Bun does its own socket I/O, so its events have no addresses; Envoy's HTTP/3 isn't traced. |
-| HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | Each QUIC packet, decrypted. |
+| HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open` and its ciphers' `openv_detached` methods, found by signature | Each QUIC packet, decrypted. |
 | HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
 | HTTP/3 over quinn (Rust) | the same functions as for rustls's records, below | With rustls's aws-lc-rs and ring providers. |
 | HTTP/3 over ngtcp2 (curl) | `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt` | In each of ngtcp2's crypto libraries (OpenSSL, GnuTLS, wolfSSL, BoringSSL, quictls). |
@@ -141,7 +141,8 @@ attach.
 
 QUIC (HTTP/3) encrypts each packet separately, with the packet's header as
 associated data, so snoopy captures packets where they're encrypted and
-decrypted: BoringSSL's `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open` in Chrome,
+decrypted: BoringSSL's `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open` (or, where
+Chrome inlined open, its ciphers' `openv_detached`) in Chrome,
 freebl's `AES_AEAD` in Firefox. The same functions protect TLS records, whose
 associated data looks different. None of them touch the socket. A received
 packet is usually decrypted from the buffer it was received into, so for

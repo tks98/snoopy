@@ -95,6 +95,7 @@ enum ret_kind {
 	RET_KNOWN_LEN, // nothing; the byte count, known at entry, is kept in len_ptr
 	RET_KNOWN_LEN_TLS13, // RET_KNOWN_LEN, a TLS 1.3 record's inner plaintext
 	RET_ZERO_KNOWN_LEN, // int: 0 on success; the byte count, known at entry, is kept in len_ptr
+	RET_ONE_KNOWN_LEN, // int: 1 on success; the byte count, known at entry, is kept in len_ptr
 };
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
@@ -864,6 +865,9 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 		break;
 	case RET_ZERO_KNOWN_LEN:
 		n = (int)PT_REGS_RC(ctx) == 0 ? (__s64)call.len_ptr : 0;
+		break;
+	case RET_ONE_KNOWN_LEN:
+		n = (int)PT_REGS_RC(ctx) == 1 ? (__s64)call.len_ptr : 0;
 		break;
 	case RET_KNOWN_LEN:
 	case RET_KNOWN_LEN_TLS13:
@@ -1986,6 +1990,54 @@ int quic_open_enter(struct pt_regs *ctx)
 	if (!should_trace(pid_tgid) || !is_quic_packet(ctx))
 		return 0;
 	return open_enter(ctx, pid_tgid, FN_QUIC_RECV, RET_BOOL_EX, true);
+}
+
+// Whether the thread's innermost call in flight is a QUIC packet's
+// EVP_AEAD_CTX_open, which calls the AEAD's openv_detached with it.
+static __always_inline bool in_quic_open(__u64 pid_tgid)
+{
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	__u32 depth = get_depth(&dk);
+	if (!depth || depth > MAX_DEPTH)
+		return false;
+	struct call_key key;
+	call_key_at(&key, &dk, depth - 1);
+	struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
+	return call && call->fn == FN_QUIC_RECV;
+}
+
+// BoringSSL's AEADs decrypt in their openv_detached method, which
+// EVP_AEAD_CTX_open calls through the context's EVP_AEAD and which Chrome
+// 157 calls itself, with EVP_AEAD_CTX_open inlined into QUIC's
+// AeadBaseDecrypter::DecryptPacket:
+// int openv_detached(const EVP_AEAD_CTX *ctx, Span<const CRYPTO_IOVEC> iovecs,
+//     Span<const uint8_t> nonce, Span<const uint8_t> in_tag,
+//     Span<const CRYPTO_IVEC> aadvecs)
+// (ChaCha20-Poly1305's inner one takes the key instead of ctx, which tells
+// the context as well). A Span is a pointer and a length: iovecs is
+// arguments 1 and 2, and aadvecs, on the stack, 8 and 9, on x86-64 and arm64
+// alike. A CRYPTO_IOVEC is {out, in, len}, a CRYPTO_IVEC {in, len}.
+// open passes one of each, and so does Chrome. Older BoringSSL's open_gather
+// methods, with the same reason codes, take (ctx, out, nonce, nonce_len, in,
+// in_len, in_tag, in_tag_len, ad, ad_len), which never has 1 there.
+SEC("uprobe/openv_detached")
+int quic_openv_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid) || func_arg(ctx, 2) != 1 || func_arg(ctx, 9) != 1)
+		return 0;
+	__u64 aad[2] = {}, iov[3] = {};
+	if (bpf_probe_read_user(aad, sizeof(aad), (void *)func_arg(ctx, 8)) ||
+	    bpf_probe_read_user(iov, sizeof(iov), (void *)func_arg(ctx, 1)))
+		return 0;
+	// Seen already, where Chrome didn't inline open.
+	if (!is_quic_aad(aad[0], aad[1]) || in_quic_open(pid_tgid))
+		return 0;
+	__s32 fd = packet_fd(pid_tgid, io_thread(pid_tgid), iov[1], aad[0], aad[1]);
+	return enter_call_ad(ctx, FN_QUIC_RECV, RET_ONE_KNOWN_LEN, func_arg(ctx, 0), (void *)iov[0], iov[2], fd,
+			     aad[0], aad[1]);
 }
 
 // In programs whose plaintext has no other place to be seen, like rustls

@@ -846,6 +846,9 @@ func (t *Tracer) attach(target discover.Target, fd, pid int) (attached []string,
 			// BoringSSL's packet encryption for QUIC (HTTP/3).
 			{"EVP_AEAD_CTX_seal", t.objs.QuicSealEnter, true},
 			{"EVP_AEAD_CTX_open", t.objs.QuicOpenEnter, false},
+			// What open calls, and where Chrome 157 decrypts without it.
+			{"aead_aes_gcm_openv_detached", t.objs.QuicOpenvEnter, false},
+			{"chacha20_poly1305_openv_detached", t.objs.QuicOpenvEnter, false},
 		}
 	case discover.GnuTLS:
 		probes = []cProbe{

@@ -84,6 +84,14 @@ func (b *Binary) x86Prologue(a uint64) bool {
 	return bytes.HasPrefix(code, prologue) || bytes.HasPrefix(code, prologueEndbr)
 }
 
+// x86Entry reports whether a function that might not be called directly
+// starts at a: it opens with a frame pointer prologue, right after the int3
+// padding that Clang puts between functions. Inside a function, int3 only
+// follows a call that doesn't return, and what comes next isn't a prologue.
+func (b *Binary) x86Entry(a uint64) bool {
+	return a%x86Align == 0 && a > b.textAddr && b.x86Prologue(a) && b.code()[a-1-b.textAddr] == 0xcc
+}
+
 // insts decodes the instructions of fn, calling visit with each one and its
 // address, until visit returns false. Undecodable bytes are skipped.
 func (b *Binary) insts(fn *Func, visit func(ip uint64, inst x86asm.Inst) bool) {

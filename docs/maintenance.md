@@ -334,6 +334,20 @@ builds inline it into `open`, so they're told apart by their own codes: open
 reports bad decrypt (`0x65`); seal reports buffer too small (`0x67`) but not
 open_gather's `0x73`.
 
+Chrome 157 inlined `EVP_AEAD_CTX_open` into quiche's
+`AeadBaseDecrypter::DecryptPacket`, which calls the cipher's
+`openv_detached` method itself, through `ctx->aead`, so its packets never
+reach open. `findOpenv` finds the two methods QUIC uses, AES-GCM's
+`aead_aes_gcm_openv_detached` in `cipher/e_aes.cc.inc` and
+`chacha20_poly1305_openv_detached` in `cipher/e_chacha20poly1305.cc` (which
+ChaCha20-Poly1305's method calls with its key), as the one function in each
+file reporting bad decrypt itself. They're only called through the table, so
+they have no direct callers: `IndirectFuncAt` starts a function at a frame
+pointer prologue right after int3 padding, as Clang lays functions out
+(before, `FuncAt` took such a function for part of the one before it). With
+control-flow integrity, each also has an 8-byte entry in a jump table under
+the same symbol; the test's symbols take the larger.
+
 ### Where it lives
 
 - `internal/funcfind`: the generic search, in `funcfind.go`, `x86.go` and
@@ -392,7 +406,13 @@ header (or 13 bytes for TLS 1.2).
   since seal encrypts in place; `quic_open_enter` and its return probe copy it
   after decrypting. `is_quic_aad` leaves out TLS records by the shape of their
   associated data. QUIC's fixed bit can't be used, since peers may grease it
-  (RFC 9287).
+  (RFC 9287). `quic_openv_enter` does the same at the AEADs' `openv_detached`
+  methods, where Chrome 157 and later decrypt, reading the header and the
+  buffers from one-element arrays of `{in, len}` and `{out, in, len}`. A call
+  inside a QUIC packet's open is left to open (`in_quic_open`), so builds that
+  still call open see each packet once. Older BoringSSL's `open_gather`
+  methods report the same errors with other arguments: those don't have
+  arrays of one at arguments 2 and 9, and are left out.
 - **Sockets:** the AEAD functions never touch the socket. A packet is sent
   right after it's encrypted, so `io_threads` remembers which connection
   waits for the thread's next send, and when that teaches it a new socket,
@@ -411,6 +431,12 @@ header (or 13 bytes for TLS 1.2).
 
 ### How to tell it broke, and how to fix it
 
+- **Requests but no responses:** sent packets are seen at seal, but received
+  ones no longer pass through what's attached to, as when Chrome 157 inlined
+  open. Count calls with tracefs probes on open and on the `openv_detached`
+  methods (offsets from the debug symbols), print their associated data's
+  length (5 and 13 are TLS records), and disassemble
+  `AeadBaseDecrypter::DecryptPacket` to see what it calls now.
 - **No `EVP_AEAD_CTX_*` events:** the AEAD functions weren't found, see
   [above](#chrome-electron-and-other-chromium-builds); or Chrome no longer
   uses them for QUIC. To check the second, put tracefs probes on them and look
