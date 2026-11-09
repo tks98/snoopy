@@ -13,8 +13,9 @@ used. [AGENTS.md](AGENTS.md) is the short list for coding agents.
 
 Released: v2.9.1, the latest of the v2 releases (the first was v2.0.0). A
 `v*` tag runs `release.yml`: GoReleaser publishes the snoopy archives
-(linux amd64 and arm64, with the Java agent's jars), kubectl-snoopy's for
-Linux, macOS and Windows, an SBOM for each, the jars, the krew manifest,
+(linux amd64 and arm64, with the Java agent's jars), .deb, .rpm and .apk
+packages, kubectl-snoopy's for Linux, macOS and Windows, an SBOM for each
+archive, the jars, the krew manifest,
 `checksums.txt` and the image `ghcr.io/tks98/snoopy`, and the workflow
 attests the build provenance of `checksums.txt`'s files and of the image
 (from the release after v2.9.1). `go install
@@ -24,14 +25,14 @@ What CI checks, and when:
 
 | Check | When |
 | --- | --- |
-| gofmt, vet, golangci-lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date (`ci.yml`) | Each pull request |
+| gofmt, vet, golangci-lint, unit and race tests, amd64 and arm64 builds, BPF objects and the embedded Java agent's jars up to date (`ci.yml`) | Each pull request |
 | Known vulnerabilities, none allowed, reachable or not: govulncheck on both modules and their release-built binaries, OSV-Scanner on every lockfile (test programs' too), and the Java agent's ASM against OSV (`vulnscan.yml`) | Each pull request, and daily |
 | CodeQL on the Go code and the workflows (`codeql.yml`) | Each pull request, and weekly |
 | Integration tests on the runners' kernels, x86_64 and arm64, every C client including s2n-tls (built from source), with `SNOOPY_TEST_STRICT=1` so a missing client fails, run twice: attaching through uprobe_multi links, and a link per probe as older kernels do (`ci.yml`) | Each pull request |
 | `TestJSSE` on JDK 17, 21 and 25, x86_64 and arm64 (`ci.yml`) | Each pull request |
 | The kubectl plugin, and a kind cluster end to end (`kubectl-snoopy.yml`) | Each pull request |
 | Every BPF program loads under 5.10, 5.15, 6.1, 6.6 and 6.12, in QEMU, x86_64 and arm64 (`loadcheck.yml`) | Changes to the BPF code or how it's loaded |
-| A snapshot release: GoReleaser's config, the image, krew installing the plugin, reproducible jars and archives (`release-check.yml`) | Changes to the release's configuration |
+| A snapshot release: GoReleaser's config, the image, krew installing the plugin, the packages installing on Ubuntu, Fedora and Alpine, reproducible jars and archives (`release-check.yml`) | Changes to the release's configuration |
 | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, x86_64 and arm64 (`rust.yml`) | Weekly, and changes to those clients |
 | Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, and Fedora's curl over HTTP/3 (`canary.yml`) | Weekly |
 | Overhead (`benchmark.yml`, `docs/benchmark/`) | By hand; results in [docs/performance.md](docs/performance.md) |
@@ -91,6 +92,7 @@ make integration           # loads the BPF program, traces real clients (sudo)
 make integration-vm KERNEL=5.10   # same, in a VM with another kernel (vimto + QEMU)
 make lint                  # golangci-lint (v2 config in .golangci.yml)
 make generate              # recompile bpf/snoopy.c; use clang 18 or CI's diff check fails
+make jars                  # rebuild the embedded Java agent; use Temurin 21.0.13+9 or CI's diff check fails
 sudo ./snoopy --verbose    # try it
 ```
 
@@ -122,8 +124,8 @@ signature finding against real binaries (see
 | `internal/discover/` | Finds targets: system libs, `/proc/*/maps`, deleted files, Go binaries, RET offsets, prologue check, rustls by mangled name, stripped BoringSSL (`boringssl.go`), freebl's function table (`freebl.go`) |
 | `internal/funcfind/` | Locates functions in stripped x86-64 and arm64 binaries by the strings and constants they use (`x86.go`, `arm64.go`) |
 | `internal/procinfo/` | Container ID from cgroups; `/proc` socket lookup (fallback when there's no BTF) |
-| `internal/output/` | Text, NDJSON and pcap writers; HTTP/1 message framing (`http1.go`), HTTP/2 with HPACK (`http2.go`), gRPC messages and schema-less protobuf (`grpc.go`), QUIC and HTTP/3 with QPACK (`quic.go`, `qpack.go`), body decompression (`body.go`) |
-| `internal/javaagent/` | `--java`: staging the agent's jars in a JVM's `/tmp`, and HotSpot's attach protocol, in Go |
+| `internal/output/` | Text, NDJSON and pcap writers; HTTP/1 message framing (`http1.go`), HTTP/2 with HPACK (`http2.go`), gRPC messages and schema-less protobuf (`grpc.go`), with `--proto`'s schemas (`protoschema.go`), QUIC and HTTP/3 with QPACK (`quic.go`, `qpack.go`), body decompression (`body.go`); `--requests` (`requests.go`, on HAR's pairing), `--brief`'s folding of bodies (`fold.go`) |
+| `internal/javaagent/` | `--java`: staging the agent's jars in a JVM's `/tmp`, and HotSpot's attach protocol, in Go; the jars themselves, embedded (`jars/`, built by `make jars`) |
 | `java/` | The Java agent (`agent/src`: the ASM transformer and `Hooks`, which writes frames to `/dev/null`), `build.sh`, and the spike's tools |
 | `main.go` | CLI flags and wiring |
 | `java.go` | `--java`: which JVMs, loading the agent into them, stopping it |
@@ -446,6 +448,45 @@ signature finding against real binaries (see
   connection: Content-Length, chunked framing, until close, no body for HEAD
   responses, 1xx, 204 and 304, and it stops at 101 and CONNECT. Bytes that
   weren't captured stop a body's decoding, said once.
+- **`--requests`** (`output/requests.go`) is the HAR writer's pairing with
+  no entries kept (`maxKept` 0, so bodies are only counted) and a `done`
+  hook, called once per exchange when its response ends: an HTTP/2 or
+  HTTP/3 stream's END_STREAM or reset (`streamEnds`), or the HTTP/1
+  segment marked `ends` (the body's last byte by Content-Length or
+  chunked framing, or the headers of a message without a body). A body
+  that ends at the connection's close never ends there, so its exchange
+  isn't shown. `--count` counts its lines, and the pipeline asks it how
+  many (`Shown`). HTTP/1 segments carry the body's own bytes
+  (`payload`, chunked framing left out), which HAR keeps; before, it kept
+  a chunked body's framing.
+- **`--brief`'s folding** (`output/fold.go`): once a body's first call is
+  shown, calls carrying only more of it (`bodyRefs`) are counted, not
+  shown, and the call that ends it says how many. Folded calls aren't
+  shown calls for the pipeline or `--count` (`Folded`).
+- **gRPC methods and `--proto`:** the HTTP/2 decoder keeps each stream's
+  request `:path` on the connection (`http2Conn.paths`), since a
+  response's messages come in the other direction, and each `grpcStream`
+  knows its method, whether it carries requests, and, with `--proto`, its
+  messages' type. `decodeTyped` formats a message itself: prototext varies
+  its spacing from run to run on purpose, which tests and docs can't
+  have. Descriptor sets only; parsing `.proto` files would mean resolving
+  their imports as protoc does.
+- **`--grep`** matches after decoding and redaction (`decoded.matches`),
+  and marks what it doesn't match `filteredOut`, as the HTTP filters do.
+- **HAR files** are written as they go: `WriteFile` writes a temporary
+  file renamed over the old one, every `harInterval` while the log
+  changes, less often if writing takes long. HAR's printer has a mutex for
+  that, since its writer runs in its own goroutine.
+- **The Java agent is embedded** (`internal/javaagent/jars`), for `go
+  install`: committed, built by `make jars` with the release's JDK, and
+  checked by CI as the BPF objects are. `build.sh` dates the jars'
+  entries 2000-01-01, not by a commit, which committed jars couldn't
+  match. Jars next to snoopy, or `--java-agent`'s, come first.
+- **Startup's Ctrl-C:** `exitOnSignalUntil` asks for SIGINT and SIGTERM at
+  the start of `run` and exits at once on them until tracing starts. A
+  program started with SIGINT ignored, as a script's background job is,
+  keeps ignoring it until it asks, and snoopy used to ask only once
+  tracing started.
 - **x86 testing on an Apple Silicon Mac:** `limactl start --arch=x86_64
   --vm-type=qemu template://ubuntu-24.04` gives an emulated x86 VM where
   uprobes work (Docker's amd64 emulation is user-space only). Slow, but fine

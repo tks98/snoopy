@@ -188,9 +188,10 @@ Output:
   --duration TIME    stop after this long: 30s, 5m, 1h
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
                      ("-" for stdout, to pipe to wireshark -k -i - or tcpdump -r -)
-  --har FILE         also write the HTTP requests and responses to a HAR file
-                     when snoopy stops ("-" for stdout), for browsers'
-                     developer tools and other HAR viewers
+  --har FILE         also write the HTTP requests and responses to a HAR file,
+                     for browsers' developer tools and other HAR viewers:
+                     every few seconds as it changes ("-": to stdout, when
+                     snoopy stops)
   --quiet            don't print calls (with --pcap or --har; without them,
                      snoopy only counts the calls)
   --no-color         no colors
@@ -202,7 +203,8 @@ Capture:
                      snoopy's agent into them (it stays loaded, idle,
                      after snoopy stops)
   --java-agent DIR   the directory with the agent's jars (default: next to
-                     snoopy, or java/out in a source tree)
+                     snoopy, or java/out in a source tree, else the ones
+                     built into snoopy)
   --lib PATH         also attach to this library or program, e.g. one with
                      OpenSSL linked in statically (repeatable)
   --no-scan          only attach to system libraries and --lib, not to what
@@ -212,6 +214,7 @@ Capture:
 
 Examples:
   sudo snoopy                                 everything, decoded
+  sudo snoopy --requests                      one line per HTTP request
   sudo snoopy --brief                         one line per call
   sudo snoopy --comm curl                     only processes named curl
   sudo snoopy --host example.com --port 443   only connections to example.com:443
@@ -717,7 +720,7 @@ func run(cfg config) error {
 		logf("--quiet without --pcap or --har: calls are counted, not written anywhere")
 	}
 	if cfg.pid == 0 && cfg.comm == "" && len(cfg.containers) == 0 && !cfg.redact &&
-		!(cfg.quiet && cfg.pcap == "" && cfg.har == "") {
+		(!cfg.quiet || cfg.pcap != "" || cfg.har != "") {
 		// The default is the widest: said once, since what's captured then
 		// includes other programs' secrets, snoopy's own host's included.
 		logf("every process on this machine is traced, so their passwords and tokens show too; --comm, --pid or --container narrows it, --redact masks them")

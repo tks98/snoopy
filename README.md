@@ -13,11 +13,14 @@ Wikipedia over HTTP/2, recorded with
 
 ## Quick start
 
-Download a binary for `linux_amd64` or `linux_arm64` from the
+Install a package, or a binary for `linux_amd64` or `linux_arm64`, from the
 [releases page](https://github.com/tks98/snoopy/releases), or build one with
 Go 1.26 or later, and copy it to where `sudo` finds it:
 
 ```bash
+# a package (also .rpm and .apk)
+sudo apt install ./snoopy_*_linux_amd64.deb
+
 # a release binary
 tar xzf snoopy_*_linux_amd64.tar.gz snoopy
 sudo install snoopy /usr/local/bin/
@@ -49,6 +52,7 @@ $ sudo snoopy --brief
 
 ```bash
 sudo snoopy                                 # everything, decoded
+sudo snoopy --requests                      # one line per HTTP request and its response
 sudo snoopy --brief                         # one line per call, like tcpdump
 sudo snoopy --comm firefox                  # processes whose name starts with firefox
 sudo snoopy --pid 1234                      # one process and those it starts
@@ -80,7 +84,8 @@ the output, JSON and pcap, containers, and troubleshooting.
   symbols and is found by signature, and Firefox. Their HTTP/3 too.
 - **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded,
   bodies compressed with gzip, deflate, Brotli or zstd decompressed, and
-  gRPC messages decoded as protobuf, without needing the schema.
+  gRPC messages decoded as protobuf, without needing the schema, or with
+  their fields' names given one (`--proto`).
 - **Where:** running processes, those started while snoopy runs, and
   processes in containers. On Kubernetes, `kubectl snoopy POD` traces a pod
   from your machine ([docs/kubernetes.md](docs/kubernetes.md)).
