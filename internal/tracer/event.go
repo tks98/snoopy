@@ -56,6 +56,10 @@ const (
 	// OpenSSL's own QUIC's packets, through libcrypto's EVP_CipherUpdate.
 	FuncOSSLQUICSend
 	FuncOSSLQUICRecv
+	// Erlang's ssl's TLS records, through libcrypto's EVP_EncryptUpdate and
+	// EVP_DecryptUpdate in its crypto NIF.
+	FuncErlangRecordSend
+	FuncErlangRecordRecv
 )
 
 // FuncQUICPacketSent isn't a call but a notice: a QUIC packet was sent from
@@ -111,6 +115,9 @@ var functionNames = map[Function]string{
 	FuncOSSLQUICSend: "EVP_CipherUpdate (encrypt)",
 	FuncOSSLQUICRecv: "EVP_CipherUpdate (decrypt)",
 
+	FuncErlangRecordSend: "EVP_EncryptUpdate (TLS)",
+	FuncErlangRecordRecv: "EVP_DecryptUpdate (TLS)",
+
 	FuncQUICPacketSent: "QUIC packet sent",
 }
 
@@ -143,6 +150,8 @@ func (f Function) Library() discover.Library {
 		return discover.NGTCP2
 	case FuncJSSESocketRead, FuncJSSESocketWrite, FuncJSSEEngineUnwrap, FuncJSSEEngineWrap:
 		return discover.JSSE
+	case FuncErlangRecordSend, FuncErlangRecordRecv:
+		return discover.Erlang
 	case FuncRustlsRead, FuncRustlsWrite, FuncRecordSend, FuncRecordRecv, FuncRingSend, FuncRingRecv,
 		FuncAwsLCQUICSend, FuncAwsLCQUICRecv, FuncRingQUICSend, FuncRingQUICRecv:
 		return discover.Rustls
@@ -167,7 +176,8 @@ func (f Function) IsQUIC() bool {
 // a connection has its own encryption context, so the context, which is the
 // event's ConnID, differs between a connection's reads and writes.
 func (f Function) IsRecord() bool {
-	return f == FuncRecordSend || f == FuncRecordRecv || f == FuncRingSend || f == FuncRingRecv
+	return f == FuncRecordSend || f == FuncRecordRecv || f == FuncRingSend || f == FuncRingRecv ||
+		f == FuncErlangRecordSend || f == FuncErlangRecordRecv
 }
 
 // Direction is whether data was received or sent.
@@ -191,7 +201,7 @@ func (f Function) Direction() Direction {
 	case FuncSSLWrite, FuncSSLWriteEx, FuncGnuTLSSend, FuncPRWrite, FuncPRSend, FuncGoWrite,
 		FuncWolfSSLWrite, FuncMbedTLSWrite, FuncS2NSend, FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend,
 		FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend, FuncQUICPacketSent, FuncNGTCP2Send,
-		FuncGoQUICSend, FuncJSSESocketWrite, FuncJSSEEngineWrap, FuncOSSLQUICSend:
+		FuncGoQUICSend, FuncJSSESocketWrite, FuncJSSEEngineWrap, FuncOSSLQUICSend, FuncErlangRecordSend:
 		return Write
 	}
 	return Read

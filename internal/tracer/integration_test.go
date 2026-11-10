@@ -1667,6 +1667,47 @@ func TestOpenSSLQUIC(t *testing.T) {
 	}
 }
 
+// Erlang's ssl, whose TLS records its crypto NIF encrypts and decrypts with
+// libcrypto's EVP_EncryptUpdate and EVP_DecryptUpdate, with TLS 1.3 and
+// TLS 1.2. The VM does its own socket I/O, on the thread that encrypts and
+// decrypts, which is how their socket is known.
+func TestErlangSSL(t *testing.T) {
+	requireRoot(t)
+	erl := requireTool(t, "erl")
+	var targets []discover.Target
+	for _, dir := range []string{"/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib"} {
+		found, _ := filepath.Glob(filepath.Join(dir, "libcrypto.so.*"))
+		for _, lib := range found {
+			targets = append(targets, discover.Target{Path: lib, Library: discover.Erlang})
+		}
+	}
+	if len(targets) == 0 {
+		t.Fatal("no libcrypto found")
+	}
+	events := startTracer(t, Options{Comm: "beam"}, targets)
+	srv, _ := newServer(t)
+
+	for _, version := range []string{"tlsv1.3", "tlsv1.2"} {
+		path := "/erlang-" + version
+		eval := fmt.Sprintf(`ssl:start(), inets:start(),
+			{ok, {{_, 200, _}, _, Body}} = httpc:request(get, {"%s%s", []},
+				[{ssl, [{verify, verify_none}, {versions, ['%s']}]}], []),
+			io:format("~s~n", [Body]), halt().`, srv.URL, path, version)
+		out, err := exec.Command(erl, "-noshell", "-eval", eval).CombinedOutput()
+		if err != nil || !bytes.Contains(out, []byte("served "+path)) {
+			t.Fatalf("%s: erl: %v: %s", version, err, out)
+		}
+		write := waitFor(t, events, version+" request", func(ev *Event) bool {
+			return ev.Function == FuncErlangRecordSend && contains("GET "+path+" HTTP/1.1")(ev)
+		})
+		read := waitFor(t, events, version+" response", func(ev *Event) bool {
+			return ev.Function == FuncErlangRecordRecv && contains("served "+path)(ev)
+		})
+		checkConnection(t, write, srv.Listener.Addr().String())
+		checkConnection(t, read, srv.Listener.Addr().String())
+	}
+}
+
 // freeUDPPort returns a UDP port on 127.0.0.1 that was free a moment ago.
 func freeUDPPort(t *testing.T) string {
 	t.Helper()

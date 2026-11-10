@@ -188,6 +188,19 @@ thing it depends on ships.
 - **Guarded by:** `TestOpenSSLQUIC`, in the weekly canary against Debian's
   latest curl and OpenSSL.
 
+### Erlang's ssl
+
+- **Depends on:** OTP's crypto NIF encrypting and decrypting TLS records
+  with `EVP_EncryptUpdate` and `EVP_DecryptUpdate`, associated data first;
+  the VM receiving and sending a record on the scheduler thread that
+  decrypts or encrypts it; and its program being named `beam*`.
+- **Breaks when:** OTP changes how its crypto NIF calls libcrypto, or links
+  libcrypto into the NIF (then it's no longer a separate library to probe).
+- **How it shows:** nothing captured for an Erlang VM, quietly; or records
+  without addresses.
+- **Guarded by:** `TestErlangSSL`, in CI with Ubuntu's Erlang, TLS 1.3 and
+  1.2.
+
 ### HTTP/3 over quic-go
 
 - **Depends on:** Go's AES-GCM being `crypto/internal/fips140/aes/gcm.(*GCM)`

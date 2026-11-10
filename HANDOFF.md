@@ -62,7 +62,7 @@ compile for darwin, and `go test ./...` fails on macOS. Work inside a Linux VM:
 - In the VM, install Go 1.26+ and run:
 
   ```bash
-  sudo apt-get install -y clang-18 llvm-18 curl python3 gnutls-bin libnss3-dev pkg-config qemu-system-x86 iproute2
+  sudo apt-get install -y clang-18 llvm-18 curl python3 gnutls-bin libnss3-dev pkg-config qemu-system-x86 iproute2 erlang-base erlang-ssl erlang-inets
   ```
 
 - Editing on the Mac and building, testing and running in the VM against the
@@ -98,7 +98,7 @@ sudo ./snoopy --verbose    # try it
 ```
 
 The integration tests skip clients that aren't installed: curl, python3,
-gnutls-cli, and cc with libnss3-dev for the NSS client in
+gnutls-cli, erl (erlang-base, erlang-ssl, erlang-inets), and cc with libnss3-dev for the NSS client in
 `internal/tracer/testdata`, or with `SNOOPY_TEST_STRICT=1` (CI) fail
 instead. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
 and quinn clients with cargo, and `SNOOPY_TEST_CURL_HTTP3` runs curl's HTTP/3

@@ -739,6 +739,54 @@ own, without associated data.
   Debian trixie root filesystem with curl (`fetch.sh debian`, or
   `tar` from a `debian:trixie` container with curl installed).
 
+## Erlang's ssl
+
+### How it was found
+
+Erlang's `ssl` is written in Erlang, but encrypts and decrypts its records
+in its crypto NIF, through libcrypto. bpftrace on an `erlang:28`
+container's libcrypto (OTP 28, OpenSSL 3.5), filtered to the VM's threads
+(`erts_*`; `beam.smp`'s child of the shell, not the shell's PID):
+
+```bash
+L=/proc/<pid>/root/usr/lib/x86_64-linux-gnu/libcrypto.so.3
+bpftrace -e "uprobe:$L:EVP_EncryptUpdate,uprobe:$L:EVP_DecryptUpdate /strncmp(comm, \"erts_\", 5) == 0/ {
+  printf(\"%s %s ctx %x out %x len %d\n\", comm, probe, arg0, arg1, arg4); }"
+```
+
+Each record is a `*Update` with no output (`out` 0) and the 5-byte TLS 1.3
+header (or TLS 1.2's 13 bytes) as associated data, then one with the
+payload, then `*Final_ex`, on a context per direction that lasts as long as
+its keys. The scheduler thread that decrypts a record received it
+(`recvfrom`) just before, and the one that encrypts one sends it (`writev`)
+just after. Erlang's random numbers go through `EVP_EncryptUpdate` too, in
+place and without associated data.
+
+### How it works
+
+- **BPF:** `erl_encrypt_update_enter` and `erl_decrypt_update_enter` keep
+  associated data that `classify_aad` says is a TLS record's
+  (`erl_ciphers`), and take the next update on the context as the record:
+  sent through `record_seal_enter` at entry, received on return
+  (`RET_ONE_KNOWN_LEN_TLS13` takes a TLS 1.3 record's inner content type
+  off). Records go out as `FN_ERL_RECORD_SEND` and `_RECV`, whose socket is
+  the thread's last receive and next send, as for rustls's records.
+- **Only in Erlang's processes:** OpenSSL's own TLS may call these
+  functions, so libcrypto is the `Erlang` target only in a process whose
+  program is `beam*` (`Watcher.Process`, `isErlang`), and attached to only
+  with `--comm`, `--pid` or `--container`.
+
+### How to tell it broke, and how to fix it
+
+- **Nothing captured:** OTP moved its records to other EVP calls (an
+  `EVP_CipherUpdate`, or a provider's); rerun the bpftrace session on the
+  `EVP_*Update` and `EVP_Cipher*` functions.
+- **No addresses:** the VM moved its socket I/O off the scheduler that
+  encrypts and decrypts (to its dirty I/O threads, say); compare the
+  `recvfrom` and `writev` threads with the update calls'.
+- **To test:** `TestErlangSSL` (erlang-base, erlang-ssl and erlang-inets on
+  Ubuntu), for TLS 1.3 and 1.2.
+
 ## HTTP/3 over quic-go
 
 ### How it was found

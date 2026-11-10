@@ -801,6 +801,28 @@ func TestNameMatches(t *testing.T) {
 	}
 }
 
+// An Erlang VM's program is beam.smp, in erts-<version>/bin.
+func TestIsErlang(t *testing.T) {
+	proc := t.TempDir()
+	for pid, exe := range map[string]string{
+		"1": "/usr/lib/erlang/erts-15.2/bin/beam.smp",
+		"2": "/usr/local/lib/erlang/erts-16.0/bin/beam.smp (deleted)",
+		"3": "/usr/bin/ruby3.4",
+	} {
+		if err := os.MkdirAll(filepath.Join(proc, pid), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(exe, filepath.Join(proc, pid, "exe")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for pid, want := range map[int]bool{1: true, 2: true, 3: false, 4: false} {
+		if got := isErlang(proc, pid); got != want {
+			t.Errorf("pid %d: %v", pid, got)
+		}
+	}
+}
+
 func TestRustInfoDescribe(t *testing.T) {
 	for _, c := range []struct {
 		ri          RustInfo
