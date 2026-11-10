@@ -151,6 +151,19 @@ func TestRequestsHTTP3FINFirst(t *testing.T) {
 	}
 }
 
+// A stream that ends without a response, or one snoopy could decode, says
+// so rather than showing a status of 0.
+func TestRequestsNoResponse(t *testing.T) {
+	req := append([]byte{0x00, 0x00, 0xd1, 0xd7, 0xc1}, literalField(":authority", "example.com")...)
+	after := requestLines(t, Options{},
+		quicEvent(tracer.FuncQUICSend, streamFrameBytes(0, 0, h3Frame(0x01, req), true)),
+		quicEvent(tracer.FuncQUICRecv, streamFrameBytes(0, 0, nil, true)),
+	)
+	if got := after[1]; !strings.Contains(got, "GET https://example.com/ HTTP/3 → no response seen, ") {
+		t.Errorf("got %q", got)
+	}
+}
+
 func TestRequestsFilterAndRedact(t *testing.T) {
 	evs := []*tracer.Event{
 		event(tracer.FuncSSLWrite, "GET /ok?token=s3cr3t HTTP/1.1\r\nHost: a\r\n\r\n"),
