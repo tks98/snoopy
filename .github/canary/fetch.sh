@@ -4,8 +4,10 @@
 # prints the path=symbols spec that TestBoringSSLBinaries (SNOOPY_BORINGSSL_TEST)
 # or TestFreeblBinaries (SNOOPY_FREEBL_TEST) take. Or makes a Fedora root
 # filesystem with an HTTP/3 curl, for TestCurlHTTP3, and prints its path.
+# Or installs the latest Chrome, for TestChromeHTTP3, and prints its binary.
 #
 #   fetch.sh chrome stable|beta <dir>
+#   fetch.sh chrome-install stable|beta <dir>   (as root)
 #   fetch.sh electron x64|arm64 <dir>
 #   fetch.sh bun x64|aarch64 <dir>
 #   fetch.sh envoy x86_64|aarch_64 <dir>
@@ -41,6 +43,19 @@ chrome)
 		warn "no debug symbols for Chrome $version yet; only checking that one answer is found"
 		echo "$binary"
 	fi
+	;;
+chrome-install)
+	# The same release, installed with what it needs to run.
+	version=$(curl -fsS "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/$variant/versions" |
+		python3 -c 'import json, sys; print(json.load(sys.stdin)["versions"][0]["version"])')
+	log "Chrome $variant $version"
+	curl -fsSL -o chrome.deb "https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-$variant/google-chrome-${variant}_${version}-1_amd64.deb"
+	DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades "$PWD/chrome.deb" >&2
+	rm chrome.deb
+	binary=/opt/google/chrome/chrome
+	[ "$variant" = stable ] || binary=/opt/google/chrome-$variant/chrome
+	"$binary" --version >&2
+	echo "$binary"
 	;;
 electron)
 	auth=()

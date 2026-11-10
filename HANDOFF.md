@@ -34,7 +34,7 @@ What CI checks, and when:
 | Every BPF program loads under 5.10, 5.15, 6.1, 6.6 and 6.12, in QEMU, x86_64 and arm64 (`loadcheck.yml`) | Changes to the BPF code or how it's loaded |
 | A snapshot release: GoReleaser's config, the image, krew installing the plugin, the packages installing on Ubuntu, Fedora and Alpine, reproducible jars and archives (`release-check.yml`) | Changes to the release's configuration |
 | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, x86_64 and arm64 (`rust.yml`) | Weekly, and changes to those clients |
-| Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, and Fedora's curl over HTTP/3 (`canary.yml`) | Weekly |
+| Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, Chrome stable and beta capturing HTTP/3 end to end, and Fedora's curl over HTTP/3 (`canary.yml`) | Weekly |
 | Overhead (`benchmark.yml`, `docs/benchmark/`) | By hand; results in [docs/performance.md](docs/performance.md) |
 
 Not in CI: the integration tests on 5.10 to 6.12, which took too long
@@ -47,7 +47,8 @@ the recipes).
 
 1. **Guard against browser releases.** The rest of the list in
    [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it); the
-   weekly canary covers finding them by signature, not capturing.
+   weekly canary covers finding them by signature, and capturing for
+   Chrome's HTTP/3 (`TestChromeHTTP3`), not yet for Electron or Firefox.
 
 ## Working on it from a Mac
 

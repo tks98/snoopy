@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1502,6 +1503,92 @@ func TestCurlHTTP3(t *testing.T) {
 	if read.FD != write.FD {
 		t.Errorf("response on fd %d, request on fd %d", read.FD, write.FD)
 	}
+}
+
+// HTTP/3 in Chrome, end to end: its BoringSSL found by signature, and its
+// QUIC packets captured both ways, which the canary's signature check
+// can't tell (Chrome 157 stopped decrypting them where snoopy attached).
+// SNOOPY_TEST_CHROME is the chrome binary; the server is the quic-go test
+// program, whose self-signed certificate Chrome is told to accept by its
+// key's hash.
+func TestChromeHTTP3(t *testing.T) {
+	requireRoot(t)
+	chrome := os.Getenv("SNOOPY_TEST_CHROME")
+	if chrome == "" {
+		t.Skip("set SNOOPY_TEST_CHROME to a chrome binary to run this test")
+	}
+	goTool := requireTool(t, "go")
+	program := filepath.Join(t.TempDir(), "qgserver") // not "chrome", which --comm would match
+	build := exec.Command(goTool, "build", "-o", program, ".")
+	build.Dir = "testdata/quicgo"
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build quic-go program: %v: %s", err, out)
+	}
+	targets, err := discover.Inspect(chrome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) == 0 || targets[0].Offsets["EVP_AEAD_CTX_seal"] == 0 {
+		t.Fatalf("BoringSSL's QUIC functions not found in %s: %+v", chrome, targets)
+	}
+	events := startTracer(t, Options{Comm: "chrome"}, targets)
+
+	port := freeUDPPort(t)
+	spkiFile := filepath.Join(t.TempDir(), "spki")
+	srv := exec.Command(program, "server", port)
+	srv.Env = append(os.Environ(), "QUICGO_SPKI_FILE="+spkiFile)
+	stdout, err := srv.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
+		t.Fatalf("quic-go server: %q, %v", line, err)
+	}
+	spki, err := os.ReadFile(spkiFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/chrome-h3"
+	cmd := exec.Command(chrome, "--headless=new", "--no-sandbox", "--no-first-run", "--disable-background-networking",
+		"--user-data-dir="+t.TempDir(), "--ignore-certificate-errors-spki-list="+string(spki),
+		"--origin-to-force-quic-on=localhost:"+port, "--host-resolver-rules=MAP localhost 127.0.0.1",
+		"--dump-dom", "https://localhost:"+port+path)
+	// Into a file: Chrome's helper processes keep a pipe open after it
+	// exits. In a process group of its own, so they go with it.
+	dom := filepath.Join(t.TempDir(), "dom")
+	f, err := os.Create(dom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cmd.Stdout = f
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	timer := time.AfterFunc(time.Minute, func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	err = cmd.Wait()
+	timer.Stop()
+	out, _ := os.ReadFile(dom)
+	if err != nil || !bytes.Contains(out, []byte("served "+path+" on "+port)) {
+		t.Fatalf("chrome: %v: %.300s", err, out)
+	}
+	read := waitFor(t, events, "response", func(ev *Event) bool {
+		return ev.Function == FuncQUICRecv && contains("served "+path)(ev)
+	})
+	write := waitFor(t, events, "request", func(ev *Event) bool {
+		return ev.Function == FuncQUICSend && ev.PID == read.PID && ev.FD == read.FD && len(ev.QUICHeader) > 0 &&
+			ev.QUICHeader[0]&0x80 == 0 // after the handshake; not Chrome's own traffic
+	})
+	server := "127.0.0.1:" + port
+	checkConnection(t, read, server)
+	checkConnection(t, write, server)
 }
 
 // freeUDPPort returns a UDP port on 127.0.0.1 that was free a moment ago.

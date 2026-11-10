@@ -57,10 +57,10 @@ thing it depends on ships.
   decryption, so HTTP/3 responses went missing while requests still showed;
   received packets are now also seen at the ciphers' `openv_detached`
   methods. The test checks those against the symbols too, but only where
-  they are; nothing short of running Chrome shows that QUIC stopped calling
-  what's attached to.
-- **Guarded by:** `TestBoringSSLBinaries` against published symbols, run by
-  hand.
+  they are; that QUIC stopped calling what's attached to only showed when
+  Chrome ran, which `TestChromeHTTP3` now does in the canary.
+- **Guarded by:** `TestBoringSSLBinaries` against published symbols, and
+  `TestChromeHTTP3` capturing a page over HTTP/3, both in the weekly canary.
 
 ### Which socket a QUIC packet belongs to
 
@@ -273,7 +273,10 @@ In order of how much each removes.
    Firefox (x86-64 and arm64) with Mozilla's, and runs `TestBoringSSLBinaries`
    and `TestFreeblBinaries` on them; and it runs `TestCurlHTTP3` against
    the latest curl of a pinned Fedora release (moved on by hand to each new
-   one) on both architectures. A release that breaks one of
+   one) on both architectures, and `TestChromeHTTP3` against the latest
+   Chrome stable and beta, installed: Chrome loads a page over HTTP/3 from
+   the test's quic-go server, and the response has to be captured, which a
+   signature check can't show. A release that breaks one of
    them shows as a failed run within a week. When a release's symbols
    aren't out yet, the job only checks that one answer is found, and warns.
 2. **Check `golang.org/x/arch` bumps before merging them.** Run those
