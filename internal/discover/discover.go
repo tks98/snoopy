@@ -37,11 +37,16 @@ const (
 	Rustls
 	NGTCP2 // its crypto library's packet protection, for QUIC (curl's HTTP/3)
 	JSSE   // Java's SunJSSE, through snoopy's Java agent rather than probes
+	// OpenSSLQUIC is libcrypto, where OpenSSL's own QUIC (3.2 and later)
+	// encrypts and decrypts its packets. It's attached to only for the
+	// processes snoopy is told to trace, since all of a program's
+	// symmetric encryption goes through the functions probed.
+	OpenSSLQUIC
 )
 
 func (l Library) String() string {
 	switch l {
-	case OpenSSL:
+	case OpenSSL, OpenSSLQUIC:
 		return "openssl"
 	case GnuTLS:
 		return "gnutls"
@@ -378,9 +383,13 @@ func (w *Watcher) Root(pid int) []Target {
 		return nil
 	}
 	root = w.filesRoot(pid, root)
+	patterns := libPatterns
+	if w.perProcess {
+		patterns = processLibPatterns
+	}
 	var targets []Target
 	for _, dir := range libDirs {
-		for _, pat := range libPatterns {
+		for _, pat := range patterns {
 			matches, _ := filepath.Glob(filepath.Join(root, dir, pat))
 			for _, path := range matches {
 				targets = append(targets, w.inspect(path, "")...)
@@ -915,8 +924,13 @@ func MappedLibraries(maps io.Reader) []Mapping {
 	return out
 }
 
+// processLibPatterns are libPatterns and libraries looked at only in the
+// processes snoopy is told to trace: libcrypto, for OpenSSL's QUIC (see
+// OpenSSLQUIC), which isn't looked for across the system.
+var processLibPatterns = append(slices.Clone(libPatterns), "libcrypto.so*")
+
 func isTLSLibraryName(name string) bool {
-	for _, pat := range libPatterns {
+	for _, pat := range processLibPatterns {
 		if ok, _ := filepath.Match(pat, name); ok {
 			return true
 		}

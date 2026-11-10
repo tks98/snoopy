@@ -1351,8 +1351,13 @@ func watchCounters(ctx context.Context, t *tracer.Tracer, quic *quicSeen) {
 				}
 				noQUICWarned[pid] = true
 				comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-				logf("warning: %s (pid %d) sends or receives on UDP port 443, HTTP/3's, but none of its QUIC packets were captured: its QUIC library isn't supported, or has changed (see docs/maintenance.md)",
-					strings.TrimSpace(string(comm)), pid)
+				// OpenSSL's QUIC is only traced in the processes selected.
+				hint := ""
+				if !t.PerProcess() {
+					hint = "; if it uses OpenSSL's own QUIC (as curl does on Debian), select it with --comm or --pid"
+				}
+				logf("warning: %s (pid %d) sends or receives on UDP port 443, HTTP/3's, but none of its QUIC packets were captured: its QUIC library isn't supported, or has changed (see docs/maintenance.md)%s",
+					strings.TrimSpace(string(comm)), pid, hint)
 			}
 			lost, err := t.LostEvents()
 			if err == nil && lost > reported {

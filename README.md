@@ -73,8 +73,8 @@ the output, JSON and pcap, containers, and troubleshooting.
 
 - **TLS libraries:** OpenSSL, BoringSSL (also Bun's and Envoy's, found by
   signature), LibreSSL, GnuTLS, NSS, wolfSSL,
-  Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 (curl's HTTP/3)
-  and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
+  Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 and
+  OpenSSL's own QUIC (curl's HTTP/3) and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.
 - **Runtimes:** curl, Python, Ruby, PHP, Node.js (official builds too), .NET,
   Go, Rust and Bun programs, and Java: with Netty's netty-tcnative (gRPC-Java)

@@ -166,12 +166,27 @@ thing it depends on ships.
   and ngtcp2 encrypting packets through them rather than through the TLS
   library directly.
 - **Breaks when:** ngtcp2 changes that API (a major version), or curl moves
-  to another QUIC stack (it also builds with quiche and OpenSSL's own QUIC,
-  which would need their own probes).
+  to another QUIC stack (it also builds with quiche, which isn't supported,
+  and OpenSSL's own QUIC, which is, separately).
 - **How it shows:** renamed functions mean nothing attaches, which is loud;
   a changed `ngtcp2_crypto_aead` means wrong lengths, quietly.
 - **Guarded by:** `TestCurlHTTP3`, only with `SNOOPY_TEST_CURL_HTTP3` set to
   the root of a system with an HTTP/3 curl (Fedora's).
+
+### HTTP/3 through OpenSSL's QUIC
+
+- **Depends on:** OpenSSL's QUIC protecting packets through
+  `EVP_CipherInit_ex`, `EVP_CipherUpdate` (associated data first) and
+  `EVP_CipherFinal_ex`, all public API; and the type at the start of
+  `struct ssl_st`, which is internal, to leave out what's read and written
+  through QUIC streams.
+- **Breaks when:** OpenSSL encrypts packets differently (another EVP call,
+  or a provider called directly), or renumbers its `SSL_TYPE_*` values,
+  as it did in 3.5.
+- **How it shows:** packets not captured, which the UDP-port-443 warning
+  says; or each request and response shown twice, as QUIC and as TLS.
+- **Guarded by:** `TestOpenSSLQUIC`, in the weekly canary against Debian's
+  latest curl and OpenSSL.
 
 ### HTTP/3 over quic-go
 
