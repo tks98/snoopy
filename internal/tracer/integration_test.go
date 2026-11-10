@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"debug/elf"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -1665,6 +1666,87 @@ func TestOpenSSLQUIC(t *testing.T) {
 	}); ev != nil {
 		t.Errorf("%v on an OpenSSL QUIC stream was captured too: %q", ev.Function, ev.Data)
 	}
+}
+
+// Erlang's ssl, whose TLS records its crypto NIF encrypts and decrypts with
+// libcrypto's EVP_EncryptUpdate and EVP_DecryptUpdate, with TLS 1.3 and
+// TLS 1.2. The VM does its own socket I/O, on the thread that encrypts and
+// decrypts, which is how their socket is known. SNOOPY_TEST_ERL is another
+// Erlang's erl to use, e.g. one built with libcrypto linked into its crypto
+// NIF (--disable-dynamic-ssl-lib), which is then what's probed.
+func TestErlangSSL(t *testing.T) {
+	requireRoot(t)
+	erl := os.Getenv("SNOOPY_TEST_ERL")
+	if erl == "" {
+		erl = requireTool(t, "erl")
+	}
+	var targets []discover.Target
+	if nif := erlangCryptoNIF(t, erl); nif != "" {
+		targets = []discover.Target{{Path: nif, Library: discover.Erlang}}
+	} else {
+		for _, dir := range []string{"/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib"} {
+			found, _ := filepath.Glob(filepath.Join(dir, "libcrypto.so.*"))
+			for _, lib := range found {
+				targets = append(targets, discover.Target{Path: lib, Library: discover.Erlang})
+			}
+		}
+	}
+	if len(targets) == 0 {
+		t.Fatal("no libcrypto found")
+	}
+	events := startTracer(t, Options{Comm: "beam"}, targets)
+	srv, _ := newServer(t)
+
+	for _, version := range []string{"tlsv1.3", "tlsv1.2"} {
+		path := "/erlang-" + version
+		eval := fmt.Sprintf(`ssl:start(), inets:start(),
+			{ok, {{_, 200, _}, _, Body}} = httpc:request(get, {"%s%s", []},
+				[{ssl, [{verify, verify_none}, {versions, ['%s']}]}], []),
+			io:format("~s~n", [Body]), halt().`, srv.URL, path, version)
+		out, err := exec.Command(erl, "-noshell", "-eval", eval).CombinedOutput()
+		if err != nil || !bytes.Contains(out, []byte("served "+path)) {
+			t.Fatalf("%s: erl: %v: %s", version, err, out)
+		}
+		write := waitFor(t, events, version+" request", func(ev *Event) bool {
+			return ev.Function == FuncErlangRecordSend && contains("GET "+path+" HTTP/1.1")(ev)
+		})
+		read := waitFor(t, events, version+" response", func(ev *Event) bool {
+			return ev.Function == FuncErlangRecordRecv && contains("served "+path)(ev)
+		})
+		checkConnection(t, write, srv.Listener.Addr().String())
+		checkConnection(t, read, srv.Listener.Addr().String())
+	}
+}
+
+// erlangCryptoNIF returns the crypto NIF of the Erlang that erl runs, if
+// libcrypto is linked into it: it exports libcrypto's functions.
+func erlangCryptoNIF(t *testing.T, erl string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(erl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// bin/erl, with lib/erlang/lib or (installed by a distribution) lib
+	// next to bin.
+	var nifs []string
+	for _, pattern := range []string{"../lib/erlang/lib/crypto-*/priv/lib/crypto.so", "../lib/crypto-*/priv/lib/crypto.so"} {
+		found, _ := filepath.Glob(filepath.Join(filepath.Dir(real), pattern))
+		nifs = append(nifs, found...)
+	}
+	for _, nif := range nifs {
+		f, err := elf.Open(nif)
+		if err != nil {
+			continue
+		}
+		syms, _ := f.DynamicSymbols()
+		f.Close()
+		if slices.ContainsFunc(syms, func(s elf.Symbol) bool {
+			return s.Name == "EVP_DecryptUpdate" && s.Section != elf.SHN_UNDEF
+		}) {
+			return nif
+		}
+	}
+	return ""
 }
 
 // freeUDPPort returns a UDP port on 127.0.0.1 that was free a moment ago.

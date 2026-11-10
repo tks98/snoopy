@@ -42,6 +42,10 @@ const (
 	// processes snoopy is told to trace, since all of a program's
 	// symmetric encryption goes through the functions probed.
 	OpenSSLQUIC
+	// Erlang is libcrypto in an Erlang VM's process, whose ssl encrypts and
+	// decrypts its TLS records through it, in its crypto NIF. Also only for
+	// the processes snoopy is told to trace.
+	Erlang
 )
 
 func (l Library) String() string {
@@ -66,6 +70,8 @@ func (l Library) String() string {
 		return "ngtcp2"
 	case JSSE:
 		return "jsse"
+	case Erlang:
+		return "erlang"
 	}
 	return "unknown"
 }
@@ -622,7 +628,53 @@ func (w *Watcher) Process(pid int) []Target {
 	for _, c := range files {
 		targets = append(targets, w.inspect(c.path, c.note)...)
 	}
+	// What an Erlang VM's ssl encrypts goes through its libcrypto, which
+	// is a target for that only in Erlang's processes: libcrypto itself,
+	// or its crypto NIF, if libcrypto is linked into that
+	// (--disable-dynamic-ssl-lib).
+	if isErlang(w.proc, pid) {
+		for _, c := range files {
+			name := filepath.Base(c.path)
+			if ok, _ := filepath.Match("libcrypto.so*", name); ok {
+				targets = append(targets, Target{Path: c.path, Library: Erlang, Note: "for Erlang's ssl"})
+			} else if name == "crypto.so" && definesFuncs(c.path, "EVP_EncryptUpdate", "EVP_DecryptUpdate") {
+				targets = append(targets, Target{Path: c.path, Library: Erlang, Note: "Erlang's crypto NIF, with libcrypto linked in"})
+			}
+		}
+	}
 	return targets
+}
+
+// definesFuncs reports whether the ELF file at path exports all of names.
+func definesFuncs(path string, names ...string) bool {
+	f, file, err := openELF(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	syms, err := dynamicSymbols(f)
+	if err != nil {
+		return false
+	}
+	defined := map[string]bool{}
+	for _, s := range syms {
+		if s.Section != elf.SHN_UNDEF && elf.ST_TYPE(s.Info) == elf.STT_FUNC {
+			defined[s.Name] = true
+		}
+	}
+	for _, name := range names {
+		if !defined[name] {
+			return false
+		}
+	}
+	return true
+}
+
+// isErlang reports whether a process is an Erlang VM, whose program is
+// beam.smp (or beam, without SMP).
+func isErlang(proc string, pid int) bool {
+	exe, err := os.Readlink(filepath.Join(proc, strconv.Itoa(pid), "exe"))
+	return err == nil && strings.HasPrefix(filepath.Base(strings.TrimSuffix(exe, deletedSuffix)), "beam")
 }
 
 // Selected returns the running processes that Options.PID and Options.Comm
@@ -925,9 +977,11 @@ func MappedLibraries(maps io.Reader) []Mapping {
 }
 
 // processLibPatterns are libPatterns and libraries looked at only in the
-// processes snoopy is told to trace: libcrypto, for OpenSSL's QUIC (see
-// OpenSSLQUIC), which isn't looked for across the system.
-var processLibPatterns = append(slices.Clone(libPatterns), "libcrypto.so*")
+// processes snoopy is told to trace, which aren't looked for across the
+// system: libcrypto, for OpenSSL's QUIC (see OpenSSLQUIC) and Erlang's ssl
+// (see Erlang), and Erlang's crypto NIF, crypto.so, which may have
+// libcrypto linked into it.
+var processLibPatterns = append(slices.Clone(libPatterns), "libcrypto.so*", "crypto.so")
 
 func isTLSLibraryName(name string) bool {
 	for _, pat := range processLibPatterns {

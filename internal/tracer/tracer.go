@@ -449,7 +449,9 @@ func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
 	// libcrypto's cipher functions, for OpenSSL's QUIC, are called for all of
 	// a program's symmetric encryption: probed only for the processes told
 	// to be traced, not for every program.
-	if target.Library == discover.OpenSSLQUIC && !t.perProcess && t.opts.PID == 0 && t.opts.Comm == "" {
+	// And so are they for Erlang's ssl.
+	if (target.Library == discover.OpenSSLQUIC || target.Library == discover.Erlang) &&
+		!t.perProcess && t.opts.PID == 0 && t.opts.Comm == "" {
 		return nil, nil
 	}
 	if !t.perProcess {
@@ -897,6 +899,11 @@ func (t *Tracer) attach(target discover.Target, fd, pid int) (attached []string,
 			{"EVP_CipherInit_ex", t.objs.OsslCipherInitEnter, true},
 			{"EVP_CipherUpdate", t.objs.OsslCipherUpdateEnter, false},
 			{"EVP_CipherFinal_ex", t.objs.OsslCipherFinalEnter, true},
+		}
+	case discover.Erlang:
+		probes = []cProbe{
+			{"EVP_EncryptUpdate", t.objs.ErlEncryptUpdateEnter, true},
+			{"EVP_DecryptUpdate", t.objs.ErlDecryptUpdateEnter, false},
 		}
 	case discover.NGTCP2:
 		probes = []cProbe{

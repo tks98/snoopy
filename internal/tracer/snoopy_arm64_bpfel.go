@@ -67,6 +67,19 @@ type snoopyDepthKey struct {
 	G      uint64
 }
 
+type snoopyErlKey struct {
+	_    structs.HostLayout
+	Tgid uint64
+	Ctx  uint64
+}
+
+type snoopyErlRecord struct {
+	_     structs.HostLayout
+	Ad    uint64
+	AdLen uint32
+	_     [4]byte
+}
+
 type snoopyEventHeader struct {
 	_             structs.HostLayout
 	TimestampNs   uint64
@@ -166,6 +179,7 @@ const (
 	snoopyMapCallDepth              = "call_depth"
 	snoopyMapConnInfos              = "conn_infos"
 	snoopyMapCounters               = "counters"
+	snoopyMapErlCiphers             = "erl_ciphers"
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
 	snoopyMapIoThreads              = "io_threads"
@@ -190,6 +204,8 @@ const (
 	snoopyProgAesAeadEnter          = "aes_aead_enter"
 	snoopyProgAesCreateEnter        = "aes_create_enter"
 	snoopyProgAesCreateReturn       = "aes_create_return"
+	snoopyProgErlDecryptUpdateEnter = "erl_decrypt_update_enter"
+	snoopyProgErlEncryptUpdateEnter = "erl_encrypt_update_enter"
 	snoopyProgGnutlsRecordRecvEnter = "gnutls_record_recv_enter"
 	snoopyProgGnutlsRecordSendEnter = "gnutls_record_send_enter"
 	snoopyProgGoAeadOpenEnter       = "go_aead_open_enter"
@@ -289,6 +305,8 @@ type snoopyProgramSpecs struct {
 	AesAeadEnter          *ebpf.ProgramSpec `ebpf:"aes_aead_enter"`
 	AesCreateEnter        *ebpf.ProgramSpec `ebpf:"aes_create_enter"`
 	AesCreateReturn       *ebpf.ProgramSpec `ebpf:"aes_create_return"`
+	ErlDecryptUpdateEnter *ebpf.ProgramSpec `ebpf:"erl_decrypt_update_enter"`
+	ErlEncryptUpdateEnter *ebpf.ProgramSpec `ebpf:"erl_encrypt_update_enter"`
 	GnutlsRecordRecvEnter *ebpf.ProgramSpec `ebpf:"gnutls_record_recv_enter"`
 	GnutlsRecordSendEnter *ebpf.ProgramSpec `ebpf:"gnutls_record_send_enter"`
 	GoAeadOpenEnter       *ebpf.ProgramSpec `ebpf:"go_aead_open_enter"`
@@ -337,6 +355,7 @@ type snoopyMapSpecs struct {
 	CallDepth      *ebpf.MapSpec `ebpf:"call_depth"`
 	ConnInfos      *ebpf.MapSpec `ebpf:"conn_infos"`
 	Counters       *ebpf.MapSpec `ebpf:"counters"`
+	ErlCiphers     *ebpf.MapSpec `ebpf:"erl_ciphers"`
 	Events         *ebpf.MapSpec `ebpf:"events"`
 	Execs          *ebpf.MapSpec `ebpf:"execs"`
 	IoThreads      *ebpf.MapSpec `ebpf:"io_threads"`
@@ -394,6 +413,7 @@ type snoopyMaps struct {
 	CallDepth      *ebpf.Map `ebpf:"call_depth"`
 	ConnInfos      *ebpf.Map `ebpf:"conn_infos"`
 	Counters       *ebpf.Map `ebpf:"counters"`
+	ErlCiphers     *ebpf.Map `ebpf:"erl_ciphers"`
 	Events         *ebpf.Map `ebpf:"events"`
 	Execs          *ebpf.Map `ebpf:"execs"`
 	IoThreads      *ebpf.Map `ebpf:"io_threads"`
@@ -418,6 +438,7 @@ func (m *snoopyMaps) Close() error {
 		m.CallDepth,
 		m.ConnInfos,
 		m.Counters,
+		m.ErlCiphers,
 		m.Events,
 		m.Execs,
 		m.IoThreads,
@@ -464,6 +485,8 @@ type snoopyPrograms struct {
 	AesAeadEnter          *ebpf.Program `ebpf:"aes_aead_enter"`
 	AesCreateEnter        *ebpf.Program `ebpf:"aes_create_enter"`
 	AesCreateReturn       *ebpf.Program `ebpf:"aes_create_return"`
+	ErlDecryptUpdateEnter *ebpf.Program `ebpf:"erl_decrypt_update_enter"`
+	ErlEncryptUpdateEnter *ebpf.Program `ebpf:"erl_encrypt_update_enter"`
 	GnutlsRecordRecvEnter *ebpf.Program `ebpf:"gnutls_record_recv_enter"`
 	GnutlsRecordSendEnter *ebpf.Program `ebpf:"gnutls_record_send_enter"`
 	GoAeadOpenEnter       *ebpf.Program `ebpf:"go_aead_open_enter"`
@@ -514,6 +537,8 @@ func (p *snoopyPrograms) Close() error {
 		p.AesAeadEnter,
 		p.AesCreateEnter,
 		p.AesCreateReturn,
+		p.ErlDecryptUpdateEnter,
+		p.ErlEncryptUpdateEnter,
 		p.GnutlsRecordRecvEnter,
 		p.GnutlsRecordSendEnter,
 		p.GoAeadOpenEnter,

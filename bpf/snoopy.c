@@ -78,6 +78,10 @@ enum fn_id {
 	// libcrypto's EVP_CipherUpdate encrypts and decrypts them.
 	FN_OSSL_QUIC_SEND,
 	FN_OSSL_QUIC_RECV,
+	// TLS records of Erlang's ssl, which its crypto NIF encrypts and
+	// decrypts with libcrypto's EVP_EncryptUpdate and EVP_DecryptUpdate.
+	FN_ERL_RECORD_SEND,
+	FN_ERL_RECORD_RECV,
 };
 
 // A header-only record that isn't a call: a connection whose earlier events
@@ -100,6 +104,7 @@ enum ret_kind {
 	RET_KNOWN_LEN_TLS13, // RET_KNOWN_LEN, a TLS 1.3 record's inner plaintext
 	RET_ZERO_KNOWN_LEN, // int: 0 on success; the byte count, known at entry, is kept in len_ptr
 	RET_ONE_KNOWN_LEN, // int: 1 on success; the byte count, known at entry, is kept in len_ptr
+	RET_ONE_KNOWN_LEN_TLS13, // RET_ONE_KNOWN_LEN, a TLS 1.3 record's inner plaintext
 };
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
@@ -881,7 +886,10 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 		n = (int)PT_REGS_RC(ctx) == 0 ? (__s64)call.len_ptr : 0;
 		break;
 	case RET_ONE_KNOWN_LEN:
+	case RET_ONE_KNOWN_LEN_TLS13:
 		n = (int)PT_REGS_RC(ctx) == 1 ? (__s64)call.len_ptr : 0;
+		if (n > 0 && call.ret == RET_ONE_KNOWN_LEN_TLS13)
+			n = tls13_content_len(call.buf, n);
 		break;
 	case RET_KNOWN_LEN:
 	case RET_KNOWN_LEN_TLS13:
@@ -1393,6 +1401,9 @@ int sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
 static const char tls_library_names[][LIBNAME_MAX] = {
 	"libssl.so", "libgnutls.so", "libnspr4.so", "libfreeblpriv3.so", "libwolfssl.so",
 	"libmbedtls.so", "libs2n.so", "libngtcp2_crypto_", "libnetty_tcnative", "libconscrypt",
+	// For OpenSSL's QUIC and Erlang's ssl (processLibPatterns): Erlang
+	// loads its crypto NIF, and with it libcrypto, when it first needs it.
+	"libcrypto.so", "crypto.so",
 };
 
 static __always_inline bool tls_library_name(const char *name)
@@ -2147,6 +2158,108 @@ int aead_open_enter(struct pt_regs *ctx)
 	}
 	io_thread(pid_tgid);
 	return 0;
+}
+
+// Erlang's ssl encrypts and decrypts its TLS records in its crypto NIF,
+// through libcrypto: a record's header (TLS 1.3) or sequence number and
+// header (TLS 1.2) as associated data, then its payload, each through
+// EVP_EncryptUpdate or EVP_DecryptUpdate on the context of that direction
+// of the connection, which lasts as long as its keys:
+// int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+//     const unsigned char *in, int inl)
+// and EVP_DecryptUpdate alike. Updates without associated data before them
+// (Erlang's random numbers, through AES) aren't records. These are probed
+// only in Erlang's processes: OpenSSL's own TLS may call them too.
+
+struct erl_key {
+	__u64 tgid;
+	__u64 ctx; // the EVP_CIPHER_CTX
+};
+
+struct erl_record {
+	__u64 ad; // a record's associated data, waiting for its payload
+	__u32 ad_len;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct erl_key);
+	__type(value, struct erl_record);
+} erl_ciphers SEC(".maps");
+
+// erl_update handles an update on ctx: associated data that looks like a
+// TLS record's is kept, and the payload after it is the record's. It
+// returns the kind of the associated data for a payload, else AAD_NONE.
+static __always_inline int erl_update(__u64 pid_tgid, struct erl_key *key, __u64 out, __u64 in, __s32 inl,
+				      __u64 *ad, __u64 *ad_len)
+{
+	struct erl_record *c = bpf_map_lookup_elem(&erl_ciphers, key);
+	if (!out) {
+		int kind = inl > 0 ? classify_aad(in, inl) : AAD_NONE;
+		if (kind != AAD_TLS13 && kind != AAD_TLS12_DATA && kind != AAD_TLS12_OTHER) {
+			if (c)
+				c->ad = 0;
+			return AAD_NONE;
+		}
+		io_thread(pid_tgid); // so the thread's receives are seen from the handshake on
+		struct erl_record value;
+		__builtin_memset(&value, 0, sizeof(value));
+		value.ad = in;
+		value.ad_len = inl;
+		bpf_map_update_elem(&erl_ciphers, key, &value, BPF_ANY);
+		return AAD_NONE;
+	}
+	if (!c || !c->ad || inl <= 0)
+		return AAD_NONE;
+	*ad = c->ad;
+	*ad_len = c->ad_len;
+	c->ad = 0;
+	return classify_aad(*ad, *ad_len);
+}
+
+SEC("uprobe/EVP_EncryptUpdate")
+int erl_encrypt_update_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct erl_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.ctx = func_arg(ctx, 0);
+	__u64 ad = 0, ad_len = 0;
+	__s32 inl = (__s32)func_arg(ctx, 4);
+	if (erl_update(pid_tgid, &key, func_arg(ctx, 1), func_arg(ctx, 3), inl, &ad, &ad_len) == AAD_NONE)
+		return 0;
+	return record_seal_enter(FN_ERL_RECORD_SEND, FN_ERL_RECORD_SEND, key.ctx, func_arg(ctx, 3), inl, ad, ad_len);
+}
+
+SEC("uprobe/EVP_DecryptUpdate")
+int erl_decrypt_update_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct erl_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.ctx = func_arg(ctx, 0);
+	__u64 ad = 0, ad_len = 0, out = func_arg(ctx, 1), in = func_arg(ctx, 3);
+	__s32 inl = (__s32)func_arg(ctx, 4);
+	__u8 ret;
+	switch (erl_update(pid_tgid, &key, out, in, inl, &ad, &ad_len)) {
+	case AAD_TLS13:
+		ret = RET_ONE_KNOWN_LEN_TLS13;
+		break;
+	case AAD_TLS12_DATA:
+		ret = RET_ONE_KNOWN_LEN;
+		break;
+	default:
+		return 0;
+	}
+	__s32 fd = packet_fd(pid_tgid, io_thread(pid_tgid), in, 0, 0);
+	return enter_call_ad(ctx, FN_ERL_RECORD_RECV, ret, key.ctx, (void *)out, inl, fd, 0, 0);
 }
 
 // ring's AEAD functions, which rustls's ring provider calls through

@@ -340,7 +340,7 @@ Each line is one call to a TLS read or write function:
 | Field | Description |
 | --- | --- |
 | `time` | When the call returned. |
-| `function`, `library` | The traced function, e.g. `SSL_read`, `EVP_AEAD_CTX_open` or `AES_AEAD (decrypt)` (QUIC packets), `ring::aead open` (QUIC packets in Rust programs), `ngtcp2_crypto_decrypt` or `EVP_CipherUpdate (decrypt)` (in curl) or `cipher.AEAD.Open` (in Go programs using quic-go), or `EVP_AEAD_CTX_open (TLS)` and `ring::aead open (TLS)` (TLS records, for rustls), and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n`, `rustls`, `ngtcp2` or `go`. |
+| `function`, `library` | The traced function, e.g. `SSL_read`, `EVP_AEAD_CTX_open` or `AES_AEAD (decrypt)` (QUIC packets), `ring::aead open` (QUIC packets in Rust programs), `ngtcp2_crypto_decrypt` or `EVP_CipherUpdate (decrypt)` (in curl) or `cipher.AEAD.Open` (in Go programs using quic-go), or `EVP_AEAD_CTX_open (TLS)` and `ring::aead open (TLS)` (TLS records, for rustls) and `EVP_DecryptUpdate (TLS)` (for Erlang's `ssl`), and its library: `openssl`, `gnutls`, `nss`, `wolfssl`, `mbedtls`, `s2n`, `rustls`, `ngtcp2`, `erlang` or `go`. |
 | `direction` | `read` (received from the peer) or `write` (sent to it). |
 | `process_name`, `pid`, `tid` | The calling process and thread. |
 | `container_id` | The container the process runs in, if any. |
