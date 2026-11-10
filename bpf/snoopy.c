@@ -2506,6 +2506,11 @@ int ossl_cipher_update_enter(struct pt_regs *ctx)
 		__u32 n = inl;
 		if (n > OSSL_PACKET_MAX - off)
 			n = OSSL_PACKET_MAX - off;
+		// The masks keep the verifier's bounds: without the barriers,
+		// clang drops them as implied by the comparisons, which verifiers
+		// before Linux 6.8 don't follow.
+		barrier_var(off);
+		barrier_var(n);
 		bpf_probe_read_user(&pkt->data[off & OSSL_PACKET_MAX], n & OSSL_PACKET_MAX, (void *)in);
 	}
 	pkt->len = off + inl;
@@ -2556,6 +2561,7 @@ int ossl_cipher_final_enter(struct pt_regs *ctx)
 	}
 	r->h = h;
 	r->h.chunk_len = len;
+	barrier_var(len); // as in ossl_cipher_update_enter
 	bpf_probe_read_kernel(r->data, len & OSSL_PACKET_MAX, pkt->data);
 	bpf_ringbuf_submit(r, submit_flags(now));
 	return 0;

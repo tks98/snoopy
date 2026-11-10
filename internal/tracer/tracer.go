@@ -229,7 +229,9 @@ func New(opts Options) (*Tracer, error) {
 	if err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
-			return nil, fmt.Errorf("the kernel's BPF verifier rejected snoopy's program: %+v", ve)
+			// The error says which program, and the verifier's last words;
+			// the whole log follows, on lines of its own.
+			return nil, fmt.Errorf("the kernel's BPF verifier rejected snoopy's program: %v; its log:\n%+v", err, ve)
 		}
 		return nil, permissionHint(fmt.Errorf("load BPF program: %w", err))
 	}
