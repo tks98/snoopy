@@ -684,6 +684,61 @@ length is the ciphertext's less the tag (`ngtcp2_crypto_aead.max_overhead`).
   image, with `skopeo copy docker://registry.fedoraproject.org/fedora:latest
   dir:<dir>` and its layers unpacked, then `dnf install curl` chrooted in it.
 
+## HTTP/3 through OpenSSL's QUIC (curl on Debian)
+
+### How it was found
+
+Debian trixie's curl does HTTP/3 with nghttp3 and OpenSSL 3.5's own QUIC
+(no ngtcp2: `curl -V` lists nghttp3 but not ngtcp2). snoopy saw only what
+curl read through OpenSSL's QUIC stream objects with `SSL_read_ex`, as TLS,
+and none of what it wrote with `SSL_write_ex2`. OpenSSL protects its QUIC
+packets with libcrypto's EVP API, as its TLS records, which bpftrace on
+the container's libcrypto showed (`arg5` of `EVP_CipherInit_ex` is the
+direction; an update with no output, `arg1` 0, is associated data):
+
+```bash
+L=/proc/<pid>/root/lib/x86_64-linux-gnu/libcrypto.so.3
+bpftrace -e "uprobe:$L:EVP_CipherInit_ex /comm == \"curl\"/ { @enc[tid] = arg5; }
+  uprobe:$L:EVP_CipherUpdate /comm == \"curl\" && arg1 == 0/ { @aad[@enc[tid], arg4] = count(); }
+  uprobe:$L:EVP_CipherUpdate /comm == \"curl\" && arg1 != 0/ { @data[@enc[tid]] = count(); }"
+```
+
+Each packet's header goes in as associated data (2 or 3 bytes for a
+received short header: OpenSSL's client uses connection IDs of length 0),
+then its payload. A received packet is decrypted in one update; a packet
+to send is encrypted in one to three, one for each buffer its frames are
+in, ended by `EVP_CipherFinal_ex`. Header protection uses contexts of its
+own, without associated data.
+
+### How it works
+
+- **BPF:** `ossl_cipher_init_enter` keeps each context's direction
+  (`ossl_ciphers`); `ossl_cipher_update_enter` takes associated data that
+  `is_quic_aad` says is a QUIC header, then the context's next updates:
+  a received packet's plaintext is copied on return, and a packet to send
+  is collected in `ossl_packets` until `ossl_cipher_final_enter` emits it,
+  cut off at `OSSL_PACKET_MAX` bytes.
+- **Not seen twice:** what curl reads and writes through OpenSSL's QUIC
+  connections and streams is in the packets, so the `SSL_read`/`SSL_write`
+  probes leave those objects out (`ossl_quic_object`), by the type that
+  starts `struct ssl_st` from 3.2: 1 and 2, or from 3.5 0x80 and 0x81.
+- **Only for the processes selected:** libcrypto is the `OpenSSLQUIC`
+  target, found in a process's libraries (`processLibPatterns`), not across
+  the system, from OpenSSL 3.2 on (symbols versioned `OPENSSL_3.2.0` or
+  later), and attached to only with `--comm`, `--pid` or `--container`.
+
+### How to tell it broke, and how to fix it
+
+- **Responses but no requests, or the reverse:** OpenSSL changed how it
+  calls the EVP API for a direction; rerun the bpftrace session, also on
+  `EVP_CipherFinal_ex`.
+- **The same data twice, as QUIC and as TLS:** the type values at the start
+  of `struct ssl_st` changed (`SSL_TYPE_*` in `ssl/ssl_local.h`); update
+  `ossl_quic_object`.
+- **To test:** `TestOpenSSLQUIC`, with `SNOOPY_TEST_OPENSSL_QUIC` set to a
+  Debian trixie root filesystem with curl (`fetch.sh debian`, or
+  `tar` from a `debian:trixie` container with curl installed).
+
 ## HTTP/3 over quic-go
 
 ### How it was found

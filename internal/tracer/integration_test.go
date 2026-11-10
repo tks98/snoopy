@@ -1591,6 +1591,82 @@ func TestChromeHTTP3(t *testing.T) {
 	checkConnection(t, write, server)
 }
 
+// curl's HTTP/3 through OpenSSL's own QUIC (3.2 and later), as Debian
+// builds it: its packets are seen where libcrypto's EVP_CipherUpdate
+// encrypts and decrypts them, and what curl reads and writes through
+// OpenSSL's QUIC streams isn't seen again at SSL_read_ex and SSL_write_ex2.
+// SNOOPY_TEST_OPENSSL_QUIC is the root of a system whose curl does that (a
+// Debian trixie root filesystem), which curl is run chrooted in. The server
+// is the quic-go test program.
+func TestOpenSSLQUIC(t *testing.T) {
+	requireRoot(t)
+	root := os.Getenv("SNOOPY_TEST_OPENSSL_QUIC")
+	if root == "" {
+		t.Skip("set SNOOPY_TEST_OPENSSL_QUIC to the root of a system whose curl uses OpenSSL's QUIC to run this test")
+	}
+	goTool := requireTool(t, "go")
+	program := filepath.Join(t.TempDir(), "qgserver") // not a "curl" prefix, which --comm would match
+	build := exec.Command(goTool, "build", "-o", program, ".")
+	build.Dir = "testdata/quicgo"
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build quic-go program: %v: %s", err, out)
+	}
+	var targets []discover.Target
+	for _, pattern := range []string{"usr/lib/*/libssl.so.3", "usr/lib/*/libcrypto.so.3", "usr/lib64/libssl.so.3", "usr/lib64/libcrypto.so.3"} {
+		found, _ := filepath.Glob(filepath.Join(root, pattern))
+		for _, lib := range found {
+			ts, err := discover.Inspect(lib)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targets = append(targets, ts...)
+		}
+	}
+	if !slices.ContainsFunc(targets, func(tg discover.Target) bool { return tg.Library == discover.OpenSSLQUIC }) {
+		t.Fatalf("no libcrypto with OpenSSL's QUIC under %s: %+v", root, targets)
+	}
+	events := startTracer(t, Options{Comm: "curl"}, targets)
+
+	port := freeUDPPort(t)
+	srv := exec.Command(program, "server", port)
+	stdout, err := srv.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
+		t.Fatalf("quic-go server: %q, %v", line, err)
+	}
+	server := "127.0.0.1:" + port
+
+	path, body := "/openssl-quic", "sent-through-openssl-quic"
+	out, err := exec.Command("chroot", root, "curl", "-sk", "--http3-only", "-d", body, "https://"+server+path).CombinedOutput()
+	if err != nil || !bytes.Contains(out, []byte("served "+path+" on "+port)) {
+		t.Fatalf("curl --http3-only: %v: %s", err, out)
+	}
+	read := waitFor(t, events, "response", func(ev *Event) bool {
+		return ev.Function == FuncOSSLQUICRecv && contains("served "+path)(ev)
+	})
+	write := waitFor(t, events, "request body", func(ev *Event) bool {
+		return ev.Function == FuncOSSLQUICSend && ev.PID == read.PID && contains(body)(ev)
+	})
+	checkConnection(t, read, server)
+	checkConnection(t, write, server)
+	if read.FD != write.FD {
+		t.Errorf("response on fd %d, request on fd %d", read.FD, write.FD)
+	}
+	time.Sleep(time.Second) // for any stream reads still to come
+	if ev := events.find(func(ev *Event) bool {
+		return ev.Function.Library() == discover.OpenSSL && !ev.Function.IsQUIC() &&
+			(contains("served "+path)(ev) || contains(body)(ev))
+	}); ev != nil {
+		t.Errorf("%v on an OpenSSL QUIC stream was captured too: %q", ev.Function, ev.Data)
+	}
+}
+
 // freeUDPPort returns a UDP port on 127.0.0.1 that was free a moment ago.
 func freeUDPPort(t *testing.T) string {
 	t.Helper()

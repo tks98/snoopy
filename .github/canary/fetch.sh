@@ -3,7 +3,8 @@
 # its symbols, for the canary workflow (.github/workflows/canary.yml), and
 # prints the path=symbols spec that TestBoringSSLBinaries (SNOOPY_BORINGSSL_TEST)
 # or TestFreeblBinaries (SNOOPY_FREEBL_TEST) take. Or makes a Fedora root
-# filesystem with an HTTP/3 curl, for TestCurlHTTP3, and prints its path.
+# filesystem with an HTTP/3 curl, for TestCurlHTTP3, and prints its path;
+# or a Debian one, whose curl uses OpenSSL's own QUIC, for TestOpenSSLQUIC.
 # Or installs the latest Chrome, for TestChromeHTTP3, and prints its binary.
 #
 #   fetch.sh chrome stable|beta <dir>
@@ -13,6 +14,7 @@
 #   fetch.sh envoy x86_64|aarch_64 <dir>
 #   fetch.sh firefox linux64|linux64-aarch64 <dir>
 #   fetch.sh fedora <dir>        (as root, with Docker)
+#   fetch.sh debian <dir>        (as root, with Docker)
 #
 # Progress goes to stderr. When a release's symbols aren't published (yet),
 # the spec has none, so the test only checks that the finder gives one
@@ -142,8 +144,28 @@ fedora)
 	fi
 	echo "$root"
 	;;
+debian)
+	root=$PWD/root
+	# A release, by digest, as for Fedora: apt installs its latest curl and
+	# OpenSSL. Move it on to each new Debian release.
+	container=$(docker create docker.io/library/debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6)
+	mkdir -p "$root"
+	docker export "$container" | tar -C "$root" -xf -
+	docker rm "$container" > /dev/null
+	cp /etc/resolv.conf "$root/etc/resolv.conf"
+	mount -t proc proc "$root/proc"
+	mount --bind /dev "$root/dev"
+	chroot "$root" sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl' >&2
+	chroot "$root" curl -V | head -1 >&2
+	# HTTP/3 without ngtcp2 is OpenSSL's own QUIC.
+	if ! chroot "$root" curl -V | grep -q HTTP3 || chroot "$root" curl -V | grep -q ngtcp2; then
+		echo "::error::Debian's curl no longer does HTTP/3 through OpenSSL's QUIC" >&2
+		exit 1
+	fi
+	echo "$root"
+	;;
 *)
-	echo "usage: fetch.sh chrome|electron|firefox|fedora ..." >&2
+	echo "usage: fetch.sh chrome|electron|firefox|fedora|debian ..." >&2
 	exit 2
 	;;
 esac

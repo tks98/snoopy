@@ -523,7 +523,10 @@ signature finding against real binaries (see
   libraries a long-running process `dlopen`s more than 3 s after its exec.
 - **Not supported:** rustls under tokio with providers other than aws-lc-rs
   and ring (`Reader::read` is inlined into tokio-rustls), QUIC/HTTP/3
-  outside Chromium, Firefox, quinn, ngtcp2 and quic-go, Firefox's QUIC with
+  outside Chromium, Firefox, quinn, ngtcp2, quic-go and OpenSSL's own QUIC,
+  OpenSSL's QUIC in processes not selected with `--comm`, `--pid` or
+  `--container` (libcrypto's cipher functions carry all of a program's
+  symmetric encryption, so they're probed only there), Firefox's QUIC with
   ChaCha20-Poly1305 (which, a spike showed, reaches freebl's HACL* Poly1305
   without going through its exported `ChaCha20Poly1305_Seal`/`Open`/
   `Encrypt`/`Decrypt`, so where to probe is still to be found; Firefox only

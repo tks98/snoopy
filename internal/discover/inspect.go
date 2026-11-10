@@ -137,6 +137,9 @@ func Inspect(path string) (targets []Target, err error) {
 			targets = append(targets, Target{Path: path, Library: rs.lib})
 		}
 	}
+	if opensslQUICCrypto(f) {
+		targets = append(targets, Target{Path: path, Library: OpenSSLQUIC, Note: "for OpenSSL's QUIC"})
+	}
 	var freebl map[string]uint64
 	var freeblErr error
 	if err := guard(func() { freebl, freeblErr = findFreebl(f) }); err != nil {
@@ -177,6 +180,34 @@ func hostMachine() elf.Machine {
 
 // definedFuncs returns the names of the functions a file defines (as
 // opposed to imports) among the ones we look for.
+// opensslQUICCrypto reports whether f is OpenSSL's libcrypto from 3.2 on,
+// whose EVP_CipherInit_ex and EVP_CipherUpdate protect the packets of
+// OpenSSL's own QUIC: it defines both, and symbols of version OPENSSL_3.2.0
+// or later.
+func opensslQUICCrypto(f *elf.File) bool {
+	syms, err := dynamicSymbols(f)
+	if err != nil {
+		return false
+	}
+	var init, update, recent bool
+	for _, s := range syms {
+		if s.Section == elf.SHN_UNDEF {
+			continue
+		}
+		switch s.Name {
+		case "EVP_CipherInit_ex":
+			init = true
+		case "EVP_CipherUpdate":
+			update = true
+		}
+		var major, minor int
+		if n, _ := fmt.Sscanf(s.Version, "OPENSSL_%d.%d", &major, &minor); n == 2 && (major > 3 || major == 3 && minor >= 2) {
+			recent = true
+		}
+	}
+	return init && update && recent
+}
+
 func definedFuncs(f *elf.File) map[string]bool {
 	want := map[string]bool{}
 	for _, rs := range readSymbols {
