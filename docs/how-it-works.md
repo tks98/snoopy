@@ -15,7 +15,7 @@ What snoopy can trace, and how it does it.
 | HTTP/3 over ngtcp2 (curl) | `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt` | In each of ngtcp2's crypto libraries (OpenSSL, GnuTLS, wolfSSL, BoringSSL, quictls). |
 | HTTP/3 through OpenSSL's own QUIC (curl on Debian) | libcrypto's `EVP_CipherInit_ex`, `EVP_CipherUpdate`, `EVP_CipherFinal_ex` | OpenSSL 3.2 and later. Only in the processes selected with `--comm`, `--pid` or `--container`, since all of a program's symmetric encryption goes through those functions. |
 | HTTP/3 over quic-go (Go) | Go's AES-GCM and ChaCha20-Poly1305 `Seal` and `Open` | Only in programs that use quic-go; stripped ones too. |
-| Erlang's `ssl` (Erlang, Elixir) | libcrypto's `EVP_EncryptUpdate`, `EVP_DecryptUpdate`, which its crypto NIF encrypts and decrypts records with | TLS 1.2 and 1.3 records. Only in the processes selected with `--comm`, `--pid` or `--container`, whose program is `beam.smp`. |
+| Erlang's `ssl` (Erlang, Elixir) | libcrypto's `EVP_EncryptUpdate`, `EVP_DecryptUpdate`, which its crypto NIF encrypts and decrypts records with | TLS 1.2 and 1.3 records, through libcrypto or the NIF itself when libcrypto is linked into it. Only in the processes selected with `--comm`, `--pid` or `--container`, whose program is `beam.smp`. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` | Also the copy bundled with Firefox. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | |
@@ -95,7 +95,7 @@ connection isn't missed.
 
 Not supported: rustls under tokio with providers other than aws-lc-rs and
 ring, Erlang's `ssl` in processes not selected with `--comm`, `--pid` or
-`--container`, or with libcrypto linked into its crypto NIF, stripped TLS
+`--container`, stripped TLS
 libraries other than
 BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn, ngtcp2, quic-go and
 OpenSSL's own QUIC (quiche, for example), OpenSSL's QUIC in processes not

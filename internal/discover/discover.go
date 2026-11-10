@@ -629,15 +629,45 @@ func (w *Watcher) Process(pid int) []Target {
 		targets = append(targets, w.inspect(c.path, c.note)...)
 	}
 	// What an Erlang VM's ssl encrypts goes through its libcrypto, which
-	// is a target for that only in Erlang's processes.
+	// is a target for that only in Erlang's processes: libcrypto itself,
+	// or its crypto NIF, if libcrypto is linked into that
+	// (--disable-dynamic-ssl-lib).
 	if isErlang(w.proc, pid) {
 		for _, c := range files {
-			if ok, _ := filepath.Match("libcrypto.so*", filepath.Base(c.path)); ok {
+			name := filepath.Base(c.path)
+			if ok, _ := filepath.Match("libcrypto.so*", name); ok {
 				targets = append(targets, Target{Path: c.path, Library: Erlang, Note: "for Erlang's ssl"})
+			} else if name == "crypto.so" && definesFuncs(c.path, "EVP_EncryptUpdate", "EVP_DecryptUpdate") {
+				targets = append(targets, Target{Path: c.path, Library: Erlang, Note: "Erlang's crypto NIF, with libcrypto linked in"})
 			}
 		}
 	}
 	return targets
+}
+
+// definesFuncs reports whether the ELF file at path exports all of names.
+func definesFuncs(path string, names ...string) bool {
+	f, file, err := openELF(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	syms, err := dynamicSymbols(f)
+	if err != nil {
+		return false
+	}
+	defined := map[string]bool{}
+	for _, s := range syms {
+		if s.Section != elf.SHN_UNDEF && elf.ST_TYPE(s.Info) == elf.STT_FUNC {
+			defined[s.Name] = true
+		}
+	}
+	for _, name := range names {
+		if !defined[name] {
+			return false
+		}
+	}
+	return true
 }
 
 // isErlang reports whether a process is an Erlang VM, whose program is
@@ -947,9 +977,11 @@ func MappedLibraries(maps io.Reader) []Mapping {
 }
 
 // processLibPatterns are libPatterns and libraries looked at only in the
-// processes snoopy is told to trace: libcrypto, for OpenSSL's QUIC (see
-// OpenSSLQUIC), which isn't looked for across the system.
-var processLibPatterns = append(slices.Clone(libPatterns), "libcrypto.so*")
+// processes snoopy is told to trace, which aren't looked for across the
+// system: libcrypto, for OpenSSL's QUIC (see OpenSSLQUIC) and Erlang's ssl
+// (see Erlang), and Erlang's crypto NIF, crypto.so, which may have
+// libcrypto linked into it.
+var processLibPatterns = append(slices.Clone(libPatterns), "libcrypto.so*", "crypto.so")
 
 func isTLSLibraryName(name string) bool {
 	for _, pat := range processLibPatterns {

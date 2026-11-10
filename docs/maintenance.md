@@ -775,6 +775,15 @@ place and without associated data.
   functions, so libcrypto is the `Erlang` target only in a process whose
   program is `beam*` (`Watcher.Process`, `isErlang`), and attached to only
   with `--comm`, `--pid` or `--container`.
+- **libcrypto linked into the NIF:** OTP built with
+  `--disable-dynamic-ssl-lib` has libcrypto in its `crypto.so`, which then
+  exports the functions itself (`definesFuncs`): that's the target. One
+  that only imports them isn't, so it isn't probed for nothing.
+- **Loaded late:** the VM loads its crypto NIF, and with it libcrypto,
+  when it first needs it, so `crypto.so` and `libcrypto.so` are among the
+  names that make the BPF program tell user space a traced process mapped
+  a TLS library (`tls_library_names`), which then attaches to it while its
+  thread is held.
 
 ### How to tell it broke, and how to fix it
 
@@ -785,7 +794,10 @@ place and without associated data.
   encrypts and decrypts (to its dirty I/O threads, say); compare the
   `recvfrom` and `writev` threads with the update calls'.
 - **To test:** `TestErlangSSL` (erlang-base, erlang-ssl and erlang-inets on
-  Ubuntu), for TLS 1.3 and 1.2.
+  Ubuntu), for TLS 1.3 and 1.2; `SNOOPY_TEST_ERL` runs it with another
+  Erlang's `erl`, e.g. one built with `./configure --with-ssl
+  --disable-dynamic-ssl-lib` (static libcrypto from libssl-dev), whose
+  crypto NIF is then what's probed.
 
 ## HTTP/3 over quic-go
 

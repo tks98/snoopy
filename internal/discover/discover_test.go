@@ -823,6 +823,32 @@ func TestIsErlang(t *testing.T) {
 	}
 }
 
+// definesFuncs tells a library that exports functions from one that only
+// uses them, as an Erlang crypto NIF does unless libcrypto is linked in.
+func TestDefinesFuncs(t *testing.T) {
+	var crypto, ssl string
+	for _, dir := range []string{"/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib"} {
+		if found, _ := filepath.Glob(filepath.Join(dir, "libcrypto.so.3")); len(found) > 0 && crypto == "" {
+			crypto = found[0]
+		}
+		if found, _ := filepath.Glob(filepath.Join(dir, "libssl.so.3")); len(found) > 0 && ssl == "" {
+			ssl = found[0]
+		}
+	}
+	if crypto == "" || ssl == "" {
+		t.Skip("no OpenSSL 3 here")
+	}
+	if !definesFuncs(crypto, "EVP_EncryptUpdate", "EVP_DecryptUpdate") {
+		t.Errorf("%s: doesn't define its EVP functions", crypto)
+	}
+	if definesFuncs(crypto, "EVP_EncryptUpdate", "no_such_function") {
+		t.Errorf("%s: defines a function it hasn't", crypto)
+	}
+	if definesFuncs(ssl, "EVP_EncryptUpdate") { // libssl uses it
+		t.Errorf("%s: an imported function taken for a defined one", ssl)
+	}
+}
+
 func TestRustInfoDescribe(t *testing.T) {
 	for _, c := range []struct {
 		ri          RustInfo

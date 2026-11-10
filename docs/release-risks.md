@@ -194,12 +194,13 @@ thing it depends on ships.
   with `EVP_EncryptUpdate` and `EVP_DecryptUpdate`, associated data first;
   the VM receiving and sending a record on the scheduler thread that
   decrypts or encrypts it; and its program being named `beam*`.
-- **Breaks when:** OTP changes how its crypto NIF calls libcrypto, or links
-  libcrypto into the NIF (then it's no longer a separate library to probe).
+- **Breaks when:** OTP changes how its crypto NIF calls libcrypto; or
+  libcrypto is linked into the NIF without exporting its functions (a
+  version script), so there's nothing to probe by name.
 - **How it shows:** nothing captured for an Erlang VM, quietly; or records
   without addresses.
 - **Guarded by:** `TestErlangSSL`, in CI with Ubuntu's Erlang, TLS 1.3 and
-  1.2.
+  1.2; with libcrypto linked into the NIF, by hand (`SNOOPY_TEST_ERL`).
 
 ### HTTP/3 over quic-go
 

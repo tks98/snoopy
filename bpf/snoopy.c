@@ -1401,6 +1401,9 @@ int sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
 static const char tls_library_names[][LIBNAME_MAX] = {
 	"libssl.so", "libgnutls.so", "libnspr4.so", "libfreeblpriv3.so", "libwolfssl.so",
 	"libmbedtls.so", "libs2n.so", "libngtcp2_crypto_", "libnetty_tcnative", "libconscrypt",
+	// For OpenSSL's QUIC and Erlang's ssl (processLibPatterns): Erlang
+	// loads its crypto NIF, and with it libcrypto, when it first needs it.
+	"libcrypto.so", "crypto.so",
 };
 
 static __always_inline bool tls_library_name(const char *name)
