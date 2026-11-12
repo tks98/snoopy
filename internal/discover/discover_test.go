@@ -100,6 +100,24 @@ func buildFixture(t testing.TB, pkg, ldflags string, env ...string) string {
 	return out
 }
 
+// noLinuxCgo says why a cgo program for linux can't be built here, if it
+// can't: elsewhere, the C compiler builds for its own system, and on linux
+// it's the one go uses for cgo (CC, or gcc), which may not be installed.
+func noLinuxCgo() string {
+	if runtime.GOOS != "linux" {
+		return "cgo builds for linux only on linux"
+	}
+	out, err := exec.Command("go", "env", "CC").Output()
+	cc := strings.Fields(string(out))
+	if err != nil || len(cc) == 0 {
+		return "go env CC: no C compiler"
+	}
+	if _, err := exec.LookPath(cc[0]); err != nil {
+		return "no C compiler for cgo: " + err.Error()
+	}
+	return ""
+}
+
 // Stripped binaries are located through .gopclntab. It must agree with the
 // symbol table, also for cgo programs, whose C code precedes Go's in .text.
 func TestPclntabMatchesSymtab(t *testing.T) {
@@ -107,8 +125,11 @@ func TestPclntabMatchesSymtab(t *testing.T) {
 		"amd64": func(t *testing.T) string { return buildGoFixture(t, "amd64", false) },
 		"arm64": func(t *testing.T) string { return buildGoFixture(t, "arm64", false) },
 		"cgo-external": func(t *testing.T) string {
-			if _, err := exec.LookPath("cc"); err != nil {
-				t.Skip("no C compiler")
+			if reason := noLinuxCgo(); reason != "" {
+				if os.Getenv("SNOOPY_TEST_STRICT") == "1" {
+					t.Fatalf("%s (and SNOOPY_TEST_STRICT=1)", reason)
+				}
+				t.Skip(reason)
 			}
 			return buildFixture(t, "./testdata/gotlscgo", "-linkmode=external", "CGO_ENABLED=1")
 		},

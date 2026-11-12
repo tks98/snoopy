@@ -362,6 +362,13 @@ func (t *Tracer) PerProcess() bool {
 	return t.perProcess
 }
 
+// ProcessTargets reports whether the targets for the processes snoopy is
+// told to trace only (discover.OpenSSLQUIC and discover.Erlang) are
+// attached to: when it's told of some, per process or by --pid or --comm.
+func (t *Tracer) ProcessTargets() bool {
+	return t.perProcess || t.opts.PID != 0 || t.opts.Comm != ""
+}
+
 // ResolvesAddresses reports whether socket addresses are read in the kernel.
 // If not (the kernel has no BTF), events carry no addresses and callers have
 // to look them up in /proc, which fails for connections closed by then.
@@ -450,8 +457,7 @@ func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
 	// a program's symmetric encryption: probed only for the processes told
 	// to be traced, not for every program.
 	// And so are they for Erlang's ssl.
-	if (target.Library == discover.OpenSSLQUIC || target.Library == discover.Erlang) &&
-		!t.perProcess && t.opts.PID == 0 && t.opts.Comm == "" {
+	if (target.Library == discover.OpenSSLQUIC || target.Library == discover.Erlang) && !t.ProcessTargets() {
 		return nil, nil
 	}
 	if !t.perProcess {

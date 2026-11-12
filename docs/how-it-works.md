@@ -13,7 +13,7 @@ What snoopy can trace, and how it does it.
 | HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
 | HTTP/3 over quinn (Rust) | the same functions as for rustls's records, below | With rustls's aws-lc-rs and ring providers. |
 | HTTP/3 over ngtcp2 (curl) | `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt` | In each of ngtcp2's crypto libraries (OpenSSL, GnuTLS, wolfSSL, BoringSSL, quictls). |
-| HTTP/3 through OpenSSL's own QUIC (curl on Debian) | libcrypto's `EVP_CipherInit_ex`, `EVP_CipherUpdate`, `EVP_CipherFinal_ex` | OpenSSL 3.2 and later. Only in the processes selected with `--comm`, `--pid` or `--container`, since all of a program's symmetric encryption goes through those functions. |
+| HTTP/3 through OpenSSL's own QUIC (curl on Debian) | libcrypto's `EVP_CipherInit_ex`, `EVP_CipherUpdate`, `EVP_CipherFinal_ex` | OpenSSL 3.2 and later. Only in the processes selected with `--comm`, `--pid` or `--container`, and of those only the ones that use OpenSSL's QUIC (a file they map imports `OSSL_QUIC_client_method`, as Debian's libcurl does), since all of a program's symmetric encryption, its TLS records included, goes through those functions. |
 | HTTP/3 over quic-go (Go) | Go's AES-GCM and ChaCha20-Poly1305 `Seal` and `Open` | Only in programs that use quic-go; stripped ones too. |
 | Erlang's `ssl` (Erlang, Elixir) | libcrypto's `EVP_EncryptUpdate`, `EVP_DecryptUpdate`, which its crypto NIF encrypts and decrypts records with | TLS 1.2 and 1.3 records, through libcrypto or the NIF itself when libcrypto is linked into it. Only in the processes selected with `--comm`, `--pid` or `--container`, whose program is `beam.smp`. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
@@ -99,7 +99,9 @@ ring, Erlang's `ssl` in processes not selected with `--comm`, `--pid` or
 libraries other than
 BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn, ngtcp2, quic-go and
 OpenSSL's own QUIC (quiche, for example), OpenSSL's QUIC in processes not
-selected with `--comm`, `--pid` or `--container`, programs that use OpenSSL only through its BIO layer (e.g.
+selected with `--comm`, `--pid` or `--container`, or in a process that
+maps libcrypto and `dlopen`s what uses OpenSSL's QUIC more than 3 s after
+it starts (see [maintenance.md](maintenance.md#http3-through-openssls-quic-curl-on-debian)), programs that use OpenSSL only through its BIO layer (e.g.
 `openssl s_server -www`), and bodies compressed with a shared dictionary
 (Chrome's `dcb` and `dcz`), which are shown as sent.
 

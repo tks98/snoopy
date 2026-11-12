@@ -40,7 +40,8 @@ const (
 	// OpenSSLQUIC is libcrypto, where OpenSSL's own QUIC (3.2 and later)
 	// encrypts and decrypts its packets. It's attached to only for the
 	// processes snoopy is told to trace, since all of a program's
-	// symmetric encryption goes through the functions probed.
+	// symmetric encryption goes through the functions probed, and of
+	// those only for the ones that use OpenSSL's QUIC (see quicUsers).
 	OpenSSLQUIC
 	// Erlang is libcrypto in an Erlang VM's process, whose ssl encrypts and
 	// decrypts its TLS records through it, in its crypto NIF. Also only for
@@ -218,10 +219,24 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 		}
 	}
 
+	// libcrypto, as found in a process, is an OpenSSLQUIC target only if
+	// the process uses OpenSSL's QUIC; another process may, so the target
+	// is kept until one does. Without --pid or --comm, no process is one
+	// snoopy is told to trace, and it isn't attached to anyway.
+	quic := newQUICUsers()
+	selected := opts.PID > 0 || opts.Comm != ""
+	withheld := map[fileID]Target{}
 	seen := map[fileID]bool{}
 	inspect := func(c candidate, explicit bool) {
 		id, err := idOf(c.path)
-		if err != nil || seen[id] {
+		if err != nil {
+			return
+		}
+		if seen[id] {
+			if t, ok := withheld[id]; ok && c.pid != 0 && selected && quic.process(proc, c.pid) {
+				delete(withheld, id)
+				targets = append(targets, t)
+			}
 			return
 		}
 		seen[id] = true
@@ -243,6 +258,10 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 			}
 			t.Note = joinNotes(t.Note, c.note)
 			t.Deleted = c.deleted
+			if t.Library == OpenSSLQUIC && c.pid != 0 && !(selected && quic.process(proc, c.pid)) {
+				withheld[id] = t
+				continue
+			}
 			targets = append(targets, t)
 		}
 	}
@@ -282,6 +301,13 @@ type Watcher struct {
 	// them are known.
 	roots   *lru[fileID, bool]
 	ownRoot fileID
+	// Which files import OpenSSL's QUIC, and, not per process, the
+	// libcrypto files whose OpenSSLQUIC targets were returned, which are
+	// returned once (they're as many as there are probes).
+	quic         *quicUsers
+	quicReturned map[fileID]bool
+	// noQUIC leaves out OpenSSLQUIC targets (see SkipOpenSSLQUIC).
+	noQUIC bool
 }
 
 // maxSeen bounds the files and root filesystems a Watcher remembers, in
@@ -299,6 +325,9 @@ func NewWatcher(known []Target, perProcess bool) *Watcher {
 		if id, err := idOf(t.Path); err == nil {
 			found, _ := w.lookup(id)
 			w.remember(id, append(found, t))
+			if t.Library == OpenSSLQUIC && !perProcess {
+				w.quicReturned[id] = true
+			}
 		}
 	}
 	if id, err := dirID("/"); err == nil {
@@ -309,8 +338,15 @@ func NewWatcher(known []Target, perProcess bool) *Watcher {
 
 func newWatcher(proc string, perProcess bool) *Watcher {
 	return &Watcher{proc: proc, perProcess: perProcess, attached: map[fileID][]Target{},
-		seen: newLRU[fileID, []Target](maxSeen), roots: newLRU[fileID, bool](maxSeen)}
+		seen: newLRU[fileID, []Target](maxSeen), roots: newLRU[fileID, bool](maxSeen),
+		quic: newQUICUsers(), quicReturned: map[fileID]bool{}}
 }
+
+// SkipOpenSSLQUIC makes the Watcher leave out OpenSSLQUIC targets, and not
+// look for programs using OpenSSL's QUIC: for when snoopy isn't told which
+// processes to trace, and they wouldn't be attached to. Call it before
+// the Watcher is used.
+func (w *Watcher) SkipOpenSSLQUIC() { w.noQUIC = true }
 
 // lookup returns what a file inspected before has. w.mu must be held, or
 // w not yet shared.
@@ -323,7 +359,9 @@ func (w *Watcher) lookup(id fileID) ([]Target, bool) {
 
 // remember records what a file has. w.mu must be held, or w not yet shared.
 func (w *Watcher) remember(id fileID, found []Target) {
-	if !w.perProcess && slices.ContainsFunc(found, func(t Target) bool { return t.Problem == nil }) {
+	// An OpenSSLQUIC target is returned once at most (quicReturned), and
+	// maybe never: libcrypto alone is kept as most files are.
+	if !w.perProcess && slices.ContainsFunc(found, func(t Target) bool { return t.Problem == nil && t.Library != OpenSSLQUIC }) {
 		w.attached[id] = found
 		return
 	}
@@ -375,7 +413,9 @@ func (w *Watcher) Known(pid int) bool {
 // about that root: a process in a container or chroot that has only just
 // started hasn't mapped its libraries yet, and may be done before the next
 // look at its mappings. Per process, it returns them every time, so a
-// library the process loads later is already attached to for it.
+// library the process loads later is already attached to for it. It
+// returns no OpenSSLQUIC targets: whether libcrypto is one for a process
+// depends on what the process loads, which Process and Needed look at.
 func (w *Watcher) Root(pid int) []Target {
 	root := filepath.Join(w.proc, strconv.Itoa(pid), "root")
 	id, err := dirID(root)
@@ -437,7 +477,7 @@ const (
 // each file's RUNPATH or RPATH, and the usual library directories, all in
 // the process's root filesystem. Libraries loaded with dlopen aren't among
 // them (Root finds those in the usual directories).
-func (w *Watcher) Needed(pid int) []Target {
+func (w *Watcher) Needed(pid int) (targets []Target) {
 	dir := filepath.Join(w.proc, strconv.Itoa(pid))
 	root := filepath.Join(dir, "root")
 	exe, err := os.Readlink(filepath.Join(dir, "exe"))
@@ -454,7 +494,14 @@ func (w *Watcher) Needed(pid int) []Target {
 	// Names and search paths all come from the process and its files, so
 	// they're only ever looked up in its root, as paths in it (see inRoot),
 	// and never as globs.
-	var targets []Target
+	// libcrypto is an OpenSSLQUIC target if one of the files the process
+	// is about to load uses OpenSSL's QUIC (see Process).
+	var files, crypto []string
+	defer func() {
+		if len(crypto) > 0 && w.quic.anyOf(files) {
+			targets = append(targets, w.quicTargets(crypto, "")...)
+		}
+	}()
 	visited := map[string]bool{}
 	lookups := 0
 	queue := []string{exe} // paths in the process's root
@@ -477,8 +524,12 @@ func (w *Watcher) Needed(pid int) []Target {
 			continue
 		}
 		visited[cur] = true
+		files = append(files, inRoot(root, cur))
 		if cur != exe && isTLSLibraryName(filepath.Base(cur)) {
 			targets = append(targets, w.inspect(inRoot(root, cur), "")...)
+			if isLibcrypto(filepath.Base(cur)) && w.quicPending(inRoot(root, cur)) {
+				crypto = append(crypto, inRoot(root, cur))
+			}
 		}
 		needed, runpath, err := dependencies(inRoot(root, cur))
 		if err != nil {
@@ -570,18 +621,31 @@ func findLibrary(root, name string, dirs []string) string {
 }
 
 // inspect returns the targets in a file at path, with note added to theirs,
-// unless it was seen before; per process, those it had then.
+// unless it was seen before; per process, those it had then. OpenSSLQUIC
+// targets are left out: they depend on the process (see quicTargets).
 func (w *Watcher) inspect(path, note string) []Target {
+	_, found, seen, ok := w.examine(path)
+	if !ok || seen && !w.perProcess {
+		return nil
+	}
+	found = slices.DeleteFunc(found, func(t Target) bool { return t.Library == OpenSSLQUIC })
+	for i := range found {
+		found[i].Note = joinNotes(found[i].Note, note)
+	}
+	return found
+}
+
+// examine returns the identity of the file at path and its targets, by
+// that path, and whether it was seen before. ok is false if it can't be
+// looked at.
+func (w *Watcher) examine(path string) (id fileID, found []Target, seen, ok bool) {
 	id, err := idOf(path)
 	if err != nil {
-		return nil
+		return id, nil, false, false
 	}
 	w.mu.Lock()
-	found, seen := w.lookup(id)
+	found, seen = w.lookup(id)
 	w.mu.Unlock()
-	if seen && !w.perProcess {
-		return nil
-	}
 	if seen {
 		// The same file, but reached by this process's path: another's may
 		// be gone with it.
@@ -589,19 +653,68 @@ func (w *Watcher) inspect(path, note string) []Target {
 		for i := range found {
 			found[i].Path = path
 		}
-	} else {
-		found, err = Inspect(path)
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
-			return nil // gone with the process, or not ours to see; maybe next time
+		return id, found, true, true
+	}
+	found, err = Inspect(path)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		return id, nil, false, false // gone with the process, or not ours to see; maybe next time
+	}
+	w.mu.Lock()
+	w.remember(id, slices.Clone(found))
+	w.mu.Unlock()
+	return id, found, false, true
+}
+
+// quicTargets returns the OpenSSLQUIC targets among the libcrypto files at
+// paths, of a process that uses OpenSSL's QUIC, with note added; not per
+// process, only those not returned before.
+func (w *Watcher) quicTargets(paths []string, note string) []Target {
+	var targets []Target
+	for _, path := range paths {
+		id, found, _, ok := w.examine(path)
+		if !ok {
+			continue
 		}
-		w.mu.Lock()
-		w.remember(id, slices.Clone(found))
-		w.mu.Unlock()
+		for _, t := range found {
+			if t.Library != OpenSSLQUIC {
+				continue
+			}
+			if !w.perProcess {
+				w.mu.Lock()
+				returned := w.quicReturned[id]
+				w.quicReturned[id] = true
+				w.mu.Unlock()
+				if returned {
+					continue
+				}
+			}
+			t.Note = joinNotes(t.Note, note)
+			targets = append(targets, t)
+		}
 	}
-	for i := range found {
-		found[i].Note = joinNotes(found[i].Note, note)
+	return targets
+}
+
+// quicPending reports whether the file at path has an OpenSSLQUIC target
+// that quicTargets would return.
+func (w *Watcher) quicPending(path string) bool {
+	if w.noQUIC {
+		return false
 	}
-	return found
+	id, found, _, ok := w.examine(path)
+	if !ok || !slices.ContainsFunc(found, func(t Target) bool { return t.Library == OpenSSLQUIC }) {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.perProcess || !w.quicReturned[id]
+}
+
+// isLibcrypto reports whether a file name is libcrypto's, the only one
+// OpenSSLQUIC targets are in.
+func isLibcrypto(name string) bool {
+	ok, _ := filepath.Match("libcrypto.so*", name)
+	return ok
 }
 
 func dirID(path string) (fileID, error) {
@@ -625,8 +738,26 @@ func (w *Watcher) Process(pid int) []Target {
 		return nil
 	}
 	var targets []Target
+	var crypto []candidate
 	for _, c := range files {
 		targets = append(targets, w.inspect(c.path, c.note)...)
+		if isLibcrypto(c.name()) {
+			crypto = append(crypto, c)
+		}
+	}
+	// libcrypto is attached to for OpenSSL's QUIC only in a process that
+	// uses it, which is told by its importing OpenSSL's QUIC methods (curl
+	// does, in libcurl): others encrypt their TLS records through the
+	// same functions, for nothing. A library that does and is loaded after
+	// libcrypto isn't seen unless the process is looked at again, which it
+	// is when it loads a TLS library.
+	// Looking costs reading its mappings, so it's done only if a libcrypto
+	// has a target that would be returned.
+	crypto = slices.DeleteFunc(crypto, func(c candidate) bool { return !w.quicPending(c.path) })
+	if len(crypto) > 0 && w.quic.process(w.proc, pid) {
+		for _, c := range crypto {
+			targets = append(targets, w.quicTargets([]string{c.path}, c.note)...)
+		}
 	}
 	// What an Erlang VM's ssl encrypts goes through its libcrypto, which
 	// is a target for that only in Erlang's processes: libcrypto itself,
@@ -783,6 +914,15 @@ type candidate struct {
 	path    string
 	note    string
 	deleted string // the name the file had, if it was deleted
+	pid     int    // the process it was found in, if any
+}
+
+// name returns the file's name, as the process using it knows it.
+func (c candidate) name() string {
+	if c.deleted != "" {
+		return filepath.Base(c.deleted)
+	}
+	return filepath.Base(c.path)
 }
 
 const deletedSuffix = " (deleted)"
@@ -801,27 +941,11 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 	}
 	defer maps.Close()
 
-	// Files are reached through the process's root, but a chrooted
-	// process's maps and exe name them by their path from ours.
-	root, _ := os.Readlink(filepath.Join(dir, "root"))
-	trimRoot := func(path string) string {
-		if root != "" && root != "/" && strings.HasPrefix(path, root+"/") {
-			return strings.TrimPrefix(path, root)
-		}
-		return path
-	}
 	libs := MappedLibraries(maps)
 	out := make([]candidate, 0, len(libs)+1)
+	trimRoot := chrootTrimmer(dir)
 	for _, lib := range libs {
-		if lib.Deleted {
-			out = append(out, candidate{
-				path:    filepath.Join(dir, "map_files", lib.Range),
-				note:    "deleted " + lib.Path,
-				deleted: lib.Path,
-			})
-		} else {
-			out = append(out, candidate{path: inRoot(filepath.Join(dir, "root"), trimRoot(lib.Path))})
-		}
+		out = append(out, mappedCandidate(dir, pid, lib, trimRoot))
 	}
 
 	exe, err := os.Readlink(filepath.Join(dir, "exe"))
@@ -832,11 +956,40 @@ func processFiles(proc string, pid int) ([]candidate, error) {
 			path:    filepath.Join(dir, "exe"),
 			note:    "deleted " + strings.TrimSuffix(exe, deletedSuffix),
 			deleted: strings.TrimSuffix(exe, deletedSuffix),
+			pid:     pid,
 		})
 	default:
-		out = append(out, candidate{path: inRoot(filepath.Join(dir, "root"), trimRoot(exe))})
+		out = append(out, candidate{path: inRoot(filepath.Join(dir, "root"), trimRoot(exe)), pid: pid})
 	}
 	return out, nil
+}
+
+// chrootTrimmer returns a function that turns a path a process's maps or
+// exe name a file by into its path in the process's root: files are
+// reached through the root, but a chrooted process's maps and exe name
+// them by their path from ours. dir is the process's /proc directory.
+func chrootTrimmer(dir string) func(string) string {
+	root, _ := os.Readlink(filepath.Join(dir, "root"))
+	return func(path string) string {
+		if root != "" && root != "/" && strings.HasPrefix(path, root+"/") {
+			return strings.TrimPrefix(path, root)
+		}
+		return path
+	}
+}
+
+// mappedCandidate returns how a file a process maps is reached: through
+// its root, or, if it was deleted, through its map_files.
+func mappedCandidate(dir string, pid int, m Mapping, trimRoot func(string) string) candidate {
+	if m.Deleted {
+		return candidate{
+			path:    filepath.Join(dir, "map_files", m.Range),
+			note:    "deleted " + m.Path,
+			deleted: m.Path,
+			pid:     pid,
+		}
+	}
+	return candidate{path: inRoot(filepath.Join(dir, "root"), trimRoot(m.Path)), pid: pid}
 }
 
 // Descendants returns a process's ID and those of the processes it started,
@@ -954,10 +1107,16 @@ type Mapping struct {
 // MappedLibraries parses a /proc/<pid>/maps file and returns the distinct
 // mapped files whose names look like supported TLS libraries.
 func MappedLibraries(maps io.Reader) []Mapping {
+	return mappedFiles(maps, isTLSLibraryName, -1)
+}
+
+// mappedFiles parses a /proc/<pid>/maps file and returns the first max
+// (if not negative) distinct mapped files whose names keep accepts.
+func mappedFiles(maps io.Reader, keep func(name string) bool, max int) []Mapping {
 	seen := map[string]bool{}
 	var out []Mapping
 	sc := bufio.NewScanner(maps)
-	for sc.Scan() {
+	for sc.Scan() && len(out) != max {
 		// address perms offset dev inode pathname
 		fields := strings.Fields(sc.Text())
 		if len(fields) < 6 || !strings.HasPrefix(fields[5], "/") {
@@ -968,7 +1127,7 @@ func MappedLibraries(maps io.Reader) []Mapping {
 			continue
 		}
 		path, deleted := strings.CutSuffix(name, deletedSuffix)
-		if isTLSLibraryName(filepath.Base(path)) {
+		if keep(filepath.Base(path)) {
 			seen[name] = true
 			out = append(out, Mapping{Path: path, Range: fields[0], Deleted: deleted})
 		}

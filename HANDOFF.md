@@ -11,14 +11,14 @@ used. [AGENTS.md](AGENTS.md) is the short list for coding agents.
 
 ## Status
 
-Released: v2.9.1, the latest of the v2 releases (the first was v2.0.0). A
+Released: v2.11.3, the latest of the v2 releases (the first was v2.0.0). A
 `v*` tag runs `release.yml`: GoReleaser publishes the snoopy archives
 (linux amd64 and arm64, with the Java agent's jars), .deb, .rpm and .apk
 packages, kubectl-snoopy's for Linux, macOS and Windows, an SBOM for each
 archive, the jars, the krew manifest,
 `checksums.txt` and the image `ghcr.io/tks98/snoopy`, and the workflow
 attests the build provenance of `checksums.txt`'s files and of the image
-(from the release after v2.9.1). `go install
+(since v2.10.0). `go install
 github.com/tks98/snoopy/v2@latest` installs it too.
 
 What CI checks, and when:
@@ -28,13 +28,13 @@ What CI checks, and when:
 | gofmt, vet, golangci-lint, unit and race tests, amd64 and arm64 builds, BPF objects and the embedded Java agent's jars up to date (`ci.yml`) | Each pull request |
 | Known vulnerabilities, none allowed, reachable or not: govulncheck on both modules and their release-built binaries, OSV-Scanner on every lockfile (test programs' too), and the Java agent's ASM against OSV (`vulnscan.yml`) | Each pull request, and daily |
 | CodeQL on the Go code and the workflows (`codeql.yml`) | Each pull request, and weekly |
-| Integration tests on the runners' kernels, x86_64 and arm64, every C client including s2n-tls (built from source), with `SNOOPY_TEST_STRICT=1` so a missing client fails, run twice: attaching through uprobe_multi links, and a link per probe as older kernels do (`ci.yml`) | Each pull request |
+| Integration tests on the runners' kernels, x86_64 and arm64, every C client including s2n-tls (built from source), and Erlang's `ssl`, with `SNOOPY_TEST_STRICT=1` so a missing client fails, run twice: attaching through uprobe_multi links, and a link per probe as older kernels do (`ci.yml`) | Each pull request |
 | `TestJSSE` on JDK 17, 21 and 25, x86_64 and arm64 (`ci.yml`) | Each pull request |
 | The kubectl plugin, and a kind cluster end to end (`kubectl-snoopy.yml`) | Each pull request |
 | Every BPF program loads under 5.10, 5.15, 6.1, 6.6 and 6.12, in QEMU, x86_64 and arm64 (`loadcheck.yml`) | Changes to the BPF code or how it's loaded |
 | A snapshot release: GoReleaser's config, the image, krew installing the plugin, the packages installing on Ubuntu, Fedora and Alpine, reproducible jars and archives (`release-check.yml`) | Changes to the release's configuration |
 | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, x86_64 and arm64 (`rust.yml`) | Weekly, and changes to those clients |
-| Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, Chrome stable and beta capturing HTTP/3 end to end, and Fedora's curl over HTTP/3 (`canary.yml`) | Weekly |
+| Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, Chrome stable and beta capturing HTTP/3 end to end (`TestChromeHTTP3`), Fedora's curl over HTTP/3 (`TestCurlHTTP3`), and Debian's through OpenSSL's QUIC (`TestOpenSSLQUIC`) (`canary.yml`) | Weekly, and changes to the canary |
 | Overhead (`benchmark.yml`, `docs/benchmark/`) | By hand; results in [docs/performance.md](docs/performance.md) |
 
 Not in CI: the integration tests on 5.10 to 6.12, which took too long
@@ -526,7 +526,9 @@ signature finding against real binaries (see
   outside Chromium, Firefox, quinn, ngtcp2, quic-go and OpenSSL's own QUIC,
   OpenSSL's QUIC in processes not selected with `--comm`, `--pid` or
   `--container` (libcrypto's cipher functions carry all of a program's
-  symmetric encryption, so they're probed only there), Firefox's QUIC with
+  symmetric encryption, so they're probed only there, and only in those
+  that import OpenSSL's QUIC methods; one `dlopen`ed late is missed, see
+  docs/maintenance.md), Firefox's QUIC with
   ChaCha20-Poly1305 (which, a spike showed, reaches freebl's HACL* Poly1305
   without going through its exported `ChaCha20Poly1305_Seal`/`Open`/
   `Encrypt`/`Decrypt`, so where to probe is still to be found; Firefox only
@@ -580,9 +582,6 @@ signature finding against real binaries (see
   - An `--sslkeylog` mode.
   - A flag for the ring buffer size (`tracer.Options.RingBufferSize` exists,
     but there's no CLI flag).
-- **Possible cleanup:** `internal/discover`'s cgo-fixture test tries to build
-  for linux with `cc` when one exists, so it fails if ever run on macOS.
-  Skip it unless `runtime.GOOS == "linux"`.
 
 ## Things learned about the environment
 
