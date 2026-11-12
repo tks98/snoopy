@@ -258,7 +258,7 @@ func Find(opts Options) (targets []Target, warnings []error, err error) {
 			}
 			t.Note = joinNotes(t.Note, c.note)
 			t.Deleted = c.deleted
-			if t.Library == OpenSSLQUIC && c.pid != 0 && !(selected && quic.process(proc, c.pid)) {
+			if t.Library == OpenSSLQUIC && c.pid != 0 && (!selected || !quic.process(proc, c.pid)) {
 				withheld[id] = t
 				continue
 			}
