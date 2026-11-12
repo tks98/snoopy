@@ -332,16 +332,16 @@ it's likely to matter.
   an `SSLSocket` write or an engine call that throws after moving some
   bytes captures nothing of it, and nothing says bytes are missing. The
   plan's loss and discontinuity policy isn't built.
-- **The agent's own losses aren't reported.** It counts frames it couldn't
-  write, and numbers every frame, but user space doesn't check the numbers
-  or show the count, so a gap is silent (the ring buffer's own losses are
-  reported as for any library).
+- **The agent's own losses aren't reported.** It numbers each
+  connection's frames, but user space doesn't check the numbers, and a
+  frame it couldn't write isn't counted anywhere, so a gap is silent (the
+  ring buffer's own losses are reported as for any library).
 - **Order between threads on one connection.** A connection's frames are
   written in order, but the hook runs after JSSE has let go of its own
   lock, so two threads calling `wrap` on the same engine one right after
   the other could have their frames swap. HttpClient and the JDK's server
-  don't do that; the frames' sequence numbers could fix it if something
-  does.
+  don't do that. The frames' sequence numbers can't show it: they're
+  given as the frames are written, after the swap.
 - **SSLEngine has no addresses.** Its events have no socket, so `--host` and
   `--port` don't match them; that's HttpClient, the JDK's HTTPS server,
   Netty without tcnative and most servers. Tying an engine to its channel
