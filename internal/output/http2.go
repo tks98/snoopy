@@ -19,7 +19,11 @@ type http2Frame struct {
 	Length    int      // the frame's payload length
 	Flags     []string // e.g. END_STREAM
 	Continued bool     // more of a DATA frame that started in an earlier event
-	Data      []byte   // DATA payload in this event (padding included)
+	// EndsStream is set on what ends its stream: the rest of an END_STREAM
+	// DATA frame's payload, which may come in later events than its header,
+	// or the frame completing a header block whose HEADERS had END_STREAM.
+	EndsStream bool
+	Data       []byte // DATA payload in this event (padding included)
 	// Headers is the decoded header block, on the HEADERS, PUSH_PROMISE or
 	// CONTINUATION frame that completes it.
 	Headers []hpack.HeaderField
@@ -374,6 +378,11 @@ func (d *http2Dir) add(data []byte, missing int, pool *bodyPool) ([]http2Frame, 
 				if d.dataLeft == 0 && d.data.endStream {
 					delete(d.bodies, d.data.stream)
 					delete(d.infos, d.data.stream)
+					if n := len(frames); n > 0 && frames[n-1].Stream == d.data.stream {
+						frames[n-1].EndsStream = true
+					} else {
+						frames = append(frames, http2Frame{Type: "DATA", Stream: d.data.stream, Continued: true, EndsStream: true})
+					}
 				}
 				return frames, nil
 			}
@@ -453,6 +462,7 @@ func (d *http2Dir) dataPiece(f *http2Frame) {
 		delete(d.infos, stream)
 	}
 	f.Body = decodeBody(dec, body, last)
+	f.EndsStream = last
 }
 
 // info returns what's known about a stream's body, starting to follow it if
@@ -522,6 +532,7 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 	if flags&endHeaders == 0 {
 		return nil
 	}
+	f.EndsStream = d.blockEndStream
 	if d.dec == nil {
 		d.block = d.block[:0]
 		f.HeadersLost = true

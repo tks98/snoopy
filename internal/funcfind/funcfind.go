@@ -11,9 +11,9 @@
 //
 // x86-64 and arm64 are supported. Functions start at direct call targets
 // (with a frame pointer prologue, on x86-64), so functions only ever called
-// indirectly aren't found; an x86-64 binary built without frame pointers
-// has its functions start where its table of their unwind information
-// (.eh_frame_hdr) says.
+// indirectly are found only with IndirectFuncAt, by their entry; an x86-64
+// binary built without frame pointers has its functions start where its
+// table of their unwind information (.eh_frame_hdr) says.
 package funcfind
 
 import (
@@ -206,20 +206,33 @@ func (b *Binary) isStart(a uint64) bool {
 // end of the one before goes: that includes functions that aren't called
 // directly, where they're recognizable.
 func (b *Binary) isBoundary(a uint64) bool {
-	return b.isStart(a) || b.arm64 && b.arm64Entry(a)
+	return b.isStart(a) || b.arm64 && b.arm64Entry(a) || !b.arm64 && b.x86Entry(a)
 }
 
 // FuncAt returns the function containing the instruction at pc.
 func (b *Binary) FuncAt(pc uint64) (*Func, bool) {
+	return b.funcAt(pc, b.isStart)
+}
+
+// IndirectFuncAt is FuncAt for code that may be in a function only ever
+// called through a pointer, like the methods in a table of them, which
+// starts where its entry is recognizable instead (see isBoundary).
+func (b *Binary) IndirectFuncAt(pc uint64) (*Func, bool) {
+	return b.funcAt(pc, b.isBoundary)
+}
+
+// funcAt returns the function containing pc, which starts where isStart
+// says.
+func (b *Binary) funcAt(pc uint64, isStart func(uint64) bool) (*Func, bool) {
 	if b.useFDEs() {
 		return b.fdeFuncAt(pc)
 	}
 	align := b.align()
 	start := pc &^ (align - 1)
-	for start > b.textAddr && !b.isStart(start) && pc-start < maxFuncSize {
+	for start > b.textAddr && !isStart(start) && pc-start < maxFuncSize {
 		start -= align
 	}
-	if !b.isStart(start) {
+	if !isStart(start) {
 		return nil, false
 	}
 	end := start + align

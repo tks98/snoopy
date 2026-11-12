@@ -229,7 +229,9 @@ func New(opts Options) (*Tracer, error) {
 	if err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
-			return nil, fmt.Errorf("the kernel's BPF verifier rejected snoopy's program: %+v", ve)
+			// The error says which program, and the verifier's last words;
+			// the whole log follows, on lines of its own.
+			return nil, fmt.Errorf("the kernel's BPF verifier rejected snoopy's program: %v; its log:\n%+v", err, ve)
 		}
 		return nil, permissionHint(fmt.Errorf("load BPF program: %w", err))
 	}
@@ -444,6 +446,14 @@ type cProbe struct {
 // the names it did the first time. Attaching to a file attached to for every
 // process does nothing and returns none.
 func (t *Tracer) Attach(target discover.Target, pid int) ([]string, error) {
+	// libcrypto's cipher functions, for OpenSSL's QUIC, are called for all of
+	// a program's symmetric encryption: probed only for the processes told
+	// to be traced, not for every program.
+	// And so are they for Erlang's ssl.
+	if (target.Library == discover.OpenSSLQUIC || target.Library == discover.Erlang) &&
+		!t.perProcess && t.opts.PID == 0 && t.opts.Comm == "" {
+		return nil, nil
+	}
 	if !t.perProcess {
 		pid = 0
 	}
@@ -846,6 +856,9 @@ func (t *Tracer) attach(target discover.Target, fd, pid int) (attached []string,
 			// BoringSSL's packet encryption for QUIC (HTTP/3).
 			{"EVP_AEAD_CTX_seal", t.objs.QuicSealEnter, true},
 			{"EVP_AEAD_CTX_open", t.objs.QuicOpenEnter, false},
+			// What open calls, and where Chrome 157 decrypts without it.
+			{"aead_aes_gcm_openv_detached", t.objs.QuicOpenvEnter, false},
+			{"chacha20_poly1305_openv_detached", t.objs.QuicOpenvEnter, false},
 		}
 	case discover.GnuTLS:
 		probes = []cProbe{
@@ -880,6 +893,17 @@ func (t *Tracer) attach(target discover.Target, fd, pid int) (attached []string,
 		probes = []cProbe{
 			{"s2n_recv", t.objs.S2nRecvEnter, false},
 			{"s2n_send", t.objs.S2nSendEnter, false},
+		}
+	case discover.OpenSSLQUIC:
+		probes = []cProbe{
+			{"EVP_CipherInit_ex", t.objs.OsslCipherInitEnter, true},
+			{"EVP_CipherUpdate", t.objs.OsslCipherUpdateEnter, false},
+			{"EVP_CipherFinal_ex", t.objs.OsslCipherFinalEnter, true},
+		}
+	case discover.Erlang:
+		probes = []cProbe{
+			{"EVP_EncryptUpdate", t.objs.ErlEncryptUpdateEnter, true},
+			{"EVP_DecryptUpdate", t.objs.ErlDecryptUpdateEnter, false},
 		}
 	case discover.NGTCP2:
 		probes = []cProbe{

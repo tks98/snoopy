@@ -34,7 +34,7 @@ What CI checks, and when:
 | Every BPF program loads under 5.10, 5.15, 6.1, 6.6 and 6.12, in QEMU, x86_64 and arm64 (`loadcheck.yml`) | Changes to the BPF code or how it's loaded |
 | A snapshot release: GoReleaser's config, the image, krew installing the plugin, the packages installing on Ubuntu, Fedora and Alpine, reproducible jars and archives (`release-check.yml`) | Changes to the release's configuration |
 | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, x86_64 and arm64 (`rust.yml`) | Weekly, and changes to those clients |
-| Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, and Fedora's curl over HTTP/3 (`canary.yml`) | Weekly |
+| Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, Chrome stable and beta capturing HTTP/3 end to end, and Fedora's curl over HTTP/3 (`canary.yml`) | Weekly |
 | Overhead (`benchmark.yml`, `docs/benchmark/`) | By hand; results in [docs/performance.md](docs/performance.md) |
 
 Not in CI: the integration tests on 5.10 to 6.12, which took too long
@@ -47,7 +47,8 @@ the recipes).
 
 1. **Guard against browser releases.** The rest of the list in
    [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it); the
-   weekly canary covers finding them by signature, not capturing.
+   weekly canary covers finding them by signature, and capturing for
+   Chrome's HTTP/3 (`TestChromeHTTP3`), not yet for Electron or Firefox.
 
 ## Working on it from a Mac
 
@@ -61,7 +62,7 @@ compile for darwin, and `go test ./...` fails on macOS. Work inside a Linux VM:
 - In the VM, install Go 1.26+ and run:
 
   ```bash
-  sudo apt-get install -y clang-18 llvm-18 curl python3 gnutls-bin libnss3-dev pkg-config qemu-system-x86 iproute2
+  sudo apt-get install -y clang-18 llvm-18 curl python3 gnutls-bin libnss3-dev pkg-config qemu-system-x86 iproute2 erlang-base erlang-ssl erlang-inets
   ```
 
 - Editing on the Mac and building, testing and running in the VM against the
@@ -97,7 +98,7 @@ sudo ./snoopy --verbose    # try it
 ```
 
 The integration tests skip clients that aren't installed: curl, python3,
-gnutls-cli, and cc with libnss3-dev for the NSS client in
+gnutls-cli, erl (erlang-base, erlang-ssl, erlang-inets), and cc with libnss3-dev for the NSS client in
 `internal/tracer/testdata`, or with `SNOOPY_TEST_STRICT=1` (CI) fail
 instead. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
 and quinn clients with cargo, and `SNOOPY_TEST_CURL_HTTP3` runs curl's HTTP/3
@@ -522,7 +523,10 @@ signature finding against real binaries (see
   libraries a long-running process `dlopen`s more than 3 s after its exec.
 - **Not supported:** rustls under tokio with providers other than aws-lc-rs
   and ring (`Reader::read` is inlined into tokio-rustls), QUIC/HTTP/3
-  outside Chromium, Firefox, quinn, ngtcp2 and quic-go, Firefox's QUIC with
+  outside Chromium, Firefox, quinn, ngtcp2, quic-go and OpenSSL's own QUIC,
+  OpenSSL's QUIC in processes not selected with `--comm`, `--pid` or
+  `--container` (libcrypto's cipher functions carry all of a program's
+  symmetric encryption, so they're probed only there), Firefox's QUIC with
   ChaCha20-Poly1305 (which, a spike showed, reaches freebl's HACL* Poly1305
   without going through its exported `ChaCha20Poly1305_Seal`/`Open`/
   `Encrypt`/`Decrypt`, so where to probe is still to be found; Firefox only

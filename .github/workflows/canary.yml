@@ -50,6 +50,34 @@ jobs:
         env:
           SNOOPY_BORINGSSL_TEST: ${{ steps.fetch.outputs.spec }}
 
+  chrome-http3:
+    name: HTTP/3 in Chrome ${{ matrix.variant }}, end to end
+    # The boringssl job checks that Chrome's functions are found. This checks
+    # that its QUIC packets pass through them: Chrome 157 inlined
+    # EVP_AEAD_CTX_open into its QUIC decryption, and snoopy showed requests
+    # without their responses, while the signature check still passed.
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [stable, beta]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install Chrome
+        id: chrome
+        run: echo "binary=$(sudo .github/canary/fetch.sh chrome-install ${{ matrix.variant }} "$RUNNER_TEMP/chrome")" >> "$GITHUB_OUTPUT"
+      - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      - name: Run (as root)
+        working-directory: internal/tracer
+        # Chrome loads a page from the test's own server; its own background
+        # traffic shows only as packet headers when a check fails (see
+        # AGENTS.md).
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "SNOOPY_TEST_CHROME=${{ steps.chrome.outputs.binary }}" ./tracer.test -test.v -test.run '^TestChromeHTTP3$' -test.timeout 10m
   freebl:
     name: freebl in Firefox ${{ matrix.variant }}
     strategy:
@@ -98,3 +126,26 @@ jobs:
         # curl only talks to the test's own server, so the output is safe to
         # show (see AGENTS.md).
         run: sudo env "PATH=$PATH" "HOME=$HOME" "SNOOPY_TEST_CURL_HTTP3=${{ steps.fedora.outputs.root }}" ./tracer.test -test.v -test.run TestCurlHTTP3 -test.timeout 15m
+  openssl-quic:
+    name: curl's HTTP/3 through OpenSSL's QUIC, on Debian (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Make a Debian root filesystem
+        id: debian
+        run: echo "root=$(sudo .github/canary/fetch.sh debian "$RUNNER_TEMP/debian")" >> "$GITHUB_OUTPUT"
+      - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      - name: Run (as root)
+        working-directory: internal/tracer
+        # curl only talks to the test's own server, so the output is safe to
+        # show (see AGENTS.md).
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "SNOOPY_TEST_OPENSSL_QUIC=${{ steps.debian.outputs.root }}" ./tracer.test -test.v -test.run '^TestOpenSSLQUIC$' -test.timeout 15m

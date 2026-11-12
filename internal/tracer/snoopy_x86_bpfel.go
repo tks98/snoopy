@@ -67,6 +67,19 @@ type snoopyDepthKey struct {
 	G      uint64
 }
 
+type snoopyErlKey struct {
+	_    structs.HostLayout
+	Tgid uint64
+	Ctx  uint64
+}
+
+type snoopyErlRecord struct {
+	_     structs.HostLayout
+	Ad    uint64
+	AdLen uint32
+	_     [4]byte
+}
+
 type snoopyEventHeader struct {
 	_             structs.HostLayout
 	TimestampNs   uint64
@@ -106,6 +119,24 @@ type snoopyJavaSession struct {
 	Nonce uint64
 	Fd    int32
 	Pad   uint32
+}
+
+type snoopyOsslCipher struct {
+	_       structs.HostLayout
+	Ad      uint64
+	AdLen   uint32
+	Enc     uint8
+	Sending uint8
+	_       [2]byte
+}
+
+type snoopyOsslPacket struct {
+	_       structs.HostLayout
+	StartNs uint64
+	Ad      uint64
+	AdLen   uint32
+	Len     uint32
+	Data    [4096]uint8
 }
 
 type snoopyQuicProc struct {
@@ -148,11 +179,16 @@ const (
 	snoopyMapCallDepth              = "call_depth"
 	snoopyMapConnInfos              = "conn_infos"
 	snoopyMapCounters               = "counters"
+	snoopyMapErlCiphers             = "erl_ciphers"
 	snoopyMapEvents                 = "events"
 	snoopyMapExecs                  = "execs"
 	snoopyMapIoThreads              = "io_threads"
 	snoopyMapJavaSessions           = "java_sessions"
 	snoopyMapLastWakeup             = "last_wakeup"
+	snoopyMapOsslCiphers            = "ossl_ciphers"
+	snoopyMapOsslPacketZero         = "ossl_packet_zero"
+	snoopyMapOsslPackets            = "ossl_packets"
+	snoopyMapOsslQuicTgids          = "ossl_quic_tgids"
 	snoopyMapQuicProcs              = "quic_procs"
 	snoopyMapQuicTraffic            = "quic_traffic"
 	snoopyMapRecvBufs               = "recv_bufs"
@@ -168,6 +204,8 @@ const (
 	snoopyProgAesAeadEnter          = "aes_aead_enter"
 	snoopyProgAesCreateEnter        = "aes_create_enter"
 	snoopyProgAesCreateReturn       = "aes_create_return"
+	snoopyProgErlDecryptUpdateEnter = "erl_decrypt_update_enter"
+	snoopyProgErlEncryptUpdateEnter = "erl_encrypt_update_enter"
 	snoopyProgGnutlsRecordRecvEnter = "gnutls_record_recv_enter"
 	snoopyProgGnutlsRecordSendEnter = "gnutls_record_send_enter"
 	snoopyProgGoAeadOpenEnter       = "go_aead_open_enter"
@@ -180,7 +218,11 @@ const (
 	snoopyProgMbedtlsSslWriteEnter  = "mbedtls_ssl_write_enter"
 	snoopyProgNgtcp2DecryptEnter    = "ngtcp2_decrypt_enter"
 	snoopyProgNgtcp2EncryptEnter    = "ngtcp2_encrypt_enter"
+	snoopyProgOsslCipherFinalEnter  = "ossl_cipher_final_enter"
+	snoopyProgOsslCipherInitEnter   = "ossl_cipher_init_enter"
+	snoopyProgOsslCipherUpdateEnter = "ossl_cipher_update_enter"
 	snoopyProgQuicOpenEnter         = "quic_open_enter"
+	snoopyProgQuicOpenvEnter        = "quic_openv_enter"
 	snoopyProgQuicSealEnter         = "quic_seal_enter"
 	snoopyProgRing016OpenEnter      = "ring016_open_enter"
 	snoopyProgRingOpenEnter         = "ring_open_enter"
@@ -263,6 +305,8 @@ type snoopyProgramSpecs struct {
 	AesAeadEnter          *ebpf.ProgramSpec `ebpf:"aes_aead_enter"`
 	AesCreateEnter        *ebpf.ProgramSpec `ebpf:"aes_create_enter"`
 	AesCreateReturn       *ebpf.ProgramSpec `ebpf:"aes_create_return"`
+	ErlDecryptUpdateEnter *ebpf.ProgramSpec `ebpf:"erl_decrypt_update_enter"`
+	ErlEncryptUpdateEnter *ebpf.ProgramSpec `ebpf:"erl_encrypt_update_enter"`
 	GnutlsRecordRecvEnter *ebpf.ProgramSpec `ebpf:"gnutls_record_recv_enter"`
 	GnutlsRecordSendEnter *ebpf.ProgramSpec `ebpf:"gnutls_record_send_enter"`
 	GoAeadOpenEnter       *ebpf.ProgramSpec `ebpf:"go_aead_open_enter"`
@@ -275,7 +319,11 @@ type snoopyProgramSpecs struct {
 	MbedtlsSslWriteEnter  *ebpf.ProgramSpec `ebpf:"mbedtls_ssl_write_enter"`
 	Ngtcp2DecryptEnter    *ebpf.ProgramSpec `ebpf:"ngtcp2_decrypt_enter"`
 	Ngtcp2EncryptEnter    *ebpf.ProgramSpec `ebpf:"ngtcp2_encrypt_enter"`
+	OsslCipherFinalEnter  *ebpf.ProgramSpec `ebpf:"ossl_cipher_final_enter"`
+	OsslCipherInitEnter   *ebpf.ProgramSpec `ebpf:"ossl_cipher_init_enter"`
+	OsslCipherUpdateEnter *ebpf.ProgramSpec `ebpf:"ossl_cipher_update_enter"`
 	QuicOpenEnter         *ebpf.ProgramSpec `ebpf:"quic_open_enter"`
+	QuicOpenvEnter        *ebpf.ProgramSpec `ebpf:"quic_openv_enter"`
 	QuicSealEnter         *ebpf.ProgramSpec `ebpf:"quic_seal_enter"`
 	Ring016OpenEnter      *ebpf.ProgramSpec `ebpf:"ring016_open_enter"`
 	RingOpenEnter         *ebpf.ProgramSpec `ebpf:"ring_open_enter"`
@@ -301,22 +349,27 @@ type snoopyProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type snoopyMapSpecs struct {
-	ActiveCalls   *ebpf.MapSpec `ebpf:"active_calls"`
-	AesCreating   *ebpf.MapSpec `ebpf:"aes_creating"`
-	AesGcmCtxs    *ebpf.MapSpec `ebpf:"aes_gcm_ctxs"`
-	CallDepth     *ebpf.MapSpec `ebpf:"call_depth"`
-	ConnInfos     *ebpf.MapSpec `ebpf:"conn_infos"`
-	Counters      *ebpf.MapSpec `ebpf:"counters"`
-	Events        *ebpf.MapSpec `ebpf:"events"`
-	Execs         *ebpf.MapSpec `ebpf:"execs"`
-	IoThreads     *ebpf.MapSpec `ebpf:"io_threads"`
-	JavaSessions  *ebpf.MapSpec `ebpf:"java_sessions"`
-	LastWakeup    *ebpf.MapSpec `ebpf:"last_wakeup"`
-	QuicProcs     *ebpf.MapSpec `ebpf:"quic_procs"`
-	QuicTraffic   *ebpf.MapSpec `ebpf:"quic_traffic"`
-	RecvBufs      *ebpf.MapSpec `ebpf:"recv_bufs"`
-	SealedPackets *ebpf.MapSpec `ebpf:"sealed_packets"`
-	TracedTgids   *ebpf.MapSpec `ebpf:"traced_tgids"`
+	ActiveCalls    *ebpf.MapSpec `ebpf:"active_calls"`
+	AesCreating    *ebpf.MapSpec `ebpf:"aes_creating"`
+	AesGcmCtxs     *ebpf.MapSpec `ebpf:"aes_gcm_ctxs"`
+	CallDepth      *ebpf.MapSpec `ebpf:"call_depth"`
+	ConnInfos      *ebpf.MapSpec `ebpf:"conn_infos"`
+	Counters       *ebpf.MapSpec `ebpf:"counters"`
+	ErlCiphers     *ebpf.MapSpec `ebpf:"erl_ciphers"`
+	Events         *ebpf.MapSpec `ebpf:"events"`
+	Execs          *ebpf.MapSpec `ebpf:"execs"`
+	IoThreads      *ebpf.MapSpec `ebpf:"io_threads"`
+	JavaSessions   *ebpf.MapSpec `ebpf:"java_sessions"`
+	LastWakeup     *ebpf.MapSpec `ebpf:"last_wakeup"`
+	OsslCiphers    *ebpf.MapSpec `ebpf:"ossl_ciphers"`
+	OsslPacketZero *ebpf.MapSpec `ebpf:"ossl_packet_zero"`
+	OsslPackets    *ebpf.MapSpec `ebpf:"ossl_packets"`
+	OsslQuicTgids  *ebpf.MapSpec `ebpf:"ossl_quic_tgids"`
+	QuicProcs      *ebpf.MapSpec `ebpf:"quic_procs"`
+	QuicTraffic    *ebpf.MapSpec `ebpf:"quic_traffic"`
+	RecvBufs       *ebpf.MapSpec `ebpf:"recv_bufs"`
+	SealedPackets  *ebpf.MapSpec `ebpf:"sealed_packets"`
+	TracedTgids    *ebpf.MapSpec `ebpf:"traced_tgids"`
 }
 
 // snoopyVariableSpecs contains global variables before they are loaded into the kernel.
@@ -354,22 +407,27 @@ func (o *snoopyObjects) Close() error {
 //
 // It can be passed to loadSnoopyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type snoopyMaps struct {
-	ActiveCalls   *ebpf.Map `ebpf:"active_calls"`
-	AesCreating   *ebpf.Map `ebpf:"aes_creating"`
-	AesGcmCtxs    *ebpf.Map `ebpf:"aes_gcm_ctxs"`
-	CallDepth     *ebpf.Map `ebpf:"call_depth"`
-	ConnInfos     *ebpf.Map `ebpf:"conn_infos"`
-	Counters      *ebpf.Map `ebpf:"counters"`
-	Events        *ebpf.Map `ebpf:"events"`
-	Execs         *ebpf.Map `ebpf:"execs"`
-	IoThreads     *ebpf.Map `ebpf:"io_threads"`
-	JavaSessions  *ebpf.Map `ebpf:"java_sessions"`
-	LastWakeup    *ebpf.Map `ebpf:"last_wakeup"`
-	QuicProcs     *ebpf.Map `ebpf:"quic_procs"`
-	QuicTraffic   *ebpf.Map `ebpf:"quic_traffic"`
-	RecvBufs      *ebpf.Map `ebpf:"recv_bufs"`
-	SealedPackets *ebpf.Map `ebpf:"sealed_packets"`
-	TracedTgids   *ebpf.Map `ebpf:"traced_tgids"`
+	ActiveCalls    *ebpf.Map `ebpf:"active_calls"`
+	AesCreating    *ebpf.Map `ebpf:"aes_creating"`
+	AesGcmCtxs     *ebpf.Map `ebpf:"aes_gcm_ctxs"`
+	CallDepth      *ebpf.Map `ebpf:"call_depth"`
+	ConnInfos      *ebpf.Map `ebpf:"conn_infos"`
+	Counters       *ebpf.Map `ebpf:"counters"`
+	ErlCiphers     *ebpf.Map `ebpf:"erl_ciphers"`
+	Events         *ebpf.Map `ebpf:"events"`
+	Execs          *ebpf.Map `ebpf:"execs"`
+	IoThreads      *ebpf.Map `ebpf:"io_threads"`
+	JavaSessions   *ebpf.Map `ebpf:"java_sessions"`
+	LastWakeup     *ebpf.Map `ebpf:"last_wakeup"`
+	OsslCiphers    *ebpf.Map `ebpf:"ossl_ciphers"`
+	OsslPacketZero *ebpf.Map `ebpf:"ossl_packet_zero"`
+	OsslPackets    *ebpf.Map `ebpf:"ossl_packets"`
+	OsslQuicTgids  *ebpf.Map `ebpf:"ossl_quic_tgids"`
+	QuicProcs      *ebpf.Map `ebpf:"quic_procs"`
+	QuicTraffic    *ebpf.Map `ebpf:"quic_traffic"`
+	RecvBufs       *ebpf.Map `ebpf:"recv_bufs"`
+	SealedPackets  *ebpf.Map `ebpf:"sealed_packets"`
+	TracedTgids    *ebpf.Map `ebpf:"traced_tgids"`
 }
 
 func (m *snoopyMaps) Close() error {
@@ -380,11 +438,16 @@ func (m *snoopyMaps) Close() error {
 		m.CallDepth,
 		m.ConnInfos,
 		m.Counters,
+		m.ErlCiphers,
 		m.Events,
 		m.Execs,
 		m.IoThreads,
 		m.JavaSessions,
 		m.LastWakeup,
+		m.OsslCiphers,
+		m.OsslPacketZero,
+		m.OsslPackets,
+		m.OsslQuicTgids,
 		m.QuicProcs,
 		m.QuicTraffic,
 		m.RecvBufs,
@@ -422,6 +485,8 @@ type snoopyPrograms struct {
 	AesAeadEnter          *ebpf.Program `ebpf:"aes_aead_enter"`
 	AesCreateEnter        *ebpf.Program `ebpf:"aes_create_enter"`
 	AesCreateReturn       *ebpf.Program `ebpf:"aes_create_return"`
+	ErlDecryptUpdateEnter *ebpf.Program `ebpf:"erl_decrypt_update_enter"`
+	ErlEncryptUpdateEnter *ebpf.Program `ebpf:"erl_encrypt_update_enter"`
 	GnutlsRecordRecvEnter *ebpf.Program `ebpf:"gnutls_record_recv_enter"`
 	GnutlsRecordSendEnter *ebpf.Program `ebpf:"gnutls_record_send_enter"`
 	GoAeadOpenEnter       *ebpf.Program `ebpf:"go_aead_open_enter"`
@@ -434,7 +499,11 @@ type snoopyPrograms struct {
 	MbedtlsSslWriteEnter  *ebpf.Program `ebpf:"mbedtls_ssl_write_enter"`
 	Ngtcp2DecryptEnter    *ebpf.Program `ebpf:"ngtcp2_decrypt_enter"`
 	Ngtcp2EncryptEnter    *ebpf.Program `ebpf:"ngtcp2_encrypt_enter"`
+	OsslCipherFinalEnter  *ebpf.Program `ebpf:"ossl_cipher_final_enter"`
+	OsslCipherInitEnter   *ebpf.Program `ebpf:"ossl_cipher_init_enter"`
+	OsslCipherUpdateEnter *ebpf.Program `ebpf:"ossl_cipher_update_enter"`
 	QuicOpenEnter         *ebpf.Program `ebpf:"quic_open_enter"`
+	QuicOpenvEnter        *ebpf.Program `ebpf:"quic_openv_enter"`
 	QuicSealEnter         *ebpf.Program `ebpf:"quic_seal_enter"`
 	Ring016OpenEnter      *ebpf.Program `ebpf:"ring016_open_enter"`
 	RingOpenEnter         *ebpf.Program `ebpf:"ring_open_enter"`
@@ -468,6 +537,8 @@ func (p *snoopyPrograms) Close() error {
 		p.AesAeadEnter,
 		p.AesCreateEnter,
 		p.AesCreateReturn,
+		p.ErlDecryptUpdateEnter,
+		p.ErlEncryptUpdateEnter,
 		p.GnutlsRecordRecvEnter,
 		p.GnutlsRecordSendEnter,
 		p.GoAeadOpenEnter,
@@ -480,7 +551,11 @@ func (p *snoopyPrograms) Close() error {
 		p.MbedtlsSslWriteEnter,
 		p.Ngtcp2DecryptEnter,
 		p.Ngtcp2EncryptEnter,
+		p.OsslCipherFinalEnter,
+		p.OsslCipherInitEnter,
+		p.OsslCipherUpdateEnter,
 		p.QuicOpenEnter,
+		p.QuicOpenvEnter,
 		p.QuicSealEnter,
 		p.Ring016OpenEnter,
 		p.RingOpenEnter,

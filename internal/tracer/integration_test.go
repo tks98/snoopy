@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"debug/elf"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -35,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1502,6 +1504,249 @@ func TestCurlHTTP3(t *testing.T) {
 	if read.FD != write.FD {
 		t.Errorf("response on fd %d, request on fd %d", read.FD, write.FD)
 	}
+}
+
+// HTTP/3 in Chrome, end to end: its BoringSSL found by signature, and its
+// QUIC packets captured both ways, which the canary's signature check
+// can't tell (Chrome 157 stopped decrypting them where snoopy attached).
+// SNOOPY_TEST_CHROME is the chrome binary; the server is the quic-go test
+// program, whose self-signed certificate Chrome is told to accept by its
+// key's hash.
+func TestChromeHTTP3(t *testing.T) {
+	requireRoot(t)
+	chrome := os.Getenv("SNOOPY_TEST_CHROME")
+	if chrome == "" {
+		t.Skip("set SNOOPY_TEST_CHROME to a chrome binary to run this test")
+	}
+	goTool := requireTool(t, "go")
+	program := filepath.Join(t.TempDir(), "qgserver") // not "chrome", which --comm would match
+	build := exec.Command(goTool, "build", "-o", program, ".")
+	build.Dir = "testdata/quicgo"
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build quic-go program: %v: %s", err, out)
+	}
+	targets, err := discover.Inspect(chrome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) == 0 || targets[0].Offsets["EVP_AEAD_CTX_seal"] == 0 {
+		t.Fatalf("BoringSSL's QUIC functions not found in %s: %+v", chrome, targets)
+	}
+	events := startTracer(t, Options{Comm: "chrome"}, targets)
+
+	port := freeUDPPort(t)
+	spkiFile := filepath.Join(t.TempDir(), "spki")
+	srv := exec.Command(program, "server", port)
+	srv.Env = append(os.Environ(), "QUICGO_SPKI_FILE="+spkiFile)
+	stdout, err := srv.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
+		t.Fatalf("quic-go server: %q, %v", line, err)
+	}
+	spki, err := os.ReadFile(spkiFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/chrome-h3"
+	cmd := exec.Command(chrome, "--headless=new", "--no-sandbox", "--no-first-run", "--disable-background-networking",
+		"--user-data-dir="+t.TempDir(), "--ignore-certificate-errors-spki-list="+string(spki),
+		"--origin-to-force-quic-on=localhost:"+port, "--host-resolver-rules=MAP localhost 127.0.0.1",
+		"--dump-dom", "https://localhost:"+port+path)
+	// Into a file: Chrome's helper processes keep a pipe open after it
+	// exits. In a process group of its own, so they go with it.
+	dom := filepath.Join(t.TempDir(), "dom")
+	f, err := os.Create(dom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cmd.Stdout = f
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	timer := time.AfterFunc(time.Minute, func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	err = cmd.Wait()
+	timer.Stop()
+	out, _ := os.ReadFile(dom)
+	if err != nil || !bytes.Contains(out, []byte("served "+path+" on "+port)) {
+		t.Fatalf("chrome: %v: %.300s", err, out)
+	}
+	read := waitFor(t, events, "response", func(ev *Event) bool {
+		return ev.Function == FuncQUICRecv && contains("served "+path)(ev)
+	})
+	write := waitFor(t, events, "request", func(ev *Event) bool {
+		return ev.Function == FuncQUICSend && ev.PID == read.PID && ev.FD == read.FD && len(ev.QUICHeader) > 0 &&
+			ev.QUICHeader[0]&0x80 == 0 // after the handshake; not Chrome's own traffic
+	})
+	server := "127.0.0.1:" + port
+	checkConnection(t, read, server)
+	checkConnection(t, write, server)
+}
+
+// curl's HTTP/3 through OpenSSL's own QUIC (3.2 and later), as Debian
+// builds it: its packets are seen where libcrypto's EVP_CipherUpdate
+// encrypts and decrypts them, and what curl reads and writes through
+// OpenSSL's QUIC streams isn't seen again at SSL_read_ex and SSL_write_ex2.
+// SNOOPY_TEST_OPENSSL_QUIC is the root of a system whose curl does that (a
+// Debian trixie root filesystem), which curl is run chrooted in. The server
+// is the quic-go test program.
+func TestOpenSSLQUIC(t *testing.T) {
+	requireRoot(t)
+	root := os.Getenv("SNOOPY_TEST_OPENSSL_QUIC")
+	if root == "" {
+		t.Skip("set SNOOPY_TEST_OPENSSL_QUIC to the root of a system whose curl uses OpenSSL's QUIC to run this test")
+	}
+	goTool := requireTool(t, "go")
+	program := filepath.Join(t.TempDir(), "qgserver") // not a "curl" prefix, which --comm would match
+	build := exec.Command(goTool, "build", "-o", program, ".")
+	build.Dir = "testdata/quicgo"
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build quic-go program: %v: %s", err, out)
+	}
+	var targets []discover.Target
+	for _, pattern := range []string{"usr/lib/*/libssl.so.3", "usr/lib/*/libcrypto.so.3", "usr/lib64/libssl.so.3", "usr/lib64/libcrypto.so.3"} {
+		found, _ := filepath.Glob(filepath.Join(root, pattern))
+		for _, lib := range found {
+			ts, err := discover.Inspect(lib)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targets = append(targets, ts...)
+		}
+	}
+	if !slices.ContainsFunc(targets, func(tg discover.Target) bool { return tg.Library == discover.OpenSSLQUIC }) {
+		t.Fatalf("no libcrypto with OpenSSL's QUIC under %s: %+v", root, targets)
+	}
+	events := startTracer(t, Options{Comm: "curl"}, targets)
+
+	port := freeUDPPort(t)
+	srv := exec.Command(program, "server", port)
+	stdout, err := srv.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
+		t.Fatalf("quic-go server: %q, %v", line, err)
+	}
+	server := "127.0.0.1:" + port
+
+	path, body := "/openssl-quic", "sent-through-openssl-quic"
+	out, err := exec.Command("chroot", root, "curl", "-sk", "--http3-only", "-d", body, "https://"+server+path).CombinedOutput()
+	if err != nil || !bytes.Contains(out, []byte("served "+path+" on "+port)) {
+		t.Fatalf("curl --http3-only: %v: %s", err, out)
+	}
+	read := waitFor(t, events, "response", func(ev *Event) bool {
+		return ev.Function == FuncOSSLQUICRecv && contains("served "+path)(ev)
+	})
+	write := waitFor(t, events, "request body", func(ev *Event) bool {
+		return ev.Function == FuncOSSLQUICSend && ev.PID == read.PID && contains(body)(ev)
+	})
+	checkConnection(t, read, server)
+	checkConnection(t, write, server)
+	if read.FD != write.FD {
+		t.Errorf("response on fd %d, request on fd %d", read.FD, write.FD)
+	}
+	time.Sleep(time.Second) // for any stream reads still to come
+	if ev := events.find(func(ev *Event) bool {
+		return ev.Function.Library() == discover.OpenSSL && !ev.Function.IsQUIC() &&
+			(contains("served "+path)(ev) || contains(body)(ev))
+	}); ev != nil {
+		t.Errorf("%v on an OpenSSL QUIC stream was captured too: %q", ev.Function, ev.Data)
+	}
+}
+
+// Erlang's ssl, whose TLS records its crypto NIF encrypts and decrypts with
+// libcrypto's EVP_EncryptUpdate and EVP_DecryptUpdate, with TLS 1.3 and
+// TLS 1.2. The VM does its own socket I/O, on the thread that encrypts and
+// decrypts, which is how their socket is known. SNOOPY_TEST_ERL is another
+// Erlang's erl to use, e.g. one built with libcrypto linked into its crypto
+// NIF (--disable-dynamic-ssl-lib), which is then what's probed.
+func TestErlangSSL(t *testing.T) {
+	requireRoot(t)
+	erl := os.Getenv("SNOOPY_TEST_ERL")
+	if erl == "" {
+		erl = requireTool(t, "erl")
+	}
+	var targets []discover.Target
+	if nif := erlangCryptoNIF(t, erl); nif != "" {
+		targets = []discover.Target{{Path: nif, Library: discover.Erlang}}
+	} else {
+		for _, dir := range []string{"/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib"} {
+			found, _ := filepath.Glob(filepath.Join(dir, "libcrypto.so.*"))
+			for _, lib := range found {
+				targets = append(targets, discover.Target{Path: lib, Library: discover.Erlang})
+			}
+		}
+	}
+	if len(targets) == 0 {
+		t.Fatal("no libcrypto found")
+	}
+	events := startTracer(t, Options{Comm: "beam"}, targets)
+	srv, _ := newServer(t)
+
+	for _, version := range []string{"tlsv1.3", "tlsv1.2"} {
+		path := "/erlang-" + version
+		eval := fmt.Sprintf(`ssl:start(), inets:start(),
+			{ok, {{_, 200, _}, _, Body}} = httpc:request(get, {"%s%s", []},
+				[{ssl, [{verify, verify_none}, {versions, ['%s']}]}], []),
+			io:format("~s~n", [Body]), halt().`, srv.URL, path, version)
+		out, err := exec.Command(erl, "-noshell", "-eval", eval).CombinedOutput()
+		if err != nil || !bytes.Contains(out, []byte("served "+path)) {
+			t.Fatalf("%s: erl: %v: %s", version, err, out)
+		}
+		write := waitFor(t, events, version+" request", func(ev *Event) bool {
+			return ev.Function == FuncErlangRecordSend && contains("GET "+path+" HTTP/1.1")(ev)
+		})
+		read := waitFor(t, events, version+" response", func(ev *Event) bool {
+			return ev.Function == FuncErlangRecordRecv && contains("served "+path)(ev)
+		})
+		checkConnection(t, write, srv.Listener.Addr().String())
+		checkConnection(t, read, srv.Listener.Addr().String())
+	}
+}
+
+// erlangCryptoNIF returns the crypto NIF of the Erlang that erl runs, if
+// libcrypto is linked into it: it exports libcrypto's functions.
+func erlangCryptoNIF(t *testing.T, erl string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(erl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// bin/erl, with lib/erlang/lib or (installed by a distribution) lib
+	// next to bin.
+	var nifs []string
+	for _, pattern := range []string{"../lib/erlang/lib/crypto-*/priv/lib/crypto.so", "../lib/crypto-*/priv/lib/crypto.so"} {
+		found, _ := filepath.Glob(filepath.Join(filepath.Dir(real), pattern))
+		nifs = append(nifs, found...)
+	}
+	for _, nif := range nifs {
+		f, err := elf.Open(nif)
+		if err != nil {
+			continue
+		}
+		syms, _ := f.DynamicSymbols()
+		f.Close()
+		if slices.ContainsFunc(syms, func(s elf.Symbol) bool {
+			return s.Name == "EVP_DecryptUpdate" && s.Section != elf.SHN_UNDEF
+		}) {
+			return nif
+		}
+	}
+	return ""
 }
 
 // freeUDPPort returns a UDP port on 127.0.0.1 that was free a moment ago.

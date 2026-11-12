@@ -5,10 +5,11 @@ receives over TLS, browsers included, without certificates or changes to the
 program. It uses eBPF to read the data where the program hands it to its TLS
 library, before it's encrypted and after it's decrypted.
 
-![snoopy in one terminal and Chromium, opened from another, loading pages while their requests and responses scroll by](docs/demo.gif)
+![snoopy in one terminal and Chromium, opened from another, loading pages while a line for each request and its response scrolls by](docs/demo.gif)
 
-Chromium loading example.com and Cloudflare's test page over HTTP/3, and
-Wikipedia over HTTP/2, recorded with
+`snoopy --requests` while Chromium loads example.com and Cloudflare's test
+page over HTTP/3, and Wikipedia over HTTP/2: one line per request, with its
+status, type, size and time. Recorded with
 [docs/demo/record.sh](docs/demo/record.sh).
 
 ## Quick start
@@ -72,13 +73,14 @@ the output, JSON and pcap, containers, and troubleshooting.
 
 - **TLS libraries:** OpenSSL, BoringSSL (also Bun's and Envoy's, found by
   signature), LibreSSL, GnuTLS, NSS, wolfSSL,
-  Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 (curl's HTTP/3)
-  and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
+  Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 and
+  OpenSSL's own QUIC (curl's HTTP/3) and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.
 - **Runtimes:** curl, Python, Ruby, PHP, Node.js (official builds too), .NET,
   Go, Rust and Bun programs, and Java: with Netty's netty-tcnative (gRPC-Java)
   or Conscrypt as is, and Java's own TLS (JSSE) with `--java`, which loads a
-  small agent into the JVM; not Erlang or Deno
+  small agent into the JVM; Erlang and Elixir, when selected with `--comm`,
+  `--pid` or `--container`; not Deno
   ([docs/how-it-works.md](docs/how-it-works.md#languages-and-runtimes)).
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
   symbols and is found by signature, and Firefox. Their HTTP/3 too.

@@ -20,7 +20,7 @@ const fnQUICPacketSent = 0xfe
 func (f Function) learnsSocketLater() bool {
 	switch f {
 	case FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend, FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend,
-		FuncNGTCP2Send, FuncGoQUICSend:
+		FuncNGTCP2Send, FuncGoQUICSend, FuncOSSLQUICSend, FuncErlangRecordSend:
 		return true
 	}
 	return false

@@ -334,6 +334,20 @@ builds inline it into `open`, so they're told apart by their own codes: open
 reports bad decrypt (`0x65`); seal reports buffer too small (`0x67`) but not
 open_gather's `0x73`.
 
+Chrome 157 inlined `EVP_AEAD_CTX_open` into quiche's
+`AeadBaseDecrypter::DecryptPacket`, which calls the cipher's
+`openv_detached` method itself, through `ctx->aead`, so its packets never
+reach open. `findOpenv` finds the two methods QUIC uses, AES-GCM's
+`aead_aes_gcm_openv_detached` in `cipher/e_aes.cc.inc` and
+`chacha20_poly1305_openv_detached` in `cipher/e_chacha20poly1305.cc` (which
+ChaCha20-Poly1305's method calls with its key), as the one function in each
+file reporting bad decrypt itself. They're only called through the table, so
+they have no direct callers: `IndirectFuncAt` starts a function at a frame
+pointer prologue right after int3 padding, as Clang lays functions out
+(before, `FuncAt` took such a function for part of the one before it). With
+control-flow integrity, each also has an 8-byte entry in a jump table under
+the same symbol; the test's symbols take the larger.
+
 ### Where it lives
 
 - `internal/funcfind`: the generic search, in `funcfind.go`, `x86.go` and
@@ -392,7 +406,13 @@ header (or 13 bytes for TLS 1.2).
   since seal encrypts in place; `quic_open_enter` and its return probe copy it
   after decrypting. `is_quic_aad` leaves out TLS records by the shape of their
   associated data. QUIC's fixed bit can't be used, since peers may grease it
-  (RFC 9287).
+  (RFC 9287). `quic_openv_enter` does the same at the AEADs' `openv_detached`
+  methods, where Chrome 157 and later decrypt, reading the header and the
+  buffers from one-element arrays of `{in, len}` and `{out, in, len}`. A call
+  inside a QUIC packet's open is left to open (`in_quic_open`), so builds that
+  still call open see each packet once. Older BoringSSL's `open_gather`
+  methods report the same errors with other arguments: those don't have
+  arrays of one at arguments 2 and 9, and are left out.
 - **Sockets:** the AEAD functions never touch the socket. A packet is sent
   right after it's encrypted, so `io_threads` remembers which connection
   waits for the thread's next send, and when that teaches it a new socket,
@@ -411,6 +431,12 @@ header (or 13 bytes for TLS 1.2).
 
 ### How to tell it broke, and how to fix it
 
+- **Requests but no responses:** sent packets are seen at seal, but received
+  ones no longer pass through what's attached to, as when Chrome 157 inlined
+  open. Count calls with tracefs probes on open and on the `openv_detached`
+  methods (offsets from the debug symbols), print their associated data's
+  length (5 and 13 are TLS records), and disassemble
+  `AeadBaseDecrypter::DecryptPacket` to see what it calls now.
 - **No `EVP_AEAD_CTX_*` events:** the AEAD functions weren't found, see
   [above](#chrome-electron-and-other-chromium-builds); or Chrome no longer
   uses them for QUIC. To check the second, put tracefs probes on them and look
@@ -657,6 +683,121 @@ length is the ciphertext's less the tag (`ngtcp2_crypto_aead.max_overhead`).
   A Fedora root filesystem can be made without Docker from its container
   image, with `skopeo copy docker://registry.fedoraproject.org/fedora:latest
   dir:<dir>` and its layers unpacked, then `dnf install curl` chrooted in it.
+
+## HTTP/3 through OpenSSL's QUIC (curl on Debian)
+
+### How it was found
+
+Debian trixie's curl does HTTP/3 with nghttp3 and OpenSSL 3.5's own QUIC
+(no ngtcp2: `curl -V` lists nghttp3 but not ngtcp2). snoopy saw only what
+curl read through OpenSSL's QUIC stream objects with `SSL_read_ex`, as TLS,
+and none of what it wrote with `SSL_write_ex2`. OpenSSL protects its QUIC
+packets with libcrypto's EVP API, as its TLS records, which bpftrace on
+the container's libcrypto showed (`arg5` of `EVP_CipherInit_ex` is the
+direction; an update with no output, `arg1` 0, is associated data):
+
+```bash
+L=/proc/<pid>/root/lib/x86_64-linux-gnu/libcrypto.so.3
+bpftrace -e "uprobe:$L:EVP_CipherInit_ex /comm == \"curl\"/ { @enc[tid] = arg5; }
+  uprobe:$L:EVP_CipherUpdate /comm == \"curl\" && arg1 == 0/ { @aad[@enc[tid], arg4] = count(); }
+  uprobe:$L:EVP_CipherUpdate /comm == \"curl\" && arg1 != 0/ { @data[@enc[tid]] = count(); }"
+```
+
+Each packet's header goes in as associated data (2 or 3 bytes for a
+received short header: OpenSSL's client uses connection IDs of length 0),
+then its payload. A received packet is decrypted in one update; a packet
+to send is encrypted in one to three, one for each buffer its frames are
+in, ended by `EVP_CipherFinal_ex`. Header protection uses contexts of its
+own, without associated data.
+
+### How it works
+
+- **BPF:** `ossl_cipher_init_enter` keeps each context's direction
+  (`ossl_ciphers`); `ossl_cipher_update_enter` takes associated data that
+  `is_quic_aad` says is a QUIC header, then the context's next updates:
+  a received packet's plaintext is copied on return, and a packet to send
+  is collected in `ossl_packets` until `ossl_cipher_final_enter` emits it,
+  cut off at `OSSL_PACKET_MAX` bytes.
+- **Not seen twice:** what curl reads and writes through OpenSSL's QUIC
+  connections and streams is in the packets, so the `SSL_read`/`SSL_write`
+  probes leave those objects out (`ossl_quic_object`), by the type that
+  starts `struct ssl_st` from 3.2: 1 and 2, or from 3.5 0x80 and 0x81.
+- **Only for the processes selected:** libcrypto is the `OpenSSLQUIC`
+  target, found in a process's libraries (`processLibPatterns`), not across
+  the system, from OpenSSL 3.2 on (symbols versioned `OPENSSL_3.2.0` or
+  later), and attached to only with `--comm`, `--pid` or `--container`.
+
+### How to tell it broke, and how to fix it
+
+- **Responses but no requests, or the reverse:** OpenSSL changed how it
+  calls the EVP API for a direction; rerun the bpftrace session, also on
+  `EVP_CipherFinal_ex`.
+- **The same data twice, as QUIC and as TLS:** the type values at the start
+  of `struct ssl_st` changed (`SSL_TYPE_*` in `ssl/ssl_local.h`); update
+  `ossl_quic_object`.
+- **To test:** `TestOpenSSLQUIC`, with `SNOOPY_TEST_OPENSSL_QUIC` set to a
+  Debian trixie root filesystem with curl (`fetch.sh debian`, or
+  `tar` from a `debian:trixie` container with curl installed).
+
+## Erlang's ssl
+
+### How it was found
+
+Erlang's `ssl` is written in Erlang, but encrypts and decrypts its records
+in its crypto NIF, through libcrypto. bpftrace on an `erlang:28`
+container's libcrypto (OTP 28, OpenSSL 3.5), filtered to the VM's threads
+(`erts_*`; `beam.smp`'s child of the shell, not the shell's PID):
+
+```bash
+L=/proc/<pid>/root/usr/lib/x86_64-linux-gnu/libcrypto.so.3
+bpftrace -e "uprobe:$L:EVP_EncryptUpdate,uprobe:$L:EVP_DecryptUpdate /strncmp(comm, \"erts_\", 5) == 0/ {
+  printf(\"%s %s ctx %x out %x len %d\n\", comm, probe, arg0, arg1, arg4); }"
+```
+
+Each record is a `*Update` with no output (`out` 0) and the 5-byte TLS 1.3
+header (or TLS 1.2's 13 bytes) as associated data, then one with the
+payload, then `*Final_ex`, on a context per direction that lasts as long as
+its keys. The scheduler thread that decrypts a record received it
+(`recvfrom`) just before, and the one that encrypts one sends it (`writev`)
+just after. Erlang's random numbers go through `EVP_EncryptUpdate` too, in
+place and without associated data.
+
+### How it works
+
+- **BPF:** `erl_encrypt_update_enter` and `erl_decrypt_update_enter` keep
+  associated data that `classify_aad` says is a TLS record's
+  (`erl_ciphers`), and take the next update on the context as the record:
+  sent through `record_seal_enter` at entry, received on return
+  (`RET_ONE_KNOWN_LEN_TLS13` takes a TLS 1.3 record's inner content type
+  off). Records go out as `FN_ERL_RECORD_SEND` and `_RECV`, whose socket is
+  the thread's last receive and next send, as for rustls's records.
+- **Only in Erlang's processes:** OpenSSL's own TLS may call these
+  functions, so libcrypto is the `Erlang` target only in a process whose
+  program is `beam*` (`Watcher.Process`, `isErlang`), and attached to only
+  with `--comm`, `--pid` or `--container`.
+- **libcrypto linked into the NIF:** OTP built with
+  `--disable-dynamic-ssl-lib` has libcrypto in its `crypto.so`, which then
+  exports the functions itself (`definesFuncs`): that's the target. One
+  that only imports them isn't, so it isn't probed for nothing.
+- **Loaded late:** the VM loads its crypto NIF, and with it libcrypto,
+  when it first needs it, so `crypto.so` and `libcrypto.so` are among the
+  names that make the BPF program tell user space a traced process mapped
+  a TLS library (`tls_library_names`), which then attaches to it while its
+  thread is held.
+
+### How to tell it broke, and how to fix it
+
+- **Nothing captured:** OTP moved its records to other EVP calls (an
+  `EVP_CipherUpdate`, or a provider's); rerun the bpftrace session on the
+  `EVP_*Update` and `EVP_Cipher*` functions.
+- **No addresses:** the VM moved its socket I/O off the scheduler that
+  encrypts and decrypts (to its dirty I/O threads, say); compare the
+  `recvfrom` and `writev` threads with the update calls'.
+- **To test:** `TestErlangSSL` (erlang-base, erlang-ssl and erlang-inets on
+  Ubuntu), for TLS 1.3 and 1.2; `SNOOPY_TEST_ERL` runs it with another
+  Erlang's `erl`, e.g. one built with `./configure --with-ssl
+  --disable-dynamic-ssl-lib` (static libcrypto from libssl-dev), whose
+  crypto NIF is then what's probed.
 
 ## HTTP/3 over quic-go
 
