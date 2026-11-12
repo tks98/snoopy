@@ -8,7 +8,7 @@ What snoopy can trace, and how it does it.
 | Library | Functions probed | Notes |
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Also copies linked into a program that exports them, like Node.js. |
-| BoringSSL in Chrome, Brave, Edge, Electron apps, Bun and Envoy | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. Bun does its own socket I/O, so its events have no addresses; Envoy's HTTP/3 isn't traced. |
+| BoringSSL in Chrome, Brave, Edge, Electron apps, Bun and Envoy | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. Bun does its own socket I/O; its events had no addresses when last checked, before the pairing of memory BIOs' records with their sockets described below, and it hasn't been checked since. Envoy's HTTP/3 isn't traced. |
 | HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open` and its ciphers' `openv_detached` methods, found by signature | Each QUIC packet, decrypted. |
 | HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
 | HTTP/3 over quinn (Rust) | the same functions as for rustls's records, below | With rustls's aws-lc-rs and ring providers. |
@@ -60,8 +60,22 @@ All of them on x86_64 and arm64. Some details:
   tokio, where the read path is inlined. All of them are found by their
   symbols, which Cargo keeps by default.
 
-Programs that do their own socket I/O around the TLS library, such as .NET's
-`SslStream` over OpenSSL, are captured without a file descriptor or addresses.
+Programs that do their own socket I/O around the TLS library, with OpenSSL's
+memory BIOs, make no socket syscall inside `SSL_read` or `SSL_write`. Node.js
+moves the records between the BIOs and the socket on its event loop's thread,
+receiving a record just before the `SSL_read` that decrypts it and sending one
+just after the `SSL_write` that encrypted it. So for a connection whose socket
+isn't known yet, a write's socket is the one the thread sends on next, within
+10 ms, and a read's the one the thread last received from, but only if that
+send or receive holds an application data record of the call's length (its
+plaintext plus the AEAD's overhead), so another connection's I/O in between
+isn't taken for this one's. A write's event waits in user space for the send,
+as rustls's do. Programs that encrypt on one thread and do the socket I/O on
+another, like Dart, whose `SecureSocket` encrypts on a worker thread while its
+isolate's thread sends the records, are captured without a file descriptor or
+addresses. So are connections with CBC cipher suites, whose records' lengths
+vary with their padding, and, as last checked (before this pairing), .NET's
+`SslStream` over OpenSSL.
 
 ### Languages and runtimes
 
@@ -73,8 +87,8 @@ HTTPS:
 | --- | --- | --- |
 | curl | the system's OpenSSL | yes |
 | Python, Ruby, PHP | the system's OpenSSL | yes |
-| Node.js, distribution packages | the system's OpenSSL | yes |
-| Node.js, official builds and `node` images | OpenSSL built into the `node` binary | yes; `--comm node` matches it by its file name, since it calls itself `MainThread` |
+| Node.js, distribution packages | the system's OpenSSL, around its own socket I/O | yes, with socket addresses since the pairing above |
+| Node.js, official builds and `node` images | OpenSSL built into the `node` binary, around its own socket I/O | yes, the same; `--comm node` matches it by its file name, since it calls itself `MainThread` |
 | .NET | the system's OpenSSL, around its own socket I/O | yes, without socket addresses |
 | Go | `crypto/tls` | yes, stripped binaries too |
 | Rust | rustls, or OpenSSL through the `openssl` crate | yes (see above for rustls) |
@@ -84,6 +98,7 @@ HTTPS:
 | Java with Netty's netty-tcnative (gRPC-Java and Netty, when it's there) | BoringSSL in a JNI library, extracted to a temporary file | yes, found when the JVM loads it, however late |
 | Java with Conscrypt | BoringSSL in a JNI library, stripped | yes, found by signature |
 | Java (OpenJDK), otherwise | JSSE, written in Java | with `--java`, through snoopy's agent ([below](#java-and-jsse)) |
+| Dart | BoringSSL, built in, encrypting on another thread than its socket I/O | yes, found by signature, without socket addresses (Dart 3.14, checked in November 2026) |
 | Erlang, Elixir | OTP's `ssl`, written in Erlang, with libcrypto for its records | yes, when selected with `--comm beam`, `--pid` or `--container` |
 
 A TLS library a process loads after it started, such as the ones a JVM

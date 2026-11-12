@@ -237,6 +237,10 @@ type Event struct {
 	ContainerName string // the name it was given (--container ID=NAME)
 	Local         netip.AddrPort
 	Remote        netip.AddrPort
+
+	// socketLater is set if the BPF program may tell the event's socket in a
+	// notice right behind it (see learnsSocketLater).
+	socketLater bool
 }
 
 // Truncated reports whether fewer bytes were captured than transferred.

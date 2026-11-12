@@ -305,6 +305,28 @@ signature finding against real binaries (see
   (`FN_SOCKET_NOTICE`, 0xff), and `tracer/sockets.go` holds such writes
   (rustls, QUIC sends) until it arrives, or 300 ms. Returns are
   `io::Result<usize>` in two registers (`RET_RUST_RESULT`).
+- **OpenSSL over memory BIOs** (Node.js; `memory_bio_return`): an
+  `SSL_read` or `SSL_write` that returns without a socket syscall during it,
+  on a connection whose socket isn't known, makes its thread an `io_threads`
+  one. A write sets `want_conn` with the length of its first record's
+  plaintext (`want_len`), and the thread's next send, within `WANT_MAX_NS`
+  (10 ms), teaches its socket only if one of its first records
+  (`has_app_record`) is an application data record of that length plus an
+  AEAD's overhead (16 or 8 bytes of tag, plus 1 for TLS 1.3's content type
+  or 8 for TLS 1.2's explicit nonce). A read takes the thread's last receive
+  (`last_buf`, `last_len`, `last_file`) the same way. The record check is
+  what keeps another connection's I/O on the thread, a deferred write
+  (Node's `EncOut` waits while a write is in progress), or a send on another
+  thread from being taken for the call's: a wrong address is worse than
+  none. The write's event carries `EVENT_FLAG_SOCKET_LATER`, so
+  `sockets.go` holds it for the notice like rustls's (`Event.socketLater`).
+  Only with BTF, which tells sockets from files. Measured in November 2026
+  with bpftrace: Node 18 (Ubuntu's) and 22 (official) call `SSL_read`,
+  `SSL_write` and do their `read`/`write` on the socket all on the main
+  thread, the write right after `SSL_write` returns (sometimes with the
+  `SSL_write` nested in an `SSL_read`, from the handshake's callback); Dart
+  3.14 calls them on a `DartWorker` thread and reads and writes the socket on
+  another, so it isn't paired.
 - **Stripped BoringSSL** (Chrome, Brave, Edge, Electron) is found by
   signature: `internal/discover/boringssl.go` on top of
   `internal/funcfind`, a small library for locating functions in stripped
@@ -540,9 +562,13 @@ signature finding against real binaries (see
 - **HTTP/1 pipelining:** a response is matched to the last request sent, so
   with pipelined requests a response to HEAD can be taken to have a body.
 - **No socket details** (fd or addresses) for apps that do their own socket
-  I/O around OpenSSL with memory BIOs, e.g. .NET and Node.js, nor for Java's
-  `SSLEngine`. (Before 2.10, Node's calls could get the address of a file
-  OpenSSL read, or of a later socket with that fd; now they get none.)
+  I/O around OpenSSL with memory BIOs on another thread than the one calling
+  `SSL_read` and `SSL_write`, e.g. Dart (whose `SecureSocket` encrypts on a
+  worker thread), nor, as last checked, .NET; nor for Java's `SSLEngine`;
+  nor, over memory BIOs, for CBC cipher suites or without BTF. Node.js,
+  which does its I/O on the thread that calls them, gets them (see "OpenSSL
+  over memory BIOs"). (Before 2.10, Node's calls could get the address of a
+  file OpenSSL read, or of a later socket with that fd.)
 - **Detaching is slow before Linux 6.6:** there, and on kernels without
   uprobe_multi's PID fix, each probe is a perf-based link, which the kernel
   takes tens of ms to detach, so a snoopy with thousands of links takes

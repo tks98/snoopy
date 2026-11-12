@@ -112,6 +112,11 @@ type snoopyIoThread struct {
 	DgramFd    int32
 	DgramStart uint64
 	DgramEnd   uint64
+	LastBuf    uint64
+	LastFile   uint64
+	LastLen    uint32
+	WantLen    uint32
+	WantNs     uint64
 }
 
 type snoopyJavaSession struct {

@@ -27,6 +27,7 @@ thing it depends on ships.
 | [Which socket a QUIC packet belongs to](#which-socket-a-quic-packet-belongs-to) | Browser networking internals | unpredictable | Quiet |
 | [QUIC frame parser](#quic-frame-parser) | New QUIC extensions | occasional | Partial |
 | [Firefox HTTP/3 through freebl](#firefox-http3-through-freebl) | neqo's choice of crypto | rare | Quiet |
+| [Node.js's sockets](#nodejss-sockets) | Node's `TLSWrap` and libuv | major releases, twice a year | Quiet |
 | [rustls](#rustls) | rustls internals, rustc | 6 weeks (Rust) | Loud, or quiet |
 | [Go crypto/tls](#go-cryptotls) | Go's internal structs, pclntab | 6 months | Mostly loud |
 | [Java's JSSE (`--java`)](#javas-jsse---java) | OpenJDK's `sun.security.ssl` internals, class file versions | 6 months | Quiet |
@@ -201,6 +202,23 @@ thing it depends on ships.
   without addresses.
 - **Guarded by:** `TestErlangSSL`, in CI with Ubuntu's Erlang, TLS 1.3 and
   1.2; with libcrypto linked into the NIF, by hand (`SNOOPY_TEST_ERL`).
+
+### Node.js's sockets
+
+- **Depends on:** Node sending each record `SSL_write` produced on the
+  thread that called it, right after it (before any other connection's
+  send there), and receiving each record `SSL_read` decrypts on that thread
+  right before it; and records without padding, with an AEAD.
+- **Breaks when:** Node moves its socket I/O to another thread, or defers a
+  connection's first writes behind other connections' sends; a library
+  pads records; the connection uses a CBC suite (never matched).
+- **How it shows:** Node's events without fd or addresses, quietly, as
+  before the pairing. Taking another connection's socket needs two
+  connections' records of the same length on one thread, the later one
+  sent first, before the first's socket is known.
+- **Guarded by:** `TestNodeSockets`, in CI with the runners' official Node
+  (its own OpenSSL): two connections at once over TLS 1.3 and 1.2, and a
+  server.
 
 ### HTTP/3 over quic-go
 

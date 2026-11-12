@@ -62,4 +62,22 @@ func TestSocketWaiter(t *testing.T) {
 	if got := w.expire(now.Add(300*time.Millisecond), 300*time.Millisecond); len(got) != 1 || got[0].FD != -1 {
 		t.Errorf("expire: %v", names(got))
 	}
+
+	// SSL_write is held only when its record says a notice may follow
+	// (a write over a memory BIO).
+	if got := names(w.add(ev(FuncSSLWrite, 0xe, -1, "e1"), now)); len(got) != 1 {
+		t.Errorf("SSL_write without the flag: %v", got)
+	}
+	h = rawHeader{Pid: 1, ConnID: 0xf, Fd: -1, Fn: uint8(FuncSSLWrite), Flags: flagSocketLater, Size: 2, Captured: 2, ChunkLen: 2}
+	flagged := newAssembler(func(uint64) time.Time { return now }).add(mustParse(t, record(h, "f1")), now)
+	if len(flagged) != 1 || !flagged[0].socketLater {
+		t.Fatalf("flag not read: %+v", flagged)
+	}
+	if got := w.add(flagged[0], now); got != nil {
+		t.Errorf("flagged SSL_write delivered: %v", names(got))
+	}
+	h = rawHeader{Pid: 1, ConnID: 0xf, Fd: 4, Fn: fnSocketNotice}
+	if got := names(w.notice(mustParse(t, record(h, "")))); len(got) != 1 || got[0] != "f1" {
+		t.Errorf("notice released %v", got)
+	}
 }

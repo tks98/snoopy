@@ -108,6 +108,7 @@ enum ret_kind {
 };
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
+#define EVENT_FLAG_SOCKET_LATER 2 // a socket notice may follow (see memory_bio_return)
 
 // Each ring buffer record is this header followed by chunk_len bytes of
 // payload, in a record of one of the sizes defined below.
@@ -684,7 +685,8 @@ static __always_inline bool fill_header(struct event_header *h, struct active_ca
 	return true;
 }
 
-static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
+// emit_flagged emits a call's n bytes with these EVENT_FLAG_s.
+static __always_inline void emit_flagged(struct active_call *call, __u64 pid_tgid, __s64 n, __u8 flags)
 {
 	if (n <= 0)
 		return;
@@ -692,7 +694,63 @@ static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64
 	__u64 now = bpf_ktime_get_ns();
 	if (!fill_header(&h, call, pid_tgid, n, now))
 		return;
+	h.flags |= flags;
 	output_chunks(&h, call->buf, submit_flags(now));
+}
+
+static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
+{
+	emit_flagged(call, pid_tgid, n, 0);
+}
+
+// Threads that called functions which don't do the socket I/O themselves:
+// rustls's Reader and Writer, QUIC's packet encryption, and OpenSSL's
+// SSL_read and SSL_write over memory BIOs. On the same thread, the receive
+// happens before them and the send just after. So for these threads,
+// remember the last receive's socket, and which connection the next send is
+// for.
+struct io_thread {
+	__u64 want_conn; // a connection that wrote, waiting for its socket
+	__s32 last_fd;	 // the socket of the last receive
+	// The receive buffer the last decrypted packet was found at the start
+	// of, and its socket (see packet_fd).
+	__s32 dgram_fd;
+	__u64 dgram_start;
+	__u64 dgram_end;
+	// For memory BIOs (see memory_bio_return): the last receive's buffer,
+	// its size and its socket's struct file; and the length of want_conn's
+	// record, whose send is checked for it, and when it was written.
+	__u64 last_buf;
+	__u64 last_file;
+	__u32 last_len;
+	__u32 want_len;
+	__u64 want_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, __u64); // pid_tgid
+	__type(value, struct io_thread);
+} io_threads SEC(".maps");
+
+static __always_inline struct io_thread *io_thread(__u64 pid_tgid)
+{
+	struct io_thread *rt = bpf_map_lookup_elem(&io_threads, &pid_tgid);
+	if (rt)
+		return rt;
+	struct io_thread fresh;
+	__builtin_memset(&fresh, 0, sizeof(fresh));
+	fresh.last_fd = -1;
+	bpf_map_update_elem(&io_threads, &pid_tgid, &fresh, BPF_NOEXIST);
+	return bpf_map_lookup_elem(&io_threads, &pid_tgid);
+}
+
+// want_send has the thread's next send tell conn's socket.
+static __always_inline void want_send(struct io_thread *rt, __u64 conn)
+{
+	rt->want_conn = conn;
+	rt->want_len = 0;
 }
 
 /* Bookkeeping for calls in flight */
@@ -829,6 +887,74 @@ static __always_inline __s64 tls13_content_len(__u64 buf, __s64 n)
 	return -1;
 }
 
+// TLS_MAX_PLAINTEXT is the most plaintext a TLS record holds (RFC 8446,
+// section 5.1); a larger write is sent as several records.
+#define TLS_MAX_PLAINTEXT 16384
+// MAX_RECORDS_CHECKED bounds how many records of a receive or send are
+// looked through for a call's.
+#define MAX_RECORDS_CHECKED 4
+// WANT_MAX_NS bounds how long after a write over a memory BIO its send is
+// looked for (see memory_bio_return).
+#define WANT_MAX_NS 10000000
+
+// has_app_record reports whether the len bytes at buf, a receive's or a
+// send's, start with TLS records of which one, among the first few, is an
+// application data record that holds n bytes of plaintext: n plus the AEAD's
+// tag (16 bytes, or 8 for AES-CCM-8), plus TLS 1.3's inner content type or
+// TLS 1.2's explicit nonce (8 bytes, for AES-GCM and AES-CCM). CBC suites,
+// whose padding varies, don't match, and their calls get no socket.
+static __always_inline bool has_app_record(__u64 buf, __u64 len, __s64 n)
+{
+	__u64 off = 0;
+	for (int i = 0; i < MAX_RECORDS_CHECKED; i++) {
+		__u8 h[5];
+		if (off + sizeof(h) > len || bpf_probe_read_user(h, sizeof(h), (void *)(buf + off)))
+			return false;
+		if (h[0] < 0x14 || h[0] > 0x18 || h[1] != 0x03)
+			return false;
+		__s64 rlen = (__s64)h[3] << 8 | h[4];
+		__s64 extra = rlen - n;
+		if (h[0] == TLS_APPLICATION_DATA && (extra == 9 || extra == 16 || extra == 17 || extra == 24))
+			return true;
+		off += sizeof(h) + rlen;
+	}
+	return false;
+}
+
+// OpenSSL's SSL_read and SSL_write over memory BIOs, as Node.js uses them,
+// make no syscall: the program moves the records between the BIOs and its
+// socket itself, on the same thread (Node's event loop), with the receive
+// right before SSL_read and the send right after SSL_write. memory_bio_return
+// handles such a call returning n, with no socket seen during it, for a
+// connection whose socket isn't known. It's taken from that receive, or the
+// thread's next send (see note_thread_fd), only if it holds an application
+// data record of the call's length: so another connection's I/O in between,
+// or a send on another thread (Dart's), isn't taken for this one's. A write
+// returns EVENT_FLAG_SOCKET_LATER, for user space to wait for the send's
+// socket notice.
+static __always_inline __u8 memory_bio_return(__u64 pid_tgid, struct active_call *call, __s64 n)
+{
+	if (!have_btf || conn_known(pid_tgid, call->conn))
+		return 0;
+	// So the thread's receives are seen from the handshake on.
+	struct io_thread *rt = io_thread(pid_tgid);
+	if (!rt || n <= 0)
+		return 0;
+	if (call->fn == FN_SSL_WRITE || call->fn == FN_SSL_WRITE_EX) {
+		rt->want_conn = call->conn;
+		rt->want_len = n > TLS_MAX_PLAINTEXT ? TLS_MAX_PLAINTEXT : n;
+		rt->want_ns = bpf_ktime_get_ns();
+		return EVENT_FLAG_SOCKET_LATER;
+	}
+	__s32 fd = rt->last_fd;
+	if (fd < 0 || !rt->last_file || (__u64)socket_file(fd) != rt->last_file ||
+	    !has_app_record(rt->last_buf, rt->last_len, n))
+		return 0;
+	call->fd = fd;
+	track_conn(pid_tgid, call->conn, fd);
+	return 0;
+}
+
 static __always_inline int exit_call(struct pt_regs *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -908,7 +1034,10 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 	}
 	}
 
-	emit(&call, pid_tgid, n);
+	__u8 flags = 0;
+	if (call.fd < 0 && call.fn >= FN_SSL_READ && call.fn <= FN_SSL_WRITE_EX)
+		flags = memory_bio_return(pid_tgid, &call, n);
+	emit_flagged(&call, pid_tgid, n, flags);
 	return 0;
 }
 
@@ -989,6 +1118,10 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #define RECV_KIND(id)                                                         \
 	((id) == 0 || (id) == 45 ? RECV_BUF : (id) == 19 ? RECV_IOVEC :       \
 	 (id) == 47 ? RECV_MSG : (id) == 299 ? RECV_MMSG : 0)
+// Where a send's data is, as RECV_KIND says for receives.
+#define SEND_KIND(id)                                                         \
+	((id) == 1 || (id) == 44 ? RECV_BUF : (id) == 20 ? RECV_IOVEC :       \
+	 (id) == 46 ? RECV_MSG : (id) == 307 ? RECV_MMSG : 0)
 #define IS_SENDTO(id) ((id) == 44)
 #define IS_SENDMSG(id) ((id) == 46 || (id) == 307)
 #define IS_DATAGRAM_IO(id) ((id) >= 44 && (id) <= 47 || (id) == 299 || (id) == 307)
@@ -1009,6 +1142,9 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #define RECV_KIND(id)                                                         \
 	((id) == 63 || (id) == 207 ? RECV_BUF : (id) == 65 ? RECV_IOVEC :     \
 	 (id) == 212 ? RECV_MSG : (id) == 243 ? RECV_MMSG : 0)
+#define SEND_KIND(id)                                                         \
+	((id) == 64 || (id) == 206 ? RECV_BUF : (id) == 66 ? RECV_IOVEC :     \
+	 (id) == 211 ? RECV_MSG : (id) == 269 ? RECV_MMSG : 0)
 #define IS_SENDTO(id) ((id) == 206)
 #define IS_SENDMSG(id) ((id) == 211 || (id) == 269)
 #define IS_DATAGRAM_IO(id) ((id) == 206 || (id) == 207 || (id) == 211 || (id) == 212 || (id) == 243 || (id) == 269)
@@ -1046,28 +1182,6 @@ static __always_inline void emit_socket_notice(__u64 pid_tgid, __u64 conn)
 	__builtin_memcpy(r->h.raddr, info->raddr, sizeof(r->h.raddr));
 	bpf_ringbuf_submit(r, 0);
 }
-
-// Threads that called functions which don't do the socket I/O themselves:
-// rustls's Reader and Writer, and QUIC's packet encryption. On the same
-// thread, the receive happens before them and the send just after. So for
-// these threads, remember the last receive's socket, and which connection
-// the next send is for.
-struct io_thread {
-	__u64 want_conn; // a connection that wrote, waiting for its socket
-	__s32 last_fd;	 // the socket of the last receive
-	// The receive buffer the last decrypted packet was found at the start
-	// of, and its socket (see packet_fd).
-	__s32 dgram_fd;
-	__u64 dgram_start;
-	__u64 dgram_end;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 16384);
-	__type(key, __u64); // pid_tgid
-	__type(value, struct io_thread);
-} io_threads SEC(".maps");
 
 // Where these threads' receives put their data, and from which socket: a
 // received QUIC packet may be decrypted later, after I/O on other sockets
@@ -1133,33 +1247,41 @@ static __always_inline void note_sealed(__u64 pid_tgid, __u64 buf, __u64 conn)
 	bpf_map_update_elem(&sealed_packets, &key, &conn, BPF_ANY);
 }
 
-static __always_inline void note_recv_buf(__u64 pid_tgid, __s32 fd, int kind, struct pt_regs *regs)
+// io_buf finds a receive's or send's buffer, or its first, and its size,
+// from the syscall's arguments, as kind (RECV_KIND or SEND_KIND) says.
+// Returns false if there's none.
+static __always_inline bool io_buf(int kind, struct pt_regs *regs, __u64 *buf, __u64 *len)
 {
-	__u64 arg = 0, buf = 0, len = 0;
+	__u64 arg = 0;
 	if (bpf_probe_read_kernel(&arg, sizeof(arg), &SYSCALL_ARG1(regs)) || !arg)
-		return;
+		return false;
 	switch (kind) {
 	case RECV_BUF:
-		buf = arg;
-		if (bpf_probe_read_kernel(&len, sizeof(len), &SYSCALL_ARG2(regs)))
-			return;
+		*buf = arg;
+		if (bpf_probe_read_kernel(len, sizeof(*len), &SYSCALL_ARG2(regs)))
+			return false;
 		break;
 	case RECV_MSG: // struct msghdr: msg_iov at 16
 	case RECV_MMSG: // struct mmsghdr starts with one
 		if (bpf_probe_read_user(&arg, sizeof(arg), (void *)(arg + 16)) || !arg)
-			return;
+			return false;
 		// fall through
 	case RECV_IOVEC: { // struct iovec: iov_base, iov_len
 		__u64 iov[2] = {};
 		if (bpf_probe_read_user(iov, sizeof(iov), (void *)arg))
-			return;
-		buf = iov[0];
-		len = iov[1];
+			return false;
+		*buf = iov[0];
+		*len = iov[1];
 		break;
 	}
+	default:
+		return false;
 	}
-	if (!buf)
-		return;
+	return *buf != 0;
+}
+
+static __always_inline void note_recv_buf(__u64 pid_tgid, __s32 fd, __u64 buf, __u64 len)
+{
 	struct recv_buf_key key;
 	__builtin_memset(&key, 0, sizeof(key));
 	key.tgid = pid_tgid >> 32;
@@ -1345,15 +1467,30 @@ static __always_inline void note_thread_fd(__u64 fd, long id, struct pt_regs *re
 		if (family != AF_INET && family != AF_INET6)
 			return;
 	}
+	__u64 buf = 0, len = 0;
 	int kind = RECV_KIND(id);
 	if (kind) {
 		rt->last_fd = (__s32)fd;
-		note_recv_buf(pid_tgid, (__s32)fd, kind, regs);
+		rt->last_buf = 0;
+		if (!io_buf(kind, regs, &buf, &len))
+			return;
+		note_recv_buf(pid_tgid, (__s32)fd, buf, len);
+		if (have_btf) {
+			rt->last_buf = buf;
+			rt->last_len = len > 0xffffffff ? 0xffffffff : (__u32)len;
+			rt->last_file = (__u64)socket_file((__s32)fd);
+		}
 		return;
 	}
 	__u64 conn = rt->want_conn;
 	if (conn) {
 		rt->want_conn = 0;
+		// A write over a memory BIO: only a send of its record, soon after.
+		__u32 want_len = rt->want_len;
+		rt->want_len = 0;
+		if (want_len && (bpf_ktime_get_ns() - rt->want_ns > WANT_MAX_NS ||
+				 !io_buf(SEND_KIND(id), regs, &buf, &len) || !has_app_record(buf, len, want_len)))
+			return;
 		if (track_conn(pid_tgid, conn, (__s32)fd))
 			emit_socket_notice(pid_tgid, conn);
 	}
@@ -1837,18 +1974,6 @@ static __always_inline __u64 rust_conn(const void *self)
 	return conn;
 }
 
-static __always_inline struct io_thread *io_thread(__u64 pid_tgid)
-{
-	struct io_thread *rt = bpf_map_lookup_elem(&io_threads, &pid_tgid);
-	if (rt)
-		return rt;
-	struct io_thread fresh;
-	__builtin_memset(&fresh, 0, sizeof(fresh));
-	fresh.last_fd = -1;
-	bpf_map_update_elem(&io_threads, &pid_tgid, &fresh, BPF_NOEXIST);
-	return bpf_map_lookup_elem(&io_threads, &pid_tgid);
-}
-
 SEC("uprobe/rustls_read")
 int BPF_UPROBE(rustls_read_enter, const void *self, void *buf)
 {
@@ -1872,7 +1997,7 @@ int BPF_UPROBE(rustls_write_enter, const void *self, const void *buf)
 	__u64 conn = rust_conn(self);
 	struct io_thread *rt = io_thread(pid_tgid);
 	if (rt)
-		rt->want_conn = conn;
+		want_send(rt, conn);
 	return enter_call(ctx, FN_RUSTLS_WRITE, RET_RUST_RESULT, conn, buf, 0);
 }
 
@@ -2004,7 +2129,7 @@ static __always_inline int seal_enter(__u64 pid_tgid, __u8 fn, __u64 conn, __u64
 {
 	struct io_thread *rt = io_thread(pid_tgid);
 	if (rt)
-		rt->want_conn = conn;
+		want_send(rt, conn);
 	struct active_call call;
 	__builtin_memset(&call, 0, sizeof(call));
 	call.start_ns = bpf_ktime_get_ns();
@@ -2470,7 +2595,7 @@ int aes_aead_enter(struct pt_regs *ctx)
 				     func_arg(ctx, 2), fd, func_arg(ctx, 8), (__u32)func_arg(ctx, 9));
 	}
 	if (rt)
-		rt->want_conn = key.ctx;
+		want_send(rt, key.ctx);
 	// Copy the plaintext now, in case it is encrypted in place.
 	struct active_call call;
 	__builtin_memset(&call, 0, sizeof(call));
@@ -2650,7 +2775,7 @@ int ossl_cipher_final_enter(struct pt_regs *ctx)
 	// What's sealed goes out with the thread's next send.
 	struct io_thread *rt = io_thread(pid_tgid);
 	if (rt)
-		rt->want_conn = key.ctx;
+		want_send(rt, key.ctx);
 	struct active_call call;
 	__builtin_memset(&call, 0, sizeof(call));
 	call.start_ns = pkt->start_ns;

@@ -57,7 +57,10 @@ func (h *rawHeader) addresses() (local, remote netip.AddrPort) {
 	return netip.AddrPortFrom(l, h.Lport), netip.AddrPortFrom(r, h.Rport)
 }
 
-const flagReadError = 1 // EVENT_FLAG_READ_ERROR
+const (
+	flagReadError   = 1 // EVENT_FLAG_READ_ERROR
+	flagSocketLater = 2 // EVENT_FLAG_SOCKET_LATER
+)
 
 var headerSize = binary.Size(rawHeader{})
 
@@ -195,7 +198,7 @@ func (a *assembler) newEvent(c chunk) *Event {
 	if n := min(int(c.QuicHeaderLen), len(c.QuicHeader)); n > 0 {
 		quicHeader = bytes.Clone(c.QuicHeader[:n])
 	}
-	return &Event{
+	ev := &Event{
 		QUICHeader: quicHeader,
 		Local:      local,
 		Remote:     remote,
@@ -212,4 +215,6 @@ func (a *assembler) newEvent(c chunk) *Event {
 		// a header saying more isn't to be trusted with memory.
 		Data: make([]byte, 0, min(c.Captured, MaxCaptureLimit)),
 	}
+	ev.socketLater = c.Flags&flagSocketLater != 0
+	return ev
 }
