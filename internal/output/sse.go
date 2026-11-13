@@ -242,6 +242,20 @@ func sseEvents(events []sseEvent) int {
 	return n
 }
 
+// sseDone reports whether events end with "data: [DONE]", the event that
+// ends an OpenAI API stream (and those of the many servers compatible with
+// it). For --requests it ends the response: OpenAI's Python SDK stops
+// reading there and closes the connection, so the body's own end, its last
+// chunk, is never read, and the response would never get its line.
+func sseDone(events []sseEvent) bool {
+	for i := len(events) - 1; i >= 0; i-- {
+		if e := events[i]; !e.commentOnly() {
+			return e.Type == "" && e.HasData && e.Data == "[DONE]"
+		}
+	}
+	return false
+}
+
 // sseKeepAlive reports whether a piece of an event stream only carries
 // comments, as servers send to keep the connection open.
 func sseKeepAlive(isSSE bool, events []sseEvent, part bodyPart) bool {
