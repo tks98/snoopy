@@ -147,7 +147,7 @@ func (r *Requests) line(e *harEntry, streaming bool) string {
 		return b.String()
 	}
 	if resp.seen {
-		b.WriteString(", " + sizeOf(resp))
+		b.WriteString(", " + cmpOr(e.tunnel, sizeOf(resp)))
 		if isEventStream(ct) || resp.events > 0 {
 			b.WriteString(", " + fmt.Sprint(resp.events) + " " + plural(resp.events, "event", "events"))
 		}

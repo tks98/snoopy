@@ -118,9 +118,7 @@ selected with `--comm`, `--pid` or `--container`, or in a process that
 maps libcrypto and `dlopen`s what uses OpenSSL's QUIC more than 3 s after
 it starts (see [maintenance.md](maintenance.md#http3-through-openssls-quic-curl-on-debian)), programs that use OpenSSL only through its BIO layer (e.g.
 `openssl s_server -www`), bodies compressed with a shared dictionary
-(Chrome's `dcb` and `dcz`), which are shown as sent, and WebSocket over
-HTTP/2 (RFC 8441) or HTTP/3 (RFC 9220), whose frames are shown as the
-stream's DATA.
+(Chrome's `dcb` and `dcz`), which are shown as sent.
 
 
 ## Tracing calls
@@ -211,6 +209,15 @@ decompressor notices, since they point back further than it has. A frame
 that can't be valid, or bytes of a frame header that weren't captured,
 stop the decoding of that direction. A connection that switched before
 snoopy started has no handshake to go by, and is shown as data.
+
+WebSocket over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) is the same, on one
+stream: a request with `:method CONNECT` and `:protocol websocket` (an
+extended CONNECT) and a 2xx response make the stream's DATA, in each
+direction, the stream of frames, with the extensions the response's
+`sec-websocket-extensions` accepted. The frames are found in the DATA
+frames' payloads, whichever way those split them. Their headers are
+decoded like any others', so a connection that started before snoopy
+isn't followed as WebSocket either.
 
 ## TLS records
 

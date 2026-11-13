@@ -45,6 +45,9 @@ type http2Frame struct {
 	// IsSSE, and the events this frame completed.
 	IsSSE bool
 	SSE   []sseEvent
+	// WS is, for DATA on a stream that's a WebSocket (RFC 8441), the
+	// WebSocket frames in its payload.
+	WS *wsPart
 }
 
 // bodyPart is what a piece of a message body decoded to.
@@ -159,7 +162,12 @@ type http2Conn struct {
 	// paths are the streams' requests' :paths, which their responses'
 	// gRPC messages are named by: the request's and the response's headers
 	// come in different directions.
-	paths    map[uint32]string
+	paths map[uint32]string
+	// wsOffers are the streams whose requests are extended CONNECTs for
+	// WebSocket, until their responses; ws the streams that a response
+	// made WebSocket, until they end.
+	wsOffers map[uint32]bool
+	ws       map[uint32]*http2WS
 	schemas  *ProtoSchemas
 	late     bool // started before snoopy: no preface, no headers
 	noted    bool // the note saying so was returned
@@ -190,6 +198,14 @@ type http2Dir struct {
 	grpc           map[uint32]*grpcStream  // by stream, for gRPC calls
 	sse            map[uint32]*sseStream   // by stream, for text/event-stream bodies
 	conn           *http2Conn
+	dir            tracer.Direction // which of conn's directions this is
+}
+
+// http2WS is a stream that's a WebSocket: its decoder, and which of its
+// directions ended (END_STREAM), after which it's forgotten.
+type http2WS struct {
+	c     *wsConn
+	ended [2]bool
 }
 
 // dataFrame is the DATA frame being read, to find its body bytes: a padded
@@ -200,6 +216,20 @@ type dataFrame struct {
 	off       int  // payload bytes read so far
 	pad       int  // padding length, -1 until read
 	endStream bool // END_STREAM
+}
+
+// bodyLost advances past n bytes of the frame's payload that weren't
+// captured, and returns how many of them were body bytes. A padded frame
+// whose padding length wasn't captured is taken to have none.
+func (f *dataFrame) bodyLost(n int) int {
+	start := f.off
+	f.off += n
+	if f.pad <= 0 {
+		f.pad = 0
+		return n
+	}
+	lo, hi := max(start, 1), min(f.off, f.length-f.pad)
+	return max(hi-lo, 0)
 }
 
 // bodyBytes returns the body bytes in the next piece of the frame's payload.
@@ -314,10 +344,11 @@ func (c *http2Conns) start(key http2Key, late bool) *http2Conn {
 		c.conns[oldest].close()
 		delete(c.conns, oldest)
 	}
-	conn := &http2Conn{late: late, paths: map[uint32]string{}, schemas: c.schemas}
+	conn := &http2Conn{late: late, paths: map[uint32]string{}, wsOffers: map[uint32]bool{}, ws: map[uint32]*http2WS{},
+		schemas: c.schemas}
 	for i := range conn.dirs {
 		d := &conn.dirs[i]
-		d.conn = conn
+		d.conn, d.dir = conn, tracer.Direction(i)
 		if !late {
 			d.dec = hpack.NewDecoder(4096, d.field)
 			// The peer's SETTINGS may allow a larger table; we only listen.
@@ -396,7 +427,7 @@ func (d *http2Dir) add(data []byte, missing int, why string, pool *bodyPool) ([]
 					}
 				}
 				d.dataLeft -= missing
-				d.data.off += missing
+				d.wsLost(&frames, d.data.bodyLost(missing), why)
 				if info := d.infos[d.data.stream]; info != nil {
 					info.seen += int64(missing)
 				}
@@ -404,6 +435,7 @@ func (d *http2Dir) add(data []byte, missing int, why string, pool *bodyPool) ([]
 					delete(d.bodies, d.data.stream)
 					delete(d.infos, d.data.stream)
 					delete(d.sse, d.data.stream)
+					d.wsEnd(d.data.stream)
 					if n := len(frames); n > 0 && frames[n-1].Stream == d.data.stream {
 						frames[n-1].EndsStream = true
 					} else {
@@ -461,6 +493,8 @@ func (d *http2Dir) add(data []byte, missing int, why string, pool *bodyPool) ([]
 			}
 			delete(d.infos, stream)
 			delete(d.sse, stream)
+			delete(d.conn.ws, stream)
+			delete(d.conn.wsOffers, stream)
 		}
 		frames = append(frames, f)
 	}
@@ -495,6 +529,65 @@ func (d *http2Dir) dataPiece(f *http2Frame) {
 		if last {
 			delete(d.sse, stream)
 		}
+	}
+	if ws := d.conn.ws[stream]; ws != nil && len(body) > 0 {
+		f.WS = ws.c.decode(d.dir, body)
+	}
+	if last {
+		d.wsEnd(stream)
+	}
+}
+
+// wsLost accounts for n body bytes of the current DATA frame that weren't
+// captured, for the reason why, if its stream is a WebSocket: on the last
+// of frames if that's more of the frame, else on a new item.
+func (d *http2Dir) wsLost(frames *[]http2Frame, n int, why string) {
+	ws := d.conn.ws[d.data.stream]
+	if ws == nil || n == 0 {
+		return
+	}
+	if k := len(*frames); k > 0 && (*frames)[k-1].Type == "DATA" && (*frames)[k-1].Stream == d.data.stream {
+		last := &(*frames)[k-1]
+		last.WS = ws.c.skip(d.dir, last.WS, n, why)
+		return
+	}
+	if p := ws.c.skip(d.dir, nil, n, why); p != nil {
+		*frames = append(*frames, http2Frame{Type: "DATA", Stream: d.data.stream, Continued: true, WS: p})
+	}
+}
+
+// wsEnd notes that this direction of a stream ended, and forgets the
+// stream's WebSocket once both have.
+func (d *http2Dir) wsEnd(stream uint32) {
+	if ws := d.conn.ws[stream]; ws != nil {
+		ws.ended[d.dir] = true
+		if ws.ended[opposite(d.dir)] {
+			delete(d.conn.ws, stream)
+		}
+	}
+}
+
+// wsHeaders notes a request that's an extended CONNECT for WebSocket, and
+// follows its stream as a WebSocket once a 2xx response accepts it.
+func (d *http2Dir) wsHeaders(stream uint32, fields []hpack.HeaderField) {
+	c := d.conn
+	if wsConnect(fields) {
+		if len(c.wsOffers) >= maxBodyInfos {
+			clear(c.wsOffers)
+		}
+		c.wsOffers[stream] = true
+		return
+	}
+	status, ok := headerField(fields, ":status")
+	if !ok || !c.wsOffers[stream] || strings.HasPrefix(status, "1") {
+		return
+	}
+	delete(c.wsOffers, stream)
+	if ws := wsAccept(fields, d.dir); ws != nil {
+		if len(c.ws) >= maxBodyInfos {
+			clear(c.ws)
+		}
+		c.ws[stream] = &http2WS{c: ws}
 	}
 }
 
@@ -631,6 +724,7 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 			f.Body = decodeBody(dec, nil, true)
 		}
 		d.sseHeaders(f, stream, fields)
+		d.wsHeaders(stream, fields)
 	}
 	return nil
 }
