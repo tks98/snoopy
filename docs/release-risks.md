@@ -242,7 +242,9 @@ thing it depends on ships.
   arguments mean nothing or garbage.
 - **Guarded by:** `TestQuicGoHTTP3`, in CI, which builds the quic-go program
   in `internal/tracer/testdata/quicgo` with the latest quic-go it was
-  updated to.
+  updated to, and `TestQuicGoDialAddr`, whose client dials with
+  `quic.DialAddrEarly` and so gets zero-length connection IDs, which make
+  the server's short headers as short as 2 bytes.
 
 ### Go crypto/tls
 

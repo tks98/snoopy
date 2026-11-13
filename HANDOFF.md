@@ -403,13 +403,18 @@ signature finding against real binaries (see
   `tls.Conn`'s methods, stripped binaries included, but only in programs
   with quic-go (`quicGoFunc`): every Go TLS record goes through them, and
   other code uses AES-GCM too. `go_quic_header` also wants a plausible QUIC
-  header. Their thirteen argument words spill to the stack on amd64
-  (`go_aead_args`). `Seal` emits at entry and notes the packet for
-  `sealed_packets`; `Open` is pushed for every call, so `(*tls.Conn).Read`'s
-  depth matching holds, and emits at its RETs. quic-go uses one
-  unconnected socket and separate goroutines like quinn, so the same
-  `quic_procs`, packet-sent notices and connection IDs give sockets and
-  peers.
+  header: the fixed bit, and a long header's version. It reads the version
+  only for a long header, since a short header to a zero-length connection
+  ID, as quic-go's `quic.DialAddr` clients get, is only the flags and the
+  packet number, 2 to 5 bytes (`TestQuicGoDialAddr`). Their thirteen
+  argument words spill to the stack on amd64 (`go_aead_args`). `Seal`
+  emits at entry and notes the packet for `sealed_packets`; `Open` is
+  pushed for every call, so `(*tls.Conn).Read`'s depth matching holds, and
+  emits at its RETs. quic-go uses one unconnected socket and separate
+  goroutines like quinn, so the same `quic_procs`, packet-sent notices and
+  connection IDs give sockets and peers. A `quic.DialAddr` client has a
+  socket of its own and zero-length IDs, so is followed by socket; a server
+  with several such clients at once can't tell them apart (`cidConns`).
 - **Warnings for quiet failures:** `quic_traffic` counts, per traced
   process, datagrams on UDP sockets connected to port 443 (`note_udp443`,
   only the datagram syscalls, up to 64) and untraceable Firefox packets;
@@ -529,10 +534,8 @@ signature finding against real binaries (see
   `TestWebSocketStreams` checks HTTP/2 (net/http's server, x/net/http2's
   client, `GODEBUG=http2xconnect=1`) and HTTP/3 (quic-go) with
   `testdata/wsstreams`, which frames WebSocket itself: no library there
-  speaks RFC 8441 or 9220. Its quic-go client needs its own
-  `quic.Transport`: `quic.DialAddr`'s uses zero-length connection IDs,
-  so the server's short headers are 2 or 3 bytes, under the 5 that
-  `go_quic_header` wants, and its packets aren't captured.
+  speaks RFC 8441 or 9220. Its quic-go client has its own
+  `quic.Transport`, as the quicgo program's does by default.
 - **`--requests`** (`output/requests.go`) is the HAR writer's pairing with
   no entries kept (`maxKept` 0, so bodies are only counted) and a `done`
   hook, called once per exchange when its response ends: an HTTP/2 or

@@ -5,20 +5,13 @@ package tracer_test
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
-	"fmt"
-	"net"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/tks98/snoopy/v2/internal/discover"
 	"github.com/tks98/snoopy/v2/internal/output"
 	"github.com/tks98/snoopy/v2/internal/tracer"
 )
@@ -30,81 +23,7 @@ import (
 // the packet it arrived in, as it arrived, and a line for the stream at its
 // headers and at its end.
 func TestSSEHTTP3(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("needs root")
-	}
-	goTool, err := exec.LookPath("go")
-	if err != nil {
-		if os.Getenv("SNOOPY_TEST_STRICT") == "1" {
-			t.Fatal("go not installed (and SNOOPY_TEST_STRICT=1)")
-		}
-		t.Skip("go not installed")
-	}
-	program := filepath.Join(t.TempDir(), "quicgo")
-	build := exec.Command(goTool, "build", "-o", program, ".")
-	build.Dir = "testdata/quicgo"
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build quic-go program: %v: %s", err, out)
-	}
-	targets, err := discover.Inspect(program)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr, err := tracer.New(tracer.Options{Comm: "quicgo"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tr.Close()
-	for _, target := range targets {
-		if _, err := tr.Attach(target, 0); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tr.AttachSyscalls(); err != nil {
-		t.Fatal(err)
-	}
-	var mu sync.Mutex
-	var events []*tracer.Event
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- tr.Run(ctx, func(ev *tracer.Event) {
-			mu.Lock()
-			events = append(events, ev)
-			mu.Unlock()
-		})
-	}()
-	defer func() {
-		cancel()
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
-	}()
-
-	// The server, under a name --comm doesn't match, so that only the
-	// client's side is traced.
-	l, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := fmt.Sprint(l.LocalAddr().(*net.UDPAddr).Port)
-	l.Close()
-	server := filepath.Join(t.TempDir(), "qgserver")
-	if err := os.Symlink(program, server); err != nil {
-		t.Fatal(err)
-	}
-	srv := exec.Command(server, "server", port)
-	stdout, err := srv.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := srv.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = srv.Process.Kill(); _ = srv.Wait() })
-	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "listening\n" {
-		t.Fatalf("quic-go server: %q, %v", line, err)
-	}
+	program, port, snapshot := traceQuicGo(t)
 
 	// As testdata/quicgo's events handler sends them.
 	big := strings.Repeat("x", 5000)
@@ -126,10 +45,7 @@ func TestSSEHTTP3(t *testing.T) {
 		var got []sseSeen
 		var lines []string
 		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
-			mu.Lock()
-			evs := slices.Clone(events)
-			mu.Unlock()
-			got, lines = decodeSSE(t, evs, path)
+			got, lines = decodeSSE(t, snapshot(false), path)
 			if len(got) >= len(want) && len(lines) >= 2 {
 				break
 			}
@@ -155,9 +71,7 @@ func TestSSEHTTP3(t *testing.T) {
 		if len(lines) != 2 || !strings.Contains(lines[0], ", streaming, ") || !strings.Contains(lines[1], ", 7 events, ") {
 			t.Errorf("gzip=%s: --requests:\n%s", gzip, strings.Join(lines, "\n"))
 		}
-		mu.Lock()
-		events = nil
-		mu.Unlock()
+		snapshot(true)
 	}
 }
 

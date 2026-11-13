@@ -337,6 +337,50 @@ func TestQUICConnectionsOnOneSocket(t *testing.T) {
 	}
 }
 
+// A connection whose client uses zero-length connection IDs, as quic-go's
+// quic.DialAddr does, is followed by its socket, both ways, even when the
+// socket has another connection known by its IDs: the server's short
+// headers, only flags and a packet number, aren't matched to that one's
+// IDs, though a 4-byte packet number is as long as them.
+func TestQUICZeroLengthConnectionIDs(t *testing.T) {
+	c := newQUICConns(newBodyPool())
+	long := func(dcid, scid []byte) []byte {
+		return cat([]byte{0xc3, 0, 0, 0, 1, byte(len(dcid))}, dcid, []byte{byte(len(scid))}, scid)
+	}
+	ev := func(fn tracer.Function, hdr []byte, data []byte) *tracer.Event {
+		e := quicEvent(fn, data)
+		e.FD, e.QUICHeader = 5, hdr
+		return e
+	}
+	crypto := []byte{0x06, 0x00, 0x01, 0xff} // CRYPTO off=0 len=1
+
+	// A connection with 4-byte IDs, quic-go's default, and one whose
+	// client's ID is zero-length: its Initial has no source ID, and the
+	// server's packets have no destination ID.
+	own, server := []byte{0xa1, 0xa2, 0xa3, 0xa4}, []byte{0x51, 0x52, 0x53, 0x54}
+	http3OfEvent(t, c, ev(tracer.FuncQUICRecv, long(own, server), crypto))
+	server2 := []byte{0x61, 0x62, 0x63, 0x64}
+	http3OfEvent(t, c, ev(tracer.FuncQUICSend, long([]byte{1, 2, 3, 4, 5, 6, 7, 8}, nil), crypto))
+	http3OfEvent(t, c, ev(tracer.FuncQUICRecv, long(nil, server2), crypto))
+
+	// The second connection's request, sent to the server's ID, and its
+	// response in two packets, the second with a 4-byte packet number equal
+	// to the first connection's ID.
+	request := streamFrameBytes(0, 0, h3Frame(0x01, []byte{0x00, 0x00, 0xd1}), true) // :method GET
+	if got := http3OfEvent(t, c, ev(tracer.FuncQUICSend, cat([]byte{0x40}, server2, []byte{0x07}), request)); !slices.Equal(got, []string{"HEADERS :method=GET"}) {
+		t.Errorf("request: %q", got)
+	}
+	body := h3Frame(0x00, []byte("hello, zero"))
+	got := http3OfEvent(t, c, ev(tracer.FuncQUICRecv, []byte{0x40, 0x07}, streamFrameBytes(0, 0, body[:6], false)))
+	got = append(got, http3OfEvent(t, c, ev(tracer.FuncQUICRecv, cat([]byte{0x43}, own), streamFrameBytes(0, 6, body[6:], true)))...)
+	if want := []string{"DATA hell", "DATA (continued) o, zero"}; !slices.Equal(got, want) {
+		t.Errorf("response: got %q, want %q", got, want)
+	}
+	if k := c.last; k.fd != 5 {
+		t.Errorf("the response's packets went to %+v, not the socket's", k)
+	}
+}
+
 // Headers that can't be decoded, because their connection started before
 // snoopy, are warned about.
 func TestWarnStartedEarly(t *testing.T) {
