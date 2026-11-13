@@ -6,15 +6,18 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/net/http2/hpack"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // gRPC runs over HTTP/2: a call's request and response are streams of
@@ -26,8 +29,11 @@ import (
 
 // grpcMessage is a message a DATA frame completed.
 type grpcMessage struct {
-	Length     int  // as framed, compressed if Compressed
-	Compressed bool // with the stream's grpc-encoding
+	Method     string // the call's path, /package.Service/Method, if its request was seen
+	Request    bool   // a request's message, not a response's
+	Type       string // its type, if a --proto schema has the method
+	Length     int    // as framed, compressed if Compressed
+	Compressed bool   // with the stream's grpc-encoding
 	// Fields is the message decoded as protobuf, one line per field, nested
 	// messages indented; nil if it isn't protobuf, or wasn't decoded.
 	Fields []string
@@ -41,9 +47,12 @@ const (
 
 // grpcStream reassembles one stream direction's messages.
 type grpcStream struct {
-	encoding string // grpc-encoding
-	buf      []byte // bytes of the message under way, from its prefix
-	skip     int    // bytes still to skip of a message too large to decode
+	method   string                         // the call's path, if its request was seen
+	request  bool                           // the request's direction
+	typ      protoreflect.MessageDescriptor // its messages' type, if a schema has the method
+	encoding string                         // grpc-encoding
+	buf      []byte                         // bytes of the message under way, from its prefix
+	skip     int                            // bytes still to skip of a message too large to decode
 }
 
 // isGRPC reports whether a content type is gRPC's (application/grpc,
@@ -103,13 +112,20 @@ func (s *grpcStream) add(p []byte) []grpcMessage {
 }
 
 func (s *grpcStream) message(compressed bool, b []byte) grpcMessage {
-	m := grpcMessage{Length: len(b), Compressed: compressed}
+	m := grpcMessage{Method: s.method, Request: s.request, Length: len(b), Compressed: compressed}
 	if compressed {
 		var err error
 		if b, err = decompressGRPC(s.encoding, b); err != nil {
 			m.Err = err.Error()
 			return m
 		}
+	}
+	if s.typ != nil {
+		if fields, err := decodeTyped(s.typ, b); err == nil {
+			m.Fields, m.Type = fields, string(s.typ.FullName())
+			return m
+		}
+		// Not of the schema's type (another version of it, say): shown raw.
 	}
 	if fields, ok := decodeProtobuf(b, 0); ok {
 		m.Fields = fields
@@ -118,6 +134,15 @@ func (s *grpcStream) message(compressed bool, b []byte) grpcMessage {
 	}
 	return m
 }
+
+// grpcZstd is the decoder for zstd messages, shared since making one is
+// costly. Its window is limited as bodies' are, and its output to
+// maxGRPCMessage: a frame's header can otherwise ask for gigabytes.
+// DecodeAll can be used by several goroutines at once.
+var grpcZstd = sync.OnceValues(func() (*zstd.Decoder, error) {
+	return zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true),
+		zstd.WithDecoderMaxWindow(zstdMaxWindow), zstd.WithDecoderMaxMemory(maxGRPCMessage))
+})
 
 // decompressGRPC decompresses a message with one of gRPC's encodings
 // (grpc-encoding), up to maxGRPCMessage bytes.
@@ -133,11 +158,18 @@ func decompressGRPC(encoding string, b []byte) ([]byte, error) {
 			r, err = flate.NewReader(bytes.NewReader(b)), nil
 		}
 	case "zstd":
-		var d *zstd.Decoder
-		if d, err = zstd.NewReader(bytes.NewReader(b)); err == nil {
-			defer d.Close()
-			r = d
+		d, err := grpcZstd()
+		if err != nil {
+			return nil, fmt.Errorf("zstd: %v", err)
 		}
+		out, err := d.DecodeAll(b, nil)
+		if errors.Is(err, zstd.ErrDecoderSizeExceeded) {
+			return nil, fmt.Errorf("more than %d bytes decompressed, not decoded", maxGRPCMessage)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("zstd: %v", err)
+		}
+		return out, nil
 	case "", "identity":
 		return nil, fmt.Errorf("compressed, but the stream has no grpc-encoding")
 	default:
@@ -267,4 +299,12 @@ func grpcStatusName(value string) string {
 		return ""
 	}
 	return grpcStatusNames[n]
+}
+
+// grpcKind says whether a message is a call's request or its response.
+func grpcKind(m grpcMessage) string {
+	if m.Request {
+		return "request"
+	}
+	return "response"
 }

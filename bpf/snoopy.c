@@ -74,6 +74,14 @@ enum fn_id {
 	FN_JSSE_SOCKET_WRITE,
 	FN_JSSE_ENGINE_UNWRAP,
 	FN_JSSE_ENGINE_WRAP,
+	// QUIC packets through OpenSSL's own QUIC (3.2 and later), where
+	// libcrypto's EVP_CipherUpdate encrypts and decrypts them.
+	FN_OSSL_QUIC_SEND,
+	FN_OSSL_QUIC_RECV,
+	// TLS records of Erlang's ssl, which its crypto NIF encrypts and
+	// decrypts with libcrypto's EVP_EncryptUpdate and EVP_DecryptUpdate.
+	FN_ERL_RECORD_SEND,
+	FN_ERL_RECORD_RECV,
 };
 
 // A header-only record that isn't a call: a connection whose earlier events
@@ -95,6 +103,8 @@ enum ret_kind {
 	RET_KNOWN_LEN, // nothing; the byte count, known at entry, is kept in len_ptr
 	RET_KNOWN_LEN_TLS13, // RET_KNOWN_LEN, a TLS 1.3 record's inner plaintext
 	RET_ZERO_KNOWN_LEN, // int: 0 on success; the byte count, known at entry, is kept in len_ptr
+	RET_ONE_KNOWN_LEN, // int: 1 on success; the byte count, known at entry, is kept in len_ptr
+	RET_ONE_KNOWN_LEN_TLS13, // RET_ONE_KNOWN_LEN, a TLS 1.3 record's inner plaintext
 };
 
 #define EVENT_FLAG_READ_ERROR 1 // the payload could not be copied
@@ -155,6 +165,9 @@ const volatile bool have_btf = false;
 // kernel's.
 const volatile __u64 pidns_dev = 0;
 const volatile __u64 pidns_ino = 0;
+// Whether user space registers Java agents' sessions (--java). Without, the
+// verifier drops looking for their frames in every write.
+const volatile bool java_enabled = false;
 
 struct active_call {
 	__u64 start_ns;
@@ -275,11 +288,11 @@ struct {
 
 // With --pid, the processes to trace: the one given and those it starts.
 // User space adds them as it finds them, and so does is_traced_tgid, with
-// BTF, at a process's first call.
+// BTF, at a process's first call; sched_process_exit deletes them.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
-	__type(key, __u32); // tgid
+	__type(key, __u32); // TGID as snoopy sees it (ns_pid_tgid)
 	__type(value, __u8);
 } traced_tgids SEC(".maps");
 
@@ -507,8 +520,13 @@ static __always_inline bool track_conn(__u64 pid_tgid, __u64 conn, __s32 fd)
 	struct conn_info info;
 	__builtin_memset(&info, 0, sizeof(info));
 	info.fd = fd;
-	if (have_btf)
+	if (have_btf) {
 		resolve_socket(fd, &info);
+		// Not a socket: a file the library read during the call, whose
+		// number can be reused for another connection's socket.
+		if (!info.file)
+			return false;
+	}
 
 	// Once a socket is closed (e.g. reset by the peer), the kernel releases
 	// its port and skc_num reads 0, yet buffered data can still be read.
@@ -568,7 +586,18 @@ static __always_inline int output_last_chunk(const struct event_header *h, const
 // still the same socket. Without BTF, there's no telling.
 static __always_inline bool conn_info_live(struct conn_info *info)
 {
-	return !have_btf || !info->file || (__u64)socket_file(info->fd) == info->file;
+	return !have_btf || (info->file && (__u64)socket_file(info->fd) == info->file);
+}
+
+// Reports whether a connection's socket is known, and still open.
+static __always_inline bool conn_known(__u64 pid_tgid, __u64 conn)
+{
+	struct conn_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.conn = conn;
+	struct conn_info *info = bpf_map_lookup_elem(&conn_infos, &key);
+	return info && conn_info_live(info);
 }
 
 // The flags to submit a call's records with: no wakeup if this CPU woke the
@@ -608,51 +637,61 @@ static __always_inline void output_chunks(struct event_header *h, __u64 buf, __u
 	}
 }
 
-static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
+// fill_header fills in the header of an event for call, of n bytes, at now.
+// It returns false for a process outside snoopy's PID namespace, which
+// can't be told apart.
+static __always_inline bool fill_header(struct event_header *h, struct active_call *call, __u64 pid_tgid, __s64 n,
+					__u64 now)
 {
-	if (n <= 0)
-		return;
-
 	__u64 ns = pidns_ino ? ns_pid_tgid() : pid_tgid;
 	if (!ns)
-		return; // outside snoopy's PID namespace, where it can't be told apart
+		return false;
 
-	struct event_header h;
-	__builtin_memset(&h, 0, sizeof(h));
-	__u64 now = bpf_ktime_get_ns();
-	h.timestamp_ns = now;
-	h.latency_ns = now - call->start_ns;
-	h.conn_id = call->conn;
-	h.pid = ns >> 32;
-	h.tid = (__u32)ns;
-	h.size = n > 0xffffffff ? 0xffffffff : (__u32)n;
-	h.fn = call->fn;
-	get_process_name(h.comm);
+	__builtin_memset(h, 0, sizeof(*h));
+	h->timestamp_ns = now;
+	h->latency_ns = now - call->start_ns;
+	h->conn_id = call->conn;
+	h->pid = ns >> 32;
+	h->tid = (__u32)ns;
+	h->size = n > 0xffffffff ? 0xffffffff : (__u32)n;
+	h->fn = call->fn;
+	get_process_name(h->comm);
 
-	h.fd = call->fd;
+	h->fd = call->fd;
 	struct conn_key key;
 	__builtin_memset(&key, 0, sizeof(key));
 	key.tgid = pid_tgid >> 32;
 	key.conn = call->conn;
 	struct conn_info *info = bpf_map_lookup_elem(&conn_infos, &key);
-	if (info && (h.fd < 0 || h.fd == info->fd) && conn_info_live(info)) {
-		h.fd = info->fd;
-		h.family = info->family;
-		h.lport = info->lport;
-		h.rport = info->rport;
-		__builtin_memcpy(h.laddr, info->laddr, sizeof(h.laddr));
-		__builtin_memcpy(h.raddr, info->raddr, sizeof(h.raddr));
+	if (info && (h->fd < 0 || h->fd == info->fd) && conn_info_live(info)) {
+		h->fd = info->fd;
+		h->family = info->family;
+		h->lport = info->lport;
+		h->rport = info->rport;
+		__builtin_memcpy(h->laddr, info->laddr, sizeof(h->laddr));
+		__builtin_memcpy(h->raddr, info->raddr, sizeof(h->raddr));
 	}
 
 	if (call->ad && call->ad_len) {
 		__u32 len = call->ad_len;
 		if (len > QUIC_HEADER_MAX)
 			len = QUIC_HEADER_MAX;
-		if (!bpf_probe_read_user(h.quic_header, len, (void *)call->ad))
-			h.quic_header_len = len;
+		if (!bpf_probe_read_user(h->quic_header, len, (void *)call->ad))
+			h->quic_header_len = len;
 	}
 
-	h.captured = h.size < max_capture ? h.size : max_capture;
+	h->captured = h->size < max_capture ? h->size : max_capture;
+	return true;
+}
+
+static __always_inline void emit(struct active_call *call, __u64 pid_tgid, __s64 n)
+{
+	if (n <= 0)
+		return;
+	struct event_header h;
+	__u64 now = bpf_ktime_get_ns();
+	if (!fill_header(&h, call, pid_tgid, n, now))
+		return;
 	output_chunks(&h, call->buf, submit_flags(now));
 }
 
@@ -846,6 +885,12 @@ static __always_inline int exit_call(struct pt_regs *ctx)
 	case RET_ZERO_KNOWN_LEN:
 		n = (int)PT_REGS_RC(ctx) == 0 ? (__s64)call.len_ptr : 0;
 		break;
+	case RET_ONE_KNOWN_LEN:
+	case RET_ONE_KNOWN_LEN_TLS13:
+		n = (int)PT_REGS_RC(ctx) == 1 ? (__s64)call.len_ptr : 0;
+		if (n > 0 && call.ret == RET_ONE_KNOWN_LEN_TLS13)
+			n = tls13_content_len(call.buf, n);
+		break;
 	case RET_KNOWN_LEN:
 	case RET_KNOWN_LEN_TLS13:
 		n = (__s64)call.len_ptr;
@@ -883,10 +928,43 @@ static __always_inline int record_fd(__u64 fd)
 	struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
 	if (!call)
 		return 0;
+	// Only sockets: OpenSSL may open, read and close a file inside a call
+	// (Node.js's does, in SSL_write), whose number a socket gets later.
+	if (have_btf && !socket_file((__s32)fd))
+		return 0;
 	call->fd = (__s32)fd;
 	track_conn(pid_tgid, call->conn, call->fd);
 	propagate_fd(pid_tgid, &dk, depth - 1, call->fd);
 	return 0;
+}
+
+// Without BTF, there's no telling a socket from a file, but a descriptor a
+// TLS call closes isn't its connection's socket: forget it if it was taken
+// for one, as a file the call opened, read and closed would be.
+static __always_inline void forget_closed_fd(__s32 fd)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	__u32 depth = get_depth(&dk);
+	struct call_key key;
+	for (int i = 0; i < MAX_DEPTH; i++) {
+		if ((__u32)i >= depth)
+			break;
+		call_key_at(&key, &dk, i);
+		struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
+		if (!call || call->fd != fd)
+			continue;
+		call->fd = -1;
+		struct conn_key ck;
+		__builtin_memset(&ck, 0, sizeof(ck));
+		ck.tgid = pid_tgid >> 32;
+		ck.conn = call->conn;
+		struct conn_info *info = bpf_map_lookup_elem(&conn_infos, &ck);
+		if (info && info->fd == fd)
+			bpf_map_delete_elem(&conn_infos, &ck);
+	}
 }
 
 // Syscalls a TLS library may use to move data over its socket. They all take
@@ -897,6 +975,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #if defined(__TARGET_ARCH_x86)
 #define SYS_MMAP 9
 #define SYS_WRITE 1
+#define SYS_CLOSE 3
 #define SYSCALL_FD(regs) ((regs)->di)
 #define SYSCALL_ARG1(regs) ((regs)->si)
 #define SYSCALL_ARG2(regs) ((regs)->dx)
@@ -916,6 +995,7 @@ enum { RECV_BUF = 1, RECV_IOVEC, RECV_MSG, RECV_MMSG };
 #elif defined(__TARGET_ARCH_arm64)
 #define SYS_MMAP 222
 #define SYS_WRITE 64
+#define SYS_CLOSE 57
 #define SYSCALL_FD(regs) ((regs)->orig_x0)
 #define SYSCALL_ARG1(regs) ((regs)->user_regs.regs[1])
 #define SYSCALL_ARG2(regs) ((regs)->user_regs.regs[2])
@@ -1177,6 +1257,8 @@ static __always_inline void note_packet_send(__u64 pid_tgid, __s32 fd, long id, 
 	if (!found)
 		return;
 	__u64 conn = *found;
+	// Sent: a later send from the same buffer isn't this packet's.
+	bpf_map_delete_elem(&sealed_packets, &key);
 	if (name)
 		emit_packet_sent(pid_tgid, conn, fd, buf, name);
 	if (track_conn(pid_tgid, conn, fd))
@@ -1207,7 +1289,7 @@ struct {
 
 static __always_inline void note_udp443(__u64 pid_tgid, __s32 fd, long id)
 {
-	if (!have_btf || !IS_DATAGRAM_IO(id))
+	if (!have_btf || !IS_DATAGRAM_IO(id) || !should_trace(pid_tgid))
 		return;
 	__u32 tgid = (pidns_ino ? ns_pid_tgid() : pid_tgid) >> 32; // user space reads these
 	if (!tgid)
@@ -1319,6 +1401,9 @@ int sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
 static const char tls_library_names[][LIBNAME_MAX] = {
 	"libssl.so", "libgnutls.so", "libnspr4.so", "libfreeblpriv3.so", "libwolfssl.so",
 	"libmbedtls.so", "libs2n.so", "libngtcp2_crypto_", "libnetty_tcnative", "libconscrypt",
+	// For OpenSSL's QUIC and Erlang's ssl (processLibPatterns): Erlang
+	// loads its crypto NIF, and with it libcrypto, when it first needs it.
+	"libcrypto.so", "crypto.so",
 };
 
 static __always_inline bool tls_library_name(const char *name)
@@ -1360,9 +1445,6 @@ static __always_inline void note_library_load(struct pt_regs *regs)
 		return;
 	if (!(prot & PROT_EXEC) || (__s32)fd < 0)
 		return;
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	if (!should_trace(pid_tgid))
-		return;
 	struct file *file = file_at((__s32)fd);
 	if (!file)
 		return;
@@ -1370,6 +1452,9 @@ static __always_inline void note_library_load(struct pt_regs *regs)
 	__builtin_memset(name, 0, sizeof(name));
 	if (bpf_probe_read_kernel_str(name, sizeof(name), BPF_CORE_READ(file, f_path.dentry, d_name.name)) <= 0 ||
 	    !tls_library_name(name))
+		return;
+	// After the name, which rules out nearly every mapping more cheaply.
+	if (!should_trace(bpf_get_current_pid_tgid()))
 		return;
 	__u64 ns = ns_pid_tgid();
 	if (!ns)
@@ -1385,8 +1470,9 @@ static __always_inline void note_library_load(struct pt_regs *regs)
 // The agent (java/agent) writes what SunJSSE's application calls read and
 // wrote as frames, a struct java_frame and the payload, to a descriptor for
 // /dev/null, on the calling thread; they're picked up here, before the
-// write goes anywhere. A process's frames count only once user space has
-// registered its session (java_sessions, by PID as snoopy sees it), with
+// write goes anywhere, with --java (java_enabled). A process's frames count
+// only once user space has registered its session (java_sessions, by PID as
+// snoopy sees it), with
 // the nonce the agent was started with, and, with BTF, only on the null
 // device; the first one fixes the descriptor. They're kept out of the
 // socket tracking below.
@@ -1404,7 +1490,7 @@ struct java_frame {
 	__u64 magic;
 	__u64 nonce;
 	__u64 conn;	  // the agent's ID for the SSLSocket or SSLEngine
-	__u64 seq;	  // the agent's frame count, for spotting gaps
+	__u64 seq;	  // the connection's frame count, for spotting gaps
 	__u8 dir;	  // JAVA_READ, or 0 for writes
 	__u8 kind;	  // JAVA_KIND_*
 	__u16 family;	  // AF_INET, AF_INET6, or 0 if the addresses are unknown
@@ -1426,9 +1512,43 @@ struct java_session {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, __u32); // host TGID
+	__type(key, __u32); // TGID as snoopy sees it (ns_pid_tgid), as user space gives it
 	__type(value, struct java_session);
 } java_sessions SEC(".maps");
+
+// sched:sched_process_exit(struct task_struct *p), raised by each thread as
+// it exits, in its own context. Once a process's last thread does, its
+// entries in traced_tgids and java_sessions go: nothing else deletes them,
+// and a reused PID would be taken for the process.
+SEC("raw_tracepoint/sched_process_exit")
+int sched_process_exit(struct bpf_raw_tracepoint_args *ctx)
+{
+	if (!filter_tgids && !java_enabled)
+		return 0;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (have_btf) {
+		// signal->live counts the threads that haven't begun to exit; the
+		// last one took it to 0 before this tracepoint.
+		struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+		struct signal_struct *sig = BPF_CORE_READ(task, signal);
+		atomic_t live;
+		__builtin_memset(&live, 0, sizeof(live));
+		if (!sig || bpf_core_read(&live, sizeof(live), &sig->live) || live.counter)
+			return 0;
+	} else if ((__u32)pid_tgid != pid_tgid >> 32) {
+		// Without BTF, the main thread's exit is the best sign of the
+		// process's (user space adds back one that goes on without it).
+		return 0;
+	}
+	__u32 tgid = (pidns_ino ? ns_pid_tgid() : pid_tgid) >> 32;
+	if (!tgid)
+		return 0;
+	if (filter_tgids)
+		bpf_map_delete_elem(&traced_tgids, &tgid);
+	if (java_enabled)
+		bpf_map_delete_elem(&java_sessions, &tgid);
+	return 0;
+}
 
 static __always_inline bool null_device(__s32 fd)
 {
@@ -1513,20 +1633,24 @@ int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 		note_library_load((struct pt_regs *)ctx->args[0]);
 		return 0;
 	}
+	if (!have_btf && id == SYS_CLOSE) {
+		__u64 fd = 0;
+		if (!bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD((struct pt_regs *)ctx->args[0])))
+			forget_closed_fd((__s32)fd);
+		return 0;
+	}
 	if (!IS_SOCKET_IO_SYSCALL(id))
 		return 0;
 
 	struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
-	if (id == SYS_WRITE && note_java_frame(regs))
+	if (java_enabled && id == SYS_WRITE && note_java_frame(regs))
 		return 0;
 	__u64 fd = 0;
 	if (bpf_probe_read_kernel(&fd, sizeof(fd), &SYSCALL_FD(regs)))
 		return 0;
 	note_thread_fd(fd, id, regs);
 	note_quic_proc_io((__s32)fd, id, regs);
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	if (should_trace(pid_tgid))
-		note_udp443(pid_tgid, (__s32)fd, id);
+	note_udp443(bpf_get_current_pid_tgid(), (__s32)fd, id);
 	return record_fd(fd);
 }
 
@@ -1534,27 +1658,60 @@ int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 // int SSL_read(SSL *ssl, void *buf, int num) and SSL_write alike.
 // int SSL_read_ex(SSL *ssl, void *buf, size_t num, size_t *readbytes) and SSL_write_ex alike.
 
+// Processes whose OpenSSL QUIC packets are captured (see ossl_cipher_update_enter).
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32); // tgid
+	__type(value, __u8);
+} ossl_quic_tgids SEC(".maps");
+
+// Whether ssl is one of OpenSSL's QUIC connections or streams, in a process
+// whose QUIC packets are captured: what's read and written through it is
+// seen in the packets, with the stream it's on. OpenSSL 3.2 and later start
+// struct ssl_st with its type: 0 for TLS, and for a QUIC connection and
+// stream 1 and 2, or from 3.5, 0x80 and 0x81. Older OpenSSL and LibreSSL
+// have the TLS version there, BoringSSL a pointer.
+static __always_inline bool ossl_quic_object(const void *ssl)
+{
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	if (!bpf_map_lookup_elem(&ossl_quic_tgids, &tgid))
+		return false;
+	__s32 type = -1;
+	if (bpf_probe_read_user(&type, sizeof(type), ssl))
+		return false;
+	return type == 1 || type == 2 || type == 0x80 || type == 0x81;
+}
+
 SEC("uprobe/SSL_read")
 int BPF_UPROBE(ssl_read_enter, void *ssl, void *buf)
 {
+	if (ossl_quic_object(ssl))
+		return 0;
 	return enter_call(ctx, FN_SSL_READ, RET_INT, (__u64)ssl, buf, 0);
 }
 
 SEC("uprobe/SSL_write")
 int BPF_UPROBE(ssl_write_enter, void *ssl, const void *buf)
 {
+	if (ossl_quic_object(ssl))
+		return 0;
 	return enter_call(ctx, FN_SSL_WRITE, RET_INT, (__u64)ssl, buf, 0);
 }
 
 SEC("uprobe/SSL_read_ex")
 int BPF_UPROBE(ssl_read_ex_enter, void *ssl, void *buf, __u64 num, __u64 *readbytes)
 {
+	if (ossl_quic_object(ssl))
+		return 0;
 	return enter_call(ctx, FN_SSL_READ_EX, RET_BOOL_EX, (__u64)ssl, buf, (__u64)readbytes);
 }
 
 SEC("uprobe/SSL_write_ex")
 int BPF_UPROBE(ssl_write_ex_enter, void *ssl, const void *buf, __u64 num, __u64 *written)
 {
+	if (ossl_quic_object(ssl))
+		return 0;
 	return enter_call(ctx, FN_SSL_WRITE_EX, RET_BOOL_EX, (__u64)ssl, buf, (__u64)written);
 }
 
@@ -1698,9 +1855,12 @@ int BPF_UPROBE(rustls_read_enter, const void *self, void *buf)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	if (!should_trace(pid_tgid))
 		return 0;
+	__u64 conn = rust_conn(self);
 	struct io_thread *rt = io_thread(pid_tgid);
-	__s32 fd = rt ? rt->last_fd : -1;
-	return enter_call_fd(ctx, FN_RUSTLS_READ, RET_RUST_RESULT, rust_conn(self), buf, 0, fd);
+	// The thread's last receive is only a guess at the connection's socket,
+	// which may be another connection's: not one to replace a known one.
+	__s32 fd = rt && !conn_known(pid_tgid, conn) ? rt->last_fd : -1;
+	return enter_call_fd(ctx, FN_RUSTLS_READ, RET_RUST_RESULT, conn, buf, 0, fd);
 }
 
 SEC("uprobe/rustls_write")
@@ -1890,6 +2050,54 @@ int quic_open_enter(struct pt_regs *ctx)
 	return open_enter(ctx, pid_tgid, FN_QUIC_RECV, RET_BOOL_EX, true);
 }
 
+// Whether the thread's innermost call in flight is a QUIC packet's
+// EVP_AEAD_CTX_open, which calls the AEAD's openv_detached with it.
+static __always_inline bool in_quic_open(__u64 pid_tgid)
+{
+	struct depth_key dk;
+	__builtin_memset(&dk, 0, sizeof(dk));
+	dk.thread = pid_tgid;
+	__u32 depth = get_depth(&dk);
+	if (!depth || depth > MAX_DEPTH)
+		return false;
+	struct call_key key;
+	call_key_at(&key, &dk, depth - 1);
+	struct active_call *call = bpf_map_lookup_elem(&active_calls, &key);
+	return call && call->fn == FN_QUIC_RECV;
+}
+
+// BoringSSL's AEADs decrypt in their openv_detached method, which
+// EVP_AEAD_CTX_open calls through the context's EVP_AEAD and which Chrome
+// 157 calls itself, with EVP_AEAD_CTX_open inlined into QUIC's
+// AeadBaseDecrypter::DecryptPacket:
+// int openv_detached(const EVP_AEAD_CTX *ctx, Span<const CRYPTO_IOVEC> iovecs,
+//     Span<const uint8_t> nonce, Span<const uint8_t> in_tag,
+//     Span<const CRYPTO_IVEC> aadvecs)
+// (ChaCha20-Poly1305's inner one takes the key instead of ctx, which tells
+// the context as well). A Span is a pointer and a length: iovecs is
+// arguments 1 and 2, and aadvecs, on the stack, 8 and 9, on x86-64 and arm64
+// alike. A CRYPTO_IOVEC is {out, in, len}, a CRYPTO_IVEC {in, len}.
+// open passes one of each, and so does Chrome. Older BoringSSL's open_gather
+// methods, with the same reason codes, take (ctx, out, nonce, nonce_len, in,
+// in_len, in_tag, in_tag_len, ad, ad_len), which never has 1 there.
+SEC("uprobe/openv_detached")
+int quic_openv_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid) || func_arg(ctx, 2) != 1 || func_arg(ctx, 9) != 1)
+		return 0;
+	__u64 aad[2] = {}, iov[3] = {};
+	if (bpf_probe_read_user(aad, sizeof(aad), (void *)func_arg(ctx, 8)) ||
+	    bpf_probe_read_user(iov, sizeof(iov), (void *)func_arg(ctx, 1)))
+		return 0;
+	// Seen already, where Chrome didn't inline open.
+	if (!is_quic_aad(aad[0], aad[1]) || in_quic_open(pid_tgid))
+		return 0;
+	__s32 fd = packet_fd(pid_tgid, io_thread(pid_tgid), iov[1], aad[0], aad[1]);
+	return enter_call_ad(ctx, FN_QUIC_RECV, RET_ONE_KNOWN_LEN, func_arg(ctx, 0), (void *)iov[0], iov[2], fd,
+			     aad[0], aad[1]);
+}
+
 // In programs whose plaintext has no other place to be seen, like rustls
 // under tokio, where the reads are inlined: TLS records' application data
 // too. A TLS 1.3 record's real type is at the end of its plaintext.
@@ -1950,6 +2158,108 @@ int aead_open_enter(struct pt_regs *ctx)
 	}
 	io_thread(pid_tgid);
 	return 0;
+}
+
+// Erlang's ssl encrypts and decrypts its TLS records in its crypto NIF,
+// through libcrypto: a record's header (TLS 1.3) or sequence number and
+// header (TLS 1.2) as associated data, then its payload, each through
+// EVP_EncryptUpdate or EVP_DecryptUpdate on the context of that direction
+// of the connection, which lasts as long as its keys:
+// int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+//     const unsigned char *in, int inl)
+// and EVP_DecryptUpdate alike. Updates without associated data before them
+// (Erlang's random numbers, through AES) aren't records. These are probed
+// only in Erlang's processes: OpenSSL's own TLS may call them too.
+
+struct erl_key {
+	__u64 tgid;
+	__u64 ctx; // the EVP_CIPHER_CTX
+};
+
+struct erl_record {
+	__u64 ad; // a record's associated data, waiting for its payload
+	__u32 ad_len;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct erl_key);
+	__type(value, struct erl_record);
+} erl_ciphers SEC(".maps");
+
+// erl_update handles an update on ctx: associated data that looks like a
+// TLS record's is kept, and the payload after it is the record's. It
+// returns the kind of the associated data for a payload, else AAD_NONE.
+static __always_inline int erl_update(__u64 pid_tgid, struct erl_key *key, __u64 out, __u64 in, __s32 inl,
+				      __u64 *ad, __u64 *ad_len)
+{
+	struct erl_record *c = bpf_map_lookup_elem(&erl_ciphers, key);
+	if (!out) {
+		int kind = inl > 0 ? classify_aad(in, inl) : AAD_NONE;
+		if (kind != AAD_TLS13 && kind != AAD_TLS12_DATA && kind != AAD_TLS12_OTHER) {
+			if (c)
+				c->ad = 0;
+			return AAD_NONE;
+		}
+		io_thread(pid_tgid); // so the thread's receives are seen from the handshake on
+		struct erl_record value;
+		__builtin_memset(&value, 0, sizeof(value));
+		value.ad = in;
+		value.ad_len = inl;
+		bpf_map_update_elem(&erl_ciphers, key, &value, BPF_ANY);
+		return AAD_NONE;
+	}
+	if (!c || !c->ad || inl <= 0)
+		return AAD_NONE;
+	*ad = c->ad;
+	*ad_len = c->ad_len;
+	c->ad = 0;
+	return classify_aad(*ad, *ad_len);
+}
+
+SEC("uprobe/EVP_EncryptUpdate")
+int erl_encrypt_update_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct erl_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.ctx = func_arg(ctx, 0);
+	__u64 ad = 0, ad_len = 0;
+	__s32 inl = (__s32)func_arg(ctx, 4);
+	if (erl_update(pid_tgid, &key, func_arg(ctx, 1), func_arg(ctx, 3), inl, &ad, &ad_len) == AAD_NONE)
+		return 0;
+	return record_seal_enter(FN_ERL_RECORD_SEND, FN_ERL_RECORD_SEND, key.ctx, func_arg(ctx, 3), inl, ad, ad_len);
+}
+
+SEC("uprobe/EVP_DecryptUpdate")
+int erl_decrypt_update_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct erl_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.ctx = func_arg(ctx, 0);
+	__u64 ad = 0, ad_len = 0, out = func_arg(ctx, 1), in = func_arg(ctx, 3);
+	__s32 inl = (__s32)func_arg(ctx, 4);
+	__u8 ret;
+	switch (erl_update(pid_tgid, &key, out, in, inl, &ad, &ad_len)) {
+	case AAD_TLS13:
+		ret = RET_ONE_KNOWN_LEN_TLS13;
+		break;
+	case AAD_TLS12_DATA:
+		ret = RET_ONE_KNOWN_LEN;
+		break;
+	default:
+		return 0;
+	}
+	__s32 fd = packet_fd(pid_tgid, io_thread(pid_tgid), in, 0, 0);
+	return enter_call_ad(ctx, FN_ERL_RECORD_RECV, ret, key.ctx, (void *)out, inl, fd, 0, 0);
 }
 
 // ring's AEAD functions, which rustls's ring provider calls through
@@ -2172,6 +2482,201 @@ int aes_aead_enter(struct pt_regs *ctx)
 	call.ad = func_arg(ctx, 8);
 	call.ad_len = (__u32)func_arg(ctx, 9) > 0xff ? 0xff : (__u32)func_arg(ctx, 9);
 	emit(&call, pid_tgid, (__s64)(__u32)func_arg(ctx, 5));
+	return 0;
+}
+
+// OpenSSL's own QUIC (3.2 and later) protects each packet with libcrypto's
+// EVP API, as its TLS records too: the direction set with the nonce, the
+// header given as associated data, then the payload, each through
+// EVP_CipherUpdate on the same context:
+// int EVP_CipherInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type, ENGINE *impl,
+//     const unsigned char *key, const unsigned char *iv, int enc)
+// int EVP_CipherUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+//     const unsigned char *in, int inl)
+// int EVP_CipherFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl)
+// A context's updates with associated data that looks like a QUIC header
+// (is_quic_aad: not a TLS record's) are a packet's; header protection
+// uses contexts of its own, without associated data. The payload goes from
+// in to out, which aren't the same buffer, and as much as goes in comes
+// out. A received packet is decrypted in one update; a packet to send is
+// encrypted in a few, one for each buffer its frames are in (the stream
+// data is encrypted from the stream's own buffer), so its plaintext is
+// collected until EVP_CipherFinal_ex ends it.
+
+struct ossl_cipher {
+	__u64 ad;	// the header given as associated data, if waiting for its payload
+	__u32 ad_len;
+	__u8 enc;	// 1 if it encrypts
+	__u8 sending;	// a packet to send is being encrypted, in ossl_packets
+};
+
+// OpenSSL's QUIC packets are no larger than the path's MTU allows; more
+// than this of one is cut off, and said to be.
+#define OSSL_PACKET_MAX 2047
+
+struct ossl_packet {
+	__u64 start_ns;
+	__u64 ad;
+	__u32 ad_len;
+	__u32 len; // the packet's plaintext in all, kept up to OSSL_PACKET_MAX
+	// Room for a piece of up to OSSL_PACKET_MAX at any offset below it,
+	// which the verifier can check.
+	__u8 data[2 * (OSSL_PACKET_MAX + 1)];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct aes_ctx_key);
+	__type(value, struct ossl_packet);
+} ossl_packets SEC(".maps");
+
+// A zeroed ossl_packet, to start one with: it's too large for the stack.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct ossl_packet);
+} ossl_packet_zero SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct aes_ctx_key); // tgid, EVP_CIPHER_CTX
+	__type(value, struct ossl_cipher);
+} ossl_ciphers SEC(".maps");
+
+SEC("uprobe/EVP_CipherInit_ex")
+int ossl_cipher_init_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	int enc = (int)func_arg(ctx, 5);
+	if (!should_trace(pid_tgid) || (enc != 0 && enc != 1)) // -1 keeps the direction
+		return 0;
+	struct aes_ctx_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.ctx = func_arg(ctx, 0);
+	struct ossl_cipher value;
+	__builtin_memset(&value, 0, sizeof(value));
+	value.enc = enc;
+	bpf_map_update_elem(&ossl_ciphers, &key, &value, BPF_ANY);
+	return 0;
+}
+
+SEC("uprobe/EVP_CipherUpdate")
+int ossl_cipher_update_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct aes_ctx_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.ctx = func_arg(ctx, 0);
+	struct ossl_cipher *c = bpf_map_lookup_elem(&ossl_ciphers, &key);
+	if (!c)
+		return 0;
+	__u64 out = func_arg(ctx, 1), in = func_arg(ctx, 3);
+	__s32 inl = (__s32)func_arg(ctx, 4);
+	if (!out) { // associated data
+		c->ad = 0;
+		if (inl > 0 && is_quic_aad(in, inl)) {
+			c->ad = in;
+			c->ad_len = inl;
+			__u32 tgid = key.tgid;
+			__u8 one = 1;
+			bpf_map_update_elem(&ossl_quic_tgids, &tgid, &one, BPF_NOEXIST);
+		}
+		return 0;
+	}
+	__u64 ad = c->ad, ad_len = c->ad_len;
+	if (inl <= 0 || (!ad && !c->sending))
+		return 0;
+	c->ad = 0;
+	if (!c->enc) {
+		__s32 fd = packet_fd(pid_tgid, io_thread(pid_tgid), in, ad, ad_len);
+		return enter_call_ad(ctx, FN_OSSL_QUIC_RECV, RET_ONE_KNOWN_LEN, key.ctx, (void *)out, inl, fd, ad,
+				     ad_len);
+	}
+	if (ad) { // a packet's first piece
+		__u32 zero = 0;
+		struct ossl_packet *fresh = bpf_map_lookup_elem(&ossl_packet_zero, &zero);
+		if (!fresh || bpf_map_update_elem(&ossl_packets, &key, fresh, BPF_ANY))
+			return 0;
+		c->sending = 1;
+	}
+	struct ossl_packet *pkt = bpf_map_lookup_elem(&ossl_packets, &key);
+	if (!pkt)
+		return 0;
+	if (ad) {
+		pkt->start_ns = bpf_ktime_get_ns();
+		pkt->ad = ad;
+		pkt->ad_len = ad_len;
+	}
+	__u32 off = pkt->len;
+	if (off < OSSL_PACKET_MAX) {
+		__u32 n = inl;
+		if (n > OSSL_PACKET_MAX - off)
+			n = OSSL_PACKET_MAX - off;
+		// The masks keep the verifier's bounds: without the barriers,
+		// clang drops them as implied by the comparisons, which verifiers
+		// before Linux 6.8 don't follow.
+		barrier_var(off);
+		barrier_var(n);
+		bpf_probe_read_user(&pkt->data[off & OSSL_PACKET_MAX], n & OSSL_PACKET_MAX, (void *)in);
+	}
+	pkt->len = off + inl;
+	return 0;
+}
+
+SEC("uprobe/EVP_CipherFinal_ex")
+int ossl_cipher_final_enter(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	if (!should_trace(pid_tgid))
+		return 0;
+	struct aes_ctx_key key;
+	__builtin_memset(&key, 0, sizeof(key));
+	key.tgid = pid_tgid >> 32;
+	key.ctx = func_arg(ctx, 0);
+	struct ossl_cipher *c = bpf_map_lookup_elem(&ossl_ciphers, &key);
+	if (!c || !c->sending)
+		return 0;
+	c->sending = 0;
+	struct ossl_packet *pkt = bpf_map_lookup_elem(&ossl_packets, &key);
+	if (!pkt || !pkt->len)
+		return 0;
+	// What's sealed goes out with the thread's next send.
+	struct io_thread *rt = io_thread(pid_tgid);
+	if (rt)
+		rt->want_conn = key.ctx;
+	struct active_call call;
+	__builtin_memset(&call, 0, sizeof(call));
+	call.start_ns = pkt->start_ns;
+	call.conn = key.ctx;
+	call.fd = -1;
+	call.fn = FN_OSSL_QUIC_SEND;
+	call.ad = pkt->ad;
+	call.ad_len = pkt->ad_len > 0xff ? 0xff : pkt->ad_len;
+	struct event_header h;
+	__u64 now = bpf_ktime_get_ns();
+	if (!fill_header(&h, &call, pid_tgid, pkt->len, now))
+		return 0;
+	__u32 len = h.captured;
+	if (len > OSSL_PACKET_MAX)
+		len = OSSL_PACKET_MAX;
+	h.captured = len;
+	struct event_2048 *r = bpf_ringbuf_reserve(&events, sizeof(*r), 0);
+	if (!r) {
+		count_lost();
+		return 0;
+	}
+	r->h = h;
+	r->h.chunk_len = len;
+	barrier_var(len); // as in ossl_cipher_update_enter
+	bpf_probe_read_kernel(r->data, len & OSSL_PACKET_MAX, pkt->data);
+	bpf_ringbuf_submit(r, submit_flags(now));
 	return 0;
 }
 

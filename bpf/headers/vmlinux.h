@@ -165,8 +165,17 @@ struct pid {
 	struct upid numbers[1];
 } __attribute__((preserve_access_index));
 
+typedef struct {
+	int counter;
+} atomic_t;
+
+struct signal_struct {
+	atomic_t live; // threads that haven't started exiting
+} __attribute__((preserve_access_index));
+
 struct task_struct {
 	struct files_struct *files;
+	struct signal_struct *signal;
 	struct task_struct *group_leader;
 	struct task_struct *real_parent;
 	struct pid *thread_pid;

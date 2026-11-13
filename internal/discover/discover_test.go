@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -76,7 +77,7 @@ func le32(words ...uint32) []byte {
 }
 
 // buildGoFixture compiles testdata/gotls for the given architecture.
-func buildGoFixture(t *testing.T, goarch string, strip bool) string {
+func buildGoFixture(t testing.TB, goarch string, strip bool) string {
 	t.Helper()
 	ldflags := ""
 	if strip {
@@ -85,7 +86,7 @@ func buildGoFixture(t *testing.T, goarch string, strip bool) string {
 	return buildFixture(t, "./testdata/gotls", ldflags, "GOARCH="+goarch, "CGO_ENABLED=0")
 }
 
-func buildFixture(t *testing.T, pkg, ldflags string, env ...string) string {
+func buildFixture(t testing.TB, pkg, ldflags string, env ...string) string {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("builds a Go program")
@@ -426,14 +427,17 @@ func TestBoringSSLBinaries(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Logf("SSL_read %#x, SSL_write %#x, EVP_AEAD_CTX_seal %#x, EVP_AEAD_CTX_open %#x",
-				got["SSL_read"], got["SSL_write"], got["EVP_AEAD_CTX_seal"], got["EVP_AEAD_CTX_open"])
+			t.Logf("SSL_read %#x, SSL_write %#x, EVP_AEAD_CTX_seal %#x, EVP_AEAD_CTX_open %#x, AES-GCM openv %#x, ChaCha20 openv %#x",
+				got["SSL_read"], got["SSL_write"], got["EVP_AEAD_CTX_seal"], got["EVP_AEAD_CTX_open"],
+				got["aead_aes_gcm_openv_detached"], got["chacha20_poly1305_openv_detached"])
 			if debug == "" {
 				return
 			}
+			// The openv_detached methods only in BoringSSL that has them.
+			required := []string{"SSL_read", "SSL_write", "EVP_AEAD_CTX_seal", "EVP_AEAD_CTX_open"}
 			checked := 0
 			for name, addr := range debugSymbols(t, debug) {
-				if name != "SSL_read" && name != "SSL_write" && name != "EVP_AEAD_CTX_seal" && name != "EVP_AEAD_CTX_open" {
+				if !slices.Contains(required, name) && openvFiles[name] == "" {
 					continue
 				}
 				want, err := fileOffset(f, addr)
@@ -443,10 +447,12 @@ func TestBoringSSLBinaries(t *testing.T) {
 				if got[name] != want {
 					t.Errorf("%s at %#x, debug symbols say %#x", name, got[name], want)
 				}
-				checked++
+				if slices.Contains(required, name) {
+					checked++
+				}
 			}
-			if checked != 4 {
-				t.Errorf("debug file has %d of the 4 functions", checked)
+			if checked != len(required) {
+				t.Errorf("debug file has %d of the %d functions", checked, len(required))
 			}
 		})
 	}
@@ -454,7 +460,9 @@ func TestBoringSSLBinaries(t *testing.T) {
 
 // debugSymbols returns the function addresses in an ELF debug file or a
 // Breakpad symbol file (what Electron publishes; Chrome's are on
-// chrome-symbols too).
+// chrome-symbols too). A C++ function file-local to its source, like
+// BoringSSL's AEAD methods, is there by its name too, without its
+// parameters.
 func debugSymbols(t *testing.T, path string) map[string]uint64 {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -462,6 +470,23 @@ func debugSymbols(t *testing.T, path string) map[string]uint64 {
 		t.Fatal(err)
 	}
 	out := map[string]uint64{}
+	sizes := map[string]uint64{}
+	add := func(name string, addr, size uint64) {
+		out[name] = addr
+		short := name
+		if m := mangledLocal.FindStringSubmatch(name); m != nil {
+			if n, err := strconv.Atoi(m[1]); err == nil && len(m[0])+n <= len(name) {
+				short = name[len(m[0]) : len(m[0])+n]
+			}
+		} else if i := strings.IndexByte(name, '('); i > 0 {
+			short = name[:i]
+		}
+		// With control-flow integrity, a function called through a pointer
+		// also names its entry in the jump table, which is smaller.
+		if short != name && size >= sizes[short] {
+			out[short], sizes[short] = addr, size
+		}
+	}
 	if bytes.HasPrefix(data, []byte("MODULE ")) {
 		// FUNC [m] address size parameter_size name
 		for _, line := range strings.Split(string(data), "\n") {
@@ -472,8 +497,10 @@ func debugSymbols(t *testing.T, path string) map[string]uint64 {
 			if fields[1] == "m" {
 				fields = fields[1:]
 			}
-			if addr, err := strconv.ParseUint(fields[1], 16, 64); err == nil {
-				out[strings.Join(fields[4:], " ")] = addr
+			addr, err := strconv.ParseUint(fields[1], 16, 64)
+			size, err2 := strconv.ParseUint(fields[2], 16, 64)
+			if err == nil && err2 == nil {
+				add(strings.Join(fields[4:], " "), addr, size)
 			}
 		}
 		return out
@@ -487,10 +514,14 @@ func debugSymbols(t *testing.T, path string) map[string]uint64 {
 		t.Fatal(err)
 	}
 	for _, s := range syms {
-		out[s.Name] = s.Value
+		add(s.Name, s.Value, s.Size)
 	}
 	return out
 }
+
+// mangledLocal is the start of a file-local C++ function's mangled name,
+// _ZL27aead_aes_gcm_openv_detachedPK15evp_aead_ctx_st...: its name's length.
+var mangledLocal = regexp.MustCompile(`^_ZL(\d+)`)
 
 // TestFreeblBinaries runs findFreebl on real freebl libraries:
 //
@@ -648,7 +679,7 @@ func TestNeeded(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "environ"), []byte("HOME=/root\x00"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w := &Watcher{proc: proc, seen: map[fileID][]Target{}, roots: map[fileID]bool{}}
+	w := newWatcher(proc, false)
 	var libs []string
 	for _, target := range w.Needed(7) {
 		libs = append(libs, filepath.Base(target.Path)+" "+target.Library.String())
@@ -690,7 +721,7 @@ func TestWatcherPerProcess(t *testing.T) {
 		return out
 	}
 	for _, perProcess := range []bool{false, true} {
-		w := &Watcher{proc: proc, perProcess: perProcess, seen: map[fileID][]Target{}, roots: map[fileID]bool{}}
+		w := newWatcher(proc, perProcess)
 		first, second := paths(w.Needed(7)), paths(w.Needed(8))
 		if len(first) == 0 {
 			t.Fatal("no libssl found for curl")
@@ -770,6 +801,54 @@ func TestNameMatches(t *testing.T) {
 	}
 }
 
+// An Erlang VM's program is beam.smp, in erts-<version>/bin.
+func TestIsErlang(t *testing.T) {
+	proc := t.TempDir()
+	for pid, exe := range map[string]string{
+		"1": "/usr/lib/erlang/erts-15.2/bin/beam.smp",
+		"2": "/usr/local/lib/erlang/erts-16.0/bin/beam.smp (deleted)",
+		"3": "/usr/bin/ruby3.4",
+	} {
+		if err := os.MkdirAll(filepath.Join(proc, pid), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(exe, filepath.Join(proc, pid, "exe")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for pid, want := range map[int]bool{1: true, 2: true, 3: false, 4: false} {
+		if got := isErlang(proc, pid); got != want {
+			t.Errorf("pid %d: %v", pid, got)
+		}
+	}
+}
+
+// definesFuncs tells a library that exports functions from one that only
+// uses them, as an Erlang crypto NIF does unless libcrypto is linked in.
+func TestDefinesFuncs(t *testing.T) {
+	var crypto, ssl string
+	for _, dir := range []string{"/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib"} {
+		if found, _ := filepath.Glob(filepath.Join(dir, "libcrypto.so.3")); len(found) > 0 && crypto == "" {
+			crypto = found[0]
+		}
+		if found, _ := filepath.Glob(filepath.Join(dir, "libssl.so.3")); len(found) > 0 && ssl == "" {
+			ssl = found[0]
+		}
+	}
+	if crypto == "" || ssl == "" {
+		t.Skip("no OpenSSL 3 here")
+	}
+	if !definesFuncs(crypto, "EVP_EncryptUpdate", "EVP_DecryptUpdate") {
+		t.Errorf("%s: doesn't define its EVP functions", crypto)
+	}
+	if definesFuncs(crypto, "EVP_EncryptUpdate", "no_such_function") {
+		t.Errorf("%s: defines a function it hasn't", crypto)
+	}
+	if definesFuncs(ssl, "EVP_EncryptUpdate") { // libssl uses it
+		t.Errorf("%s: an imported function taken for a defined one", ssl)
+	}
+}
+
 func TestRustInfoDescribe(t *testing.T) {
 	for _, c := range []struct {
 		ri          RustInfo
@@ -803,5 +882,21 @@ func TestHasQUICStack(t *testing.T) {
 			t.Errorf("%s: %v", path, got)
 		}
 		f.Close()
+	}
+}
+
+func TestDeniedWarning(t *testing.T) {
+	for _, tc := range []struct {
+		denied []string
+		root   bool
+		want   string
+	}{
+		{[]string{"init[1]"}, true, "permission denied inspecting 1 process (init[1]); TLS libraries and Go programs only it uses are missed"},
+		{[]string{"a[2]", "b[3]"}, false, "permission denied inspecting 2 processes (a[2], b[3]); TLS libraries and Go programs only they use are missed; run snoopy as root"},
+		{[]string{"a[1]", "a[2]", "a[3]", "a[4]", "a[5]", "a[6]", "a[7]"}, true, "permission denied inspecting 7 processes (a[1], a[2], a[3], a[4], a[5] and 2 more); TLS libraries and Go programs only they use are missed"},
+	} {
+		if got := deniedWarning(tc.denied, tc.root).Error(); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
 	}
 }

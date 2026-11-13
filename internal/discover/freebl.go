@@ -26,7 +26,7 @@ const (
 // findFreebl returns the file offsets of AES_CreateContext and AES_AEAD in a
 // freebl library.
 func findFreebl(f *elf.File) (map[string]uint64, error) {
-	syms, err := f.DynamicSymbols()
+	syms, err := dynamicSymbols(f)
 	if err != nil {
 		return nil, err
 	}

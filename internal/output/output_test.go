@@ -2,16 +2,19 @@ package output
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/netip"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/fatih/color"
+	"golang.org/x/net/http2"
 
 	"github.com/tks98/snoopy/v2/internal/tracer"
 )
@@ -132,7 +135,7 @@ func TestTextBinaryAndNotes(t *testing.T) {
 	}
 	out := buf.String()
 	for _, want := range []string{
-		"curl (pid 42, tid 43) crypto/tls.(*Conn).Read peer > 10.0.0.2:51234  100 bytes",
+		"curl (pid 42, tid 43) crypto/tls.(*Conn).Read peer:? > 10.0.0.2:51234  100 bytes",
 		"conn 0xbeef, container 4b825dc642cb",
 		"00000000  00 01 02 03",
 		"[truncated: captured 4 of 100 bytes; raise with --max-size]",
@@ -461,5 +464,83 @@ func TestPcapIPv6AndLargePayload(t *testing.T) {
 	}
 	if len(pkts) != 3+4+1 || payload != len(ev.Data) {
 		t.Errorf("got %d packets with %d bytes", len(pkts), payload)
+	}
+}
+
+// HTTP/1.x has its messages parsed in JSON, as HTTP/2 has: start lines,
+// headers (redacted with --redact), body bytes, and where messages end.
+func TestJSONHTTP1(t *testing.T) {
+	var out bytes.Buffer
+	j := NewJSON(&out, Options{Redact: true})
+	j.Print(event(tracer.FuncSSLWrite, "POST /login?token=abc HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer xyz\r\nContent-Length: 4\r\n\r\nab"))
+	j.Print(event(tracer.FuncSSLWrite, "cd"))
+	j.Print(event(tracer.FuncSSLRead, "HTTP/1.1 204 No Content\r\n\r\n"))
+	var got [][]jsonHTTP1
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var ev struct {
+			HTTP1 []jsonHTTP1 `json:"http1"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ev.HTTP1)
+	}
+	if len(got) != 3 || len(got[0]) != 2 || len(got[1]) != 1 || len(got[2]) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	req, body, rest, resp := got[0][0], got[0][1], got[1][0], got[2][0]
+	if req.Type != "request" || req.Method != "POST" || req.Version != "HTTP/1.1" || strings.Contains(req.Target, "abc") || req.End {
+		t.Errorf("request %+v", req)
+	}
+	for _, h := range req.Headers {
+		if h.Name == "Authorization" && strings.Contains(h.Value, "xyz") {
+			t.Errorf("not redacted: %+v", h)
+		}
+	}
+	if body.Type != "body" || body.Bytes != 2 || body.End || rest.Type != "body" || rest.Bytes != 2 || !rest.End {
+		t.Errorf("body %+v, then %+v", body, rest)
+	}
+	if resp.Type != "response" || resp.Status != 204 || resp.Reason != "No Content" || !resp.End {
+		t.Errorf("response %+v", resp)
+	}
+}
+
+// Grep keeps the calls it matches something of what they show in:
+// decoded HTTP/2 headers and decompressed bodies too, not only raw bytes.
+func TestGrep(t *testing.T) {
+	client := newHTTP2Writer(true)
+	client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndStream: true, EndHeaders: true,
+		BlockFragment: client.block(":method", "GET", ":scheme", "https", ":authority", "example.com", ":path", "/orders/42")})
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte(`{"order":42,"status":"shipped"}`))
+	zw.Close()
+	server := newHTTP2Writer(false)
+	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndHeaders: true,
+		BlockFragment: server.block(":status", "200", "content-encoding", "gzip")})
+	server.fr.WriteData(1, true, gz.Bytes())
+	evs := append(events(tracer.FuncSSLWrite, client.buf.Bytes(), 1<<20), events(tracer.FuncSSLRead, server.buf.Bytes(), 1<<20)...)
+	for pattern, want := range map[string][]string{
+		`/orders/\d+`: {"/orders/42"},         // in compressed headers
+		`shipped`:     {`"status":"shipped"`}, // in a gzipped body
+	} {
+		var out bytes.Buffer
+		b := NewBrief(&out, Options{Grep: regexp.MustCompile(pattern)})
+		for _, ev := range evs {
+			b.Print(ev)
+		}
+		if strings.Count(out.String(), "\n") != 1 || b.Filtered() == 0 {
+			t.Errorf("%s: %d filtered, got:\n%s", pattern, b.Filtered(), out.String())
+		}
+		var text bytes.Buffer
+		p := NewText(&text, Options{Grep: regexp.MustCompile(pattern)})
+		for _, ev := range evs {
+			p.Print(ev)
+		}
+		for _, w := range want {
+			if !strings.Contains(text.String(), w) {
+				t.Errorf("%s: no %q in:\n%s", pattern, w, text.String())
+			}
+		}
 	}
 }

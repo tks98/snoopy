@@ -11,41 +11,44 @@ used. [AGENTS.md](AGENTS.md) is the short list for coding agents.
 
 ## Status
 
-On main: version 2, the rewrite on cilium/ebpf with a CO-RE eBPF program
-(#4); exec watching with wolfSSL, Mbed TLS and s2n-tls (#9); and HPACK,
-rustls, Chrome by signature (x86_64 and arm64), HTTP/3 for Chromium and
-Firefox, and compressed bodies (#10); docs on the fragile parts (#12);
-tcpdump-style output and filters (#13); and fixes for a first run: output
-limits, `--pid` following children, connections from before snoopy, the
-`/v2` module path (#14), and install steps that make `sudo snoopy` work
-(#15).
+Released: v2.9.1, the latest of the v2 releases (the first was v2.0.0). A
+`v*` tag runs `release.yml`: GoReleaser publishes the snoopy archives
+(linux amd64 and arm64, with the Java agent's jars), .deb, .rpm and .apk
+packages, kubectl-snoopy's for Linux, macOS and Windows, an SBOM for each
+archive, the jars, the krew manifest,
+`checksums.txt` and the image `ghcr.io/tks98/snoopy`, and the workflow
+attests the build provenance of `checksums.txt`'s files and of the image
+(from the release after v2.9.1). `go install
+github.com/tks98/snoopy/v2@latest` installs it too.
 
-Released: v2.0.0, the first release, tagged on #14's merge. GoReleaser
-published linux amd64 and arm64 binaries, and `go install
-github.com/tks98/snoopy/v2@latest` installs it.
+What CI checks, and when:
 
-| Check | Status |
+| Check | When |
 | --- | --- |
-| Lint, unit and race tests, amd64 and arm64 builds, BPF objects up to date | Green in CI |
-| Integration tests on the runners' kernels (x86_64 and arm64) | Green in CI |
-| Latest Chrome, Electron and Firefox found by signature, and Fedora's curl over HTTP/3 | Weekly in CI (`canary.yml`) |
-| Overhead | Measured by hand with `docs/benchmark/run.sh`; results in [docs/performance.md](docs/performance.md) |
-| Integration tests on Linux 5.10, 5.15, 6.1, 6.6, 6.12 (vimto VMs) | No longer in CI, which took too long (#8). All pass with #14 (24 tests each; the clients for s2n, wolfSSL, Mbed TLS and rustls aren't in the VM image), run by hand as described in [docs/maintenance.md](docs/maintenance.md#older-kernels). |
-| Integration tests on Linux 7.0 arm64 (Ubuntu 26.04 in Parallels) | All 32 pass with quic-go support, with `SNOOPY_TEST_RUSTLS=1` and `SNOOPY_TEST_CURL_HTTP3` pointing at a Fedora 44 chroot |
-| Rust, curl and Go tests on x86_64 (Lima, 6.8) | `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, `TestCurlHTTP3`, `TestQuicGoHTTP3` and the Go TLS tests pass with quic-go support, cross-built on arm64 since rustup doesn't run in the emulated VM; copy them into the VM, since its shared folder can serve stale files |
-| BPF load on 5.10 to 6.12 | With quic-go support, every program loads in default, `--pid` and `--comm` modes (a QEMU load check; vimto's 5.10 runs fail on an overlayfs xattr) |
-| Browsers, by hand | Chrome 155 (x86_64, in Lima), Firefox 153 snap (arm64) and 157 (x86_64), Electron 44 and Chromium 155 snap (arm64): HTTP/2 and HTTP/3 captured with headers and bodies decoded. With #14, again on the arm64 Chromium and Firefox snaps: `--pid` of Chromium's main process, connections opened before snoopy, and Firefox from a fresh start |
+| gofmt, vet, golangci-lint, unit and race tests, amd64 and arm64 builds, BPF objects and the embedded Java agent's jars up to date (`ci.yml`) | Each pull request |
+| Known vulnerabilities, none allowed, reachable or not: govulncheck on both modules and their release-built binaries, OSV-Scanner on every lockfile (test programs' too), and the Java agent's ASM against OSV (`vulnscan.yml`) | Each pull request, and daily |
+| CodeQL on the Go code and the workflows (`codeql.yml`) | Each pull request, and weekly |
+| Integration tests on the runners' kernels, x86_64 and arm64, every C client including s2n-tls (built from source), with `SNOOPY_TEST_STRICT=1` so a missing client fails, run twice: attaching through uprobe_multi links, and a link per probe as older kernels do (`ci.yml`) | Each pull request |
+| `TestJSSE` on JDK 17, 21 and 25, x86_64 and arm64 (`ci.yml`) | Each pull request |
+| The kubectl plugin, and a kind cluster end to end (`kubectl-snoopy.yml`) | Each pull request |
+| Every BPF program loads under 5.10, 5.15, 6.1, 6.6 and 6.12, in QEMU, x86_64 and arm64 (`loadcheck.yml`) | Changes to the BPF code or how it's loaded |
+| A snapshot release: GoReleaser's config, the image, krew installing the plugin, the packages installing on Ubuntu, Fedora and Alpine, reproducible jars and archives (`release-check.yml`) | Changes to the release's configuration |
+| `TestRustls`, `TestRustlsAsync`, `TestQuinnHTTP3`, x86_64 and arm64 (`rust.yml`) | Weekly, and changes to those clients |
+| Latest Chrome, Electron, Bun, Envoy and Firefox found by signature, Chrome stable and beta capturing HTTP/3 end to end, and Fedora's curl over HTTP/3 (`canary.yml`) | Weekly |
+| Overhead (`benchmark.yml`, `docs/benchmark/`) | By hand; results in [docs/performance.md](docs/performance.md) |
+
+Not in CI: the integration tests on 5.10 to 6.12, which took too long
+there (#8); run them with vimto after changing `bpf/snoopy.c` (AGENTS.md,
+[docs/maintenance.md](docs/maintenance.md#older-kernels)). Browsers beyond
+the canary's signature checks are tested by hand (docs/maintenance.md has
+the recipes).
 
 ### To do
 
-1. **Dependabot.** #5 (golangci-lint-action 9) and #7 (goreleaser-action
-   7) are open. Go is at 1.26, with `golang.org/x/arch` 0.32 checked as
-   [docs/maintenance.md](docs/maintenance.md#funcfind-and-golangorgxarch)
-   describes: the arm64 finder gives the same answers on Debian's Chromium
-   155 and Firefox ESR 153 as with 0.30.
-2. **Guard against browser releases.** The list in
-   [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it), the
-   weekly canary job against the latest Chrome, Electron and Firefox first.
+1. **Guard against browser releases.** The rest of the list in
+   [docs/release-risks.md](docs/release-risks.md#what-to-do-about-it); the
+   weekly canary covers finding them by signature, and capturing for
+   Chrome's HTTP/3 (`TestChromeHTTP3`), not yet for Electron or Firefox.
 
 ## Working on it from a Mac
 
@@ -59,7 +62,7 @@ compile for darwin, and `go test ./...` fails on macOS. Work inside a Linux VM:
 - In the VM, install Go 1.26+ and run:
 
   ```bash
-  sudo apt-get install -y clang-18 llvm-18 curl python3 gnutls-bin libnss3-dev pkg-config qemu-system-x86 iproute2
+  sudo apt-get install -y clang-18 llvm-18 curl python3 gnutls-bin libnss3-dev pkg-config qemu-system-x86 iproute2 erlang-base erlang-ssl erlang-inets
   ```
 
 - Editing on the Mac and building, testing and running in the VM against the
@@ -78,8 +81,8 @@ Running other kernels (vimto) needs QEMU. Without KVM it is slow but works:
 `VIMTO_DISABLE_KVM=true make integration-vm KERNEL=5.10` took about a minute
 per kernel here. Nested virtualization in a Mac VM needs an M3 or newer and
 macOS 15; otherwise use `VIMTO_DISABLE_KVM=true` or let CI do it. The
-`ci-kernels` images used so far were x86_64. If arm64 images aren't
-available, run that matrix only in CI.
+`ci-kernels` images come for x86_64 and arm64; `tools/loadcheck` uses
+both.
 
 ## Commands
 
@@ -90,14 +93,18 @@ make integration           # loads the BPF program, traces real clients (sudo)
 make integration-vm KERNEL=5.10   # same, in a VM with another kernel (vimto + QEMU)
 make lint                  # golangci-lint (v2 config in .golangci.yml)
 make generate              # recompile bpf/snoopy.c; use clang 18 or CI's diff check fails
+make jars                  # rebuild the embedded Java agent; use Temurin 21.0.13+9 or CI's diff check fails
 sudo ./snoopy --verbose    # try it
 ```
 
 The integration tests skip clients that aren't installed: curl, python3,
-gnutls-cli, and cc with libnss3-dev for the NSS client in
-`internal/tracer/testdata`. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
+gnutls-cli, erl (erlang-base, erlang-ssl, erlang-inets), and cc with libnss3-dev for the NSS client in
+`internal/tracer/testdata`, or with `SNOOPY_TEST_STRICT=1` (CI) fail
+instead. `SNOOPY_TEST_RUSTLS=1` builds and runs the rustls
 and quinn clients with cargo, and `SNOOPY_TEST_CURL_HTTP3` runs curl's HTTP/3
-from a system that has it (see AGENTS.md). `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
+from a system that has it (see AGENTS.md). `SNOOPY_TEST_LEGACY_UPROBES=1`
+attaches a perf-based link per probe, as kernels before 6.6 do, whatever
+the kernel (see "Attaching" below). `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the
 signature finding against real binaries (see
 [CONTRIBUTING.md](CONTRIBUTING.md)).
 
@@ -111,19 +118,25 @@ signature finding against real binaries (see
 | `internal/tracer/gen.go` | `go:generate` → bpf2go (`go tool bpf2go`, declared as a tool in go.mod) |
 | `internal/tracer/snoopy_{x86,arm64}_bpfel.{go,o}` | Generated and committed |
 | `internal/tracer/tracer.go` | Load (BTF detection and fallback), attach, ring buffer loop, lost-event counter |
+| `internal/tracer/uprobes.go` | Making the links: uprobe_multi detection, grouping probes into links, C symbols' file offsets |
 | `internal/tracer/assemble.go` | Decodes records and reassembles chunks into events |
 | `internal/tracer/sockets.go` | Holds writes back until the socket notice for their connection arrives |
 | `internal/tracer/event.go` | `Event`, `Function` (must match `enum fn_id` in C; a test checks) |
 | `internal/discover/` | Finds targets: system libs, `/proc/*/maps`, deleted files, Go binaries, RET offsets, prologue check, rustls by mangled name, stripped BoringSSL (`boringssl.go`), freebl's function table (`freebl.go`) |
 | `internal/funcfind/` | Locates functions in stripped x86-64 and arm64 binaries by the strings and constants they use (`x86.go`, `arm64.go`) |
 | `internal/procinfo/` | Container ID from cgroups; `/proc` socket lookup (fallback when there's no BTF) |
-| `internal/output/` | Text, NDJSON and pcap writers; HTTP/1 message framing (`http1.go`), HTTP/2 with HPACK (`http2.go`), gRPC messages and schema-less protobuf (`grpc.go`), QUIC and HTTP/3 with QPACK (`quic.go`, `qpack.go`), body decompression (`body.go`) |
-| `internal/javaagent/` | `--java`: staging the agent's jars in a JVM's `/tmp`, and HotSpot's attach protocol, in Go |
+| `internal/output/` | Text, NDJSON and pcap writers; HTTP/1 message framing (`http1.go`), HTTP/2 with HPACK (`http2.go`), gRPC messages and schema-less protobuf (`grpc.go`), with `--proto`'s schemas (`protoschema.go`), QUIC and HTTP/3 with QPACK (`quic.go`, `qpack.go`), body decompression (`body.go`); `--requests` (`requests.go`, on HAR's pairing), `--brief`'s folding of bodies (`fold.go`) |
+| `internal/javaagent/` | `--java`: staging the agent's jars in a JVM's `/tmp`, and HotSpot's attach protocol, in Go; the jars themselves, embedded (`jars/`, built by `make jars`) |
 | `java/` | The Java agent (`agent/src`: the ASM transformer and `Hooks`, which writes frames to `/dev/null`), `build.sh`, and the spike's tools |
 | `main.go` | CLI flags and wiring |
 | `java.go` | `--java`: which JVMs, loading the agent into them, stopping it |
-| `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64) |
-| `.github/workflows/release.yml`, `.goreleaser.yaml` | Releases on `v*` tags |
+| `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64), the Java agent per JDK |
+| `.github/workflows/rust.yml`, `canary.yml`, `loadcheck.yml`, `release-check.yml`, `kubectl-snoopy.yml`, `benchmark.yml`, `vulnscan.yml`, `codeql.yml` | The other checks in the Status table |
+| `java/vulncheck.sh` | Checks the ASM release `java/build.sh` bundles against OSV, which no scanner sees |
+| `SECURITY.md`, `**/osv-scanner.toml` | How to report a vulnerability; the scan's exceptions, each with its reason |
+| `.github/workflows/release.yml`, `.goreleaser.yaml`, `Dockerfile` | Releases on `v*` tags, and their attestations |
+| `tools/loadcheck/` | Loads every BPF program under older kernels in QEMU (`fetch.sh`, `run.sh`) |
+| `tools/act.sh` | Runs the workflows' jobs locally with act |
 | `.vimto.toml` | VM settings for kernel-matrix tests (root, 2 GB, loopback up) |
 
 ## How it works, and what to keep in mind when changing it
@@ -191,13 +204,36 @@ signature finding against real binaries (see
 
 ### Go side
 
+- **Attaching:** each attach function builds a list of probes for the
+  file (`uprobe`), and `Tracer.link` makes the links. Where the kernel has
+  uprobe_multi links with their PID filtering fixed (`HaveUprobeMulti`:
+  6.6 and later, the fix included in 6.6.y), the probes running the same
+  program the same way are one link (`groupUprobes`), so a file takes a
+  few links rather than one per probe, return probes' first. The
+  programs are the same, loaded with `AttachTraceUprobeMulti`, which the
+  kernel then requires (they can't be attached the other way), so the
+  choice is made once, in `New`; should the kernel's verifier refuse them
+  so, they're loaded as before, which `tools/loadcheck` reports as a
+  failure. Otherwise each probe is a perf-based link, as before 2.11. C
+  functions are found by their symbols' file offsets (`symbolOffsets`,
+  as cilium/ebpf finds them, which `TestSymbolOffsets` checks), since a
+  uprobe_multi link takes a list of offsets and fails as a whole on a
+  missing symbol. Why: the kernel detaches a perf-based uprobe in tens of
+  ms, mostly waiting for RCU grace periods, one at a time; with `--comm`
+  and twenty Go programs, snoopy took 90 s to exit, 0.3 s now (see
+  [docs/performance.md](docs/performance.md#attaching-and-exiting)).
+  Kernels without the PID fix filtered per-process links by thread, so a
+  per-process probe only saw the main thread's calls; libbpf turns
+  uprobe_multi off for them too.
 - **Header layout:** `rawHeader` (Go) must match `struct event_header` (C,
   112 bytes with explicit padding); `TestHeaderMatchesBPFLayout` checks it
   against the bpf2go type.
 - **Stripped Go binaries** are located via `.gopclntab`, using `runtime.text`
   from the pclntab header. With cgo/external linking it isn't the start of
-  `.text`. `checkGoPrologue` refuses to attach unless the function starts with
-  Go's stack check, so a mistake can't plant breakpoints mid-instruction.
+  `.text`. `goBodyOffset` (`internal/discover/inspect.go`) refuses to attach
+  unless the function starts with Go's stack check, so a mistake can't plant
+  breakpoints mid-instruction, and attaches after it, where a call that
+  grows the stack doesn't fire the probe twice.
 - **Deleted or replaced files** in use by a process are attached through
   `/proc/<pid>/map_files/<range>` or `/proc/<pid>/exe`. This needs
   CAP_SYS_ADMIN.
@@ -413,6 +449,45 @@ signature finding against real binaries (see
   connection: Content-Length, chunked framing, until close, no body for HEAD
   responses, 1xx, 204 and 304, and it stops at 101 and CONNECT. Bytes that
   weren't captured stop a body's decoding, said once.
+- **`--requests`** (`output/requests.go`) is the HAR writer's pairing with
+  no entries kept (`maxKept` 0, so bodies are only counted) and a `done`
+  hook, called once per exchange when its response ends: an HTTP/2 or
+  HTTP/3 stream's END_STREAM or reset (`streamEnds`), or the HTTP/1
+  segment marked `ends` (the body's last byte by Content-Length or
+  chunked framing, or the headers of a message without a body). A body
+  that ends at the connection's close never ends there, so its exchange
+  isn't shown. `--count` counts its lines, and the pipeline asks it how
+  many (`Shown`). HTTP/1 segments carry the body's own bytes
+  (`payload`, chunked framing left out), which HAR keeps; before, it kept
+  a chunked body's framing.
+- **`--brief`'s folding** (`output/fold.go`): once a body's first call is
+  shown, calls carrying only more of it (`bodyRefs`) are counted, not
+  shown, and the call that ends it says how many. Folded calls aren't
+  shown calls for the pipeline or `--count` (`Folded`).
+- **gRPC methods and `--proto`:** the HTTP/2 decoder keeps each stream's
+  request `:path` on the connection (`http2Conn.paths`), since a
+  response's messages come in the other direction, and each `grpcStream`
+  knows its method, whether it carries requests, and, with `--proto`, its
+  messages' type. `decodeTyped` formats a message itself: prototext varies
+  its spacing from run to run on purpose, which tests and docs can't
+  have. Descriptor sets only; parsing `.proto` files would mean resolving
+  their imports as protoc does.
+- **`--grep`** matches after decoding and redaction (`decoded.matches`),
+  and marks what it doesn't match `filteredOut`, as the HTTP filters do.
+- **HAR files** are written as they go: `WriteFile` writes a temporary
+  file renamed over the old one, every `harInterval` while the log
+  changes, less often if writing takes long. HAR's printer has a mutex for
+  that, since its writer runs in its own goroutine.
+- **The Java agent is embedded** (`internal/javaagent/jars`), for `go
+  install`: committed, built by `make jars` with the release's JDK, and
+  checked by CI as the BPF objects are. `build.sh` dates the jars'
+  entries 2000-01-01, not by a commit, which committed jars couldn't
+  match. Jars next to snoopy, or `--java-agent`'s, come first.
+- **Startup's Ctrl-C:** `exitOnSignalUntil` asks for SIGINT and SIGTERM at
+  the start of `run` and exits at once on them until tracing starts. A
+  program started with SIGINT ignored, as a script's background job is,
+  keeps ignoring it until it asks, and snoopy used to ask only once
+  tracing started.
 - **x86 testing on an Apple Silicon Mac:** `limactl start --arch=x86_64
   --vm-type=qemu template://ubuntu-24.04` gives an emulated x86 VM where
   uprobes work (Docker's amd64 emulation is user-space only). Slow, but fine
@@ -448,7 +523,10 @@ signature finding against real binaries (see
   libraries a long-running process `dlopen`s more than 3 s after its exec.
 - **Not supported:** rustls under tokio with providers other than aws-lc-rs
   and ring (`Reader::read` is inlined into tokio-rustls), QUIC/HTTP/3
-  outside Chromium, Firefox, quinn, ngtcp2 and quic-go, Firefox's QUIC with
+  outside Chromium, Firefox, quinn, ngtcp2, quic-go and OpenSSL's own QUIC,
+  OpenSSL's QUIC in processes not selected with `--comm`, `--pid` or
+  `--container` (libcrypto's cipher functions carry all of a program's
+  symmetric encryption, so they're probed only there), Firefox's QUIC with
   ChaCha20-Poly1305 (which, a spike showed, reaches freebl's HACL* Poly1305
   without going through its exported `ChaCha20Poly1305_Seal`/`Open`/
   `Encrypt`/`Decrypt`, so where to probe is still to be found; Firefox only
@@ -462,7 +540,30 @@ signature finding against real binaries (see
 - **HTTP/1 pipelining:** a response is matched to the last request sent, so
   with pipelined requests a response to HEAD can be taken to have a body.
 - **No socket details** (fd or addresses) for apps that do their own socket
-  I/O around OpenSSL with memory BIOs, e.g. .NET, nor for Java's `SSLEngine`.
+  I/O around OpenSSL with memory BIOs, e.g. .NET and Node.js, nor for Java's
+  `SSLEngine`. (Before 2.10, Node's calls could get the address of a file
+  OpenSSL read, or of a later socket with that fd; now they get none.)
+- **Detaching is slow before Linux 6.6:** there, and on kernels without
+  uprobe_multi's PID fix, each probe is a perf-based link, which the kernel
+  takes tens of ms to detach, so a snoopy with thousands of links takes
+  seconds to exit, or more than a minute per-process with many processes.
+  6.6 and later attach through uprobe_multi links (see "Attaching").
+- **A lower-layer file deleted through an overlay keeps its probes** until
+  snoopy exits: the overlay only hides it, its link count stays 1, so
+  `DetachUnused` doesn't take it for deleted. That's the safe way to be
+  wrong (it can still be opened from the lower directory); it costs the
+  links. Files on a container's root (`/proc/<pid>/root/...`) are let go
+  of with the root instead.
+- **Probably duplicate events across containers of one image:** uprobes go
+  on the real (lower layer) inode, but snoopy tells files apart by the
+  overlay's device and inode, so two running containers from one image may
+  get two sets of probes on the same file. Not checked yet.
+- **kubectl snoopy's text merge** of several nodes' output splits events at
+  a blank line followed by a header-shaped line, a heuristic: a body with
+  such a line in it can be split. --json is exact. An event delimiter in
+  snoopy's text output would make it exact.
+- **--redact is slow:** about 10 ms per 15 KB body, mostly regexps; a cheap
+  pre-check before them would help.
 - **Java's JSSE needs `--java`,** which loads snoopy's agent into the JVM
   (docs/how-it-works.md, "Java and JSSE"). It can't be unloaded, only told
   to stop. Not covered: writes that throw part way, kernels without BTF

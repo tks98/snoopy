@@ -26,7 +26,7 @@ func (b *Binary) fdeStarts() []uint64 {
 	}
 	b.starts = []uint64{}
 	s := b.f.Section(".eh_frame_hdr")
-	if s == nil {
+	if s == nil || !readable(s) {
 		return b.starts
 	}
 	d, err := s.Data()
@@ -54,7 +54,7 @@ func (b *Binary) fdeFuncAt(pc uint64) (*Func, bool) {
 	if i < 0 || !b.inText(pc) {
 		return nil, false
 	}
-	end := b.textAddr + uint64(len(b.code()))
+	end := b.textEnd()
 	if i+1 < len(starts) {
 		end = starts[i+1]
 	}

@@ -79,6 +79,13 @@ The BPF programs' own time per call, for nginx at 1 KiB traced: 180 to
 (`tls_return`, which copies the data out), and 128 ns per syscall
 (`sys_enter`). Before, `tls_return` took 2,024 ns.
 
+`sys_enter` was measured again for 2.10, with byte-at-a-time `dd` reads
+and writes (BPF statistics, the same VM): 54 ns per syscall by default, 53
+ns with `--pid` or `--comm` (63 to 149 ns before), and 52 to 56 ns in a PID
+namespace, as in a Kubernetes pod (90 to 239 ns before). It now checks what
+a syscall can be before the process filter, and only looks for Java frames
+with `--java`.
+
 ## What it means
 
 - **A traced call** costs the program about 5 µs: nginx makes three TLS
@@ -118,6 +125,32 @@ The BPF programs' own time per call, for nginx at 1 KiB traced: 180 to
 
 To measure on another machine, run `sudo docs/benchmark/run.sh`; its header
 says what it needs.
+
+## Attaching and exiting
+
+snoopy stops in a fraction of a second on Linux 6.6 and later, and could
+take more than a minute before. The kernel detaches a perf-based uprobe in
+tens of milliseconds, one at a time, and snoopy had one for each probe: two
+for each C function, and one for each `RET` of a Go program's TLS methods,
+for each process with `--comm`, `--pid` or `--container`. From 2.11, where
+the kernel has uprobe_multi links (6.6, with the PID filtering fix that
+6.6.y has too), a file's probes are a few links, which detach at once.
+
+Measured with snoopy 2.10 and with this change, on Linux 6.18 (x86-64, 4
+CPUs, a cloud VM), with 20 copies of a Go program that links `crypto/tls`
+and 20 Pythons with `ssl` loaded, all idle. Attaching is from start to
+snoopy saying it's tracing, most of it finding the files; exiting is from
+Ctrl-C to the end. Each is the mean of two runs; exiting varied by less
+than 0.1 s, attaching by up to 0.3 s.
+
+| | 2.10, attach | 2.10, exit | 2.11, attach | 2.11, exit |
+| --- | --- | --- | --- | --- |
+| `snoopy --quiet` | 1.8 s | 5.1 s | 1.8 s | 0.3 s |
+| `snoopy --comm gotlsprog --quiet` | 0.7 s | 90 s | 0.5 s | 0.3 s |
+
+Per process, each of the Go programs had 17 probes, 17 links before and 3
+now. On older kernels each probe is still a link of its own, and exiting
+takes as long as before.
 
 ## Java (`--java`)
 

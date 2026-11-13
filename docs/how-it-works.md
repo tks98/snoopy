@@ -9,11 +9,13 @@ What snoopy can trace, and how it does it.
 | --- | --- | --- |
 | OpenSSL, BoringSSL, LibreSSL | `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex` | Also copies linked into a program that exports them, like Node.js. |
 | BoringSSL in Chrome, Brave, Edge, Electron apps, Bun and Envoy | `SSL_read`, `SSL_write`, found by signature | No symbols, so the functions are recognized by what they do. Bun does its own socket I/O, so its events have no addresses; Envoy's HTTP/3 isn't traced. |
-| HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, found by signature | Each QUIC packet, decrypted. |
+| HTTP/3 in Chrome, Brave, Edge and Electron apps | BoringSSL's `EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open` and its ciphers' `openv_detached` methods, found by signature | Each QUIC packet, decrypted. |
 | HTTP/3 in Firefox | freebl's `AES_CreateContext`, `AES_AEAD` | AES-GCM connections opened while snoopy runs. |
 | HTTP/3 over quinn (Rust) | the same functions as for rustls's records, below | With rustls's aws-lc-rs and ring providers. |
 | HTTP/3 over ngtcp2 (curl) | `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt` | In each of ngtcp2's crypto libraries (OpenSSL, GnuTLS, wolfSSL, BoringSSL, quictls). |
+| HTTP/3 through OpenSSL's own QUIC (curl on Debian) | libcrypto's `EVP_CipherInit_ex`, `EVP_CipherUpdate`, `EVP_CipherFinal_ex` | OpenSSL 3.2 and later. Only in the processes selected with `--comm`, `--pid` or `--container`, since all of a program's symmetric encryption goes through those functions. |
 | HTTP/3 over quic-go (Go) | Go's AES-GCM and ChaCha20-Poly1305 `Seal` and `Open` | Only in programs that use quic-go; stripped ones too. |
+| Erlang's `ssl` (Erlang, Elixir) | libcrypto's `EVP_EncryptUpdate`, `EVP_DecryptUpdate`, which its crypto NIF encrypts and decrypts records with | TLS 1.2 and 1.3 records, through libcrypto or the NIF itself when libcrypto is linked into it. Only in the processes selected with `--comm`, `--pid` or `--container`, whose program is `beam.smp`. |
 | GnuTLS | `gnutls_record_recv`, `gnutls_record_send` | |
 | NSS (Firefox, Thunderbird) | `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send` | Also the copy bundled with Firefox. |
 | wolfSSL | `wolfSSL_read`, `wolfSSL_write` | |
@@ -41,8 +43,9 @@ All of them on x86_64 and arm64. Some details:
   up before snoopy started, since a context's direction is learned when it's
   created. Rust programs using quinn (reqwest's `http3`, h3) are captured
   where rustls's crypto provider encrypts and decrypts their packets, and
-  curl's HTTP/3 (Fedora's curl has it; Ubuntu's doesn't) where ngtcp2's
-  crypto library does. Go programs using quic-go (Caddy, Traefik, Go's
+  curl's HTTP/3 where ngtcp2's crypto library does (Fedora's curl), or
+  where OpenSSL's own QUIC protects its packets through libcrypto
+  (Debian's; Ubuntu's curl has no HTTP/3). Go programs using quic-go (Caddy, Traefik, Go's
   `http3` clients) are captured where Go's AEADs encrypt and decrypt their
   packets.
 - **NSS** functions are used for all kinds of files, so only layered
@@ -81,7 +84,7 @@ HTTPS:
 | Java with Netty's netty-tcnative (gRPC-Java and Netty, when it's there) | BoringSSL in a JNI library, extracted to a temporary file | yes, found when the JVM loads it, however late |
 | Java with Conscrypt | BoringSSL in a JNI library, stripped | yes, found by signature |
 | Java (OpenJDK), otherwise | JSSE, written in Java | with `--java`, through snoopy's agent ([below](#java-and-jsse)) |
-| Erlang, Elixir | OTP's `ssl`, written in Erlang | no |
+| Erlang, Elixir | OTP's `ssl`, written in Erlang, with libcrypto for its records | yes, when selected with `--comm beam`, `--pid` or `--container` |
 
 A TLS library a process loads after it started, such as the ones a JVM
 extracts and loads the first time it needs TLS, is found when it's mapped:
@@ -91,10 +94,12 @@ thread that loaded it is held until snoopy has attached to it, so its first
 connection isn't missed.
 
 Not supported: rustls under tokio with providers other than aws-lc-rs and
-ring, Erlang's `ssl`, stripped TLS
+ring, Erlang's `ssl` in processes not selected with `--comm`, `--pid` or
+`--container`, stripped TLS
 libraries other than
-BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn, ngtcp2 and quic-go (quiche, for
-example), programs that use OpenSSL only through its BIO layer (e.g.
+BoringSSL, QUIC/HTTP/3 outside Chromium, Firefox, quinn, ngtcp2, quic-go and
+OpenSSL's own QUIC (quiche, for example), OpenSSL's QUIC in processes not
+selected with `--comm`, `--pid` or `--container`, programs that use OpenSSL only through its BIO layer (e.g.
 `openssl s_server -www`), and bodies compressed with a shared dictionary
 (Chrome's `dcb` and `dcz`), which are shown as sent.
 
@@ -110,7 +115,11 @@ example), programs that use OpenSSL only through its BIO layer (e.g.
    connection handle. A return probe copies the bytes actually transferred
    into a ring buffer, in chunks of up to 16 KiB. Go programs can't use return
    probes, because Go moves goroutine stacks, so snoopy disassembles the
-   function and puts a probe on each `RET` instruction instead.
+   function and puts a probe on each `RET` instruction instead. On Linux
+   6.6 and later, a file's probes are attached through a few uprobe_multi
+   links, which the kernel attaches and detaches in one go; on older
+   kernels each probe is a link of its own, which makes snoopy slower to
+   exit.
 3. A `sys_enter` tracepoint records which socket each TLS call uses. Socket
    addresses are read from the kernel's `struct sock`, located with CO-RE
    (BTF-based relocation) so one compiled program works on every kernel
@@ -137,7 +146,8 @@ attach.
 
 QUIC (HTTP/3) encrypts each packet separately, with the packet's header as
 associated data, so snoopy captures packets where they're encrypted and
-decrypted: BoringSSL's `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open` in Chrome,
+decrypted: BoringSSL's `EVP_AEAD_CTX_seal` and `EVP_AEAD_CTX_open` (or, where
+Chrome inlined open, its ciphers' `openv_detached`) in Chrome,
 freebl's `AES_AEAD` in Firefox. The same functions protect TLS records, whose
 associated data looks different. None of them touch the socket. A received
 packet is usually decrypted from the buffer it was received into, so for

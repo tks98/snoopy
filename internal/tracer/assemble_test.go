@@ -72,6 +72,8 @@ func TestFunctionsMatchBPFEnum(t *testing.T) {
 		"FN_GO_QUIC_SEND": FuncGoQUICSend, "FN_GO_QUIC_RECV": FuncGoQUICRecv,
 		"FN_JSSE_SOCKET_READ": FuncJSSESocketRead, "FN_JSSE_SOCKET_WRITE": FuncJSSESocketWrite,
 		"FN_JSSE_ENGINE_UNWRAP": FuncJSSEEngineUnwrap, "FN_JSSE_ENGINE_WRAP": FuncJSSEEngineWrap,
+		"FN_OSSL_QUIC_SEND": FuncOSSLQUICSend, "FN_OSSL_QUIC_RECV": FuncOSSLQUICRecv,
+		"FN_ERL_RECORD_SEND": FuncErlangRecordSend, "FN_ERL_RECORD_RECV": FuncErlangRecordRecv,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("C enum has %d functions, Go has %d", len(names), len(want))
@@ -274,4 +276,44 @@ func TestDecodeHeader(t *testing.T) {
 			t.Fatalf("got %+v, want %+v", got, want)
 		}
 	}
+}
+
+// A header's Captured doesn't size the event's buffer beyond what the BPF
+// program can capture.
+func TestAssembleHugeCaptured(t *testing.T) {
+	a := newAssembler(testClock)
+	h := rawHeader{TimestampNs: 1, Tid: 1, Size: 0xffffffff, Captured: 0xffffffff}
+	evs := a.add(mustParse(t, record(h, "hello")), time.Now())
+	if len(evs) != 0 {
+		t.Fatalf("got %d events before the rest of the call", len(evs))
+	}
+	evs = a.expire(time.Now().Add(time.Hour), time.Second)
+	if len(evs) != 1 || cap(evs[0].Data) > MaxCaptureLimit {
+		t.Fatalf("got %d events, capacity %d", len(evs), cap(evs[0].Data))
+	}
+}
+
+func FuzzAssemble(f *testing.F) {
+	rec := make([]byte, headerSize+8)
+	binary.NativeEndian.PutUint32(rec[36:], 8) // captured
+	binary.NativeEndian.PutUint32(rec[44:], 8) // chunk length
+	rec[92] = 10                               // QUIC header length
+	f.Add(rec)
+	f.Fuzz(func(t *testing.T, b []byte) {
+		a := newAssembler(testClock)
+		for len(b) >= headerSize {
+			n := min(len(b), headerSize+int(b[44]))
+			c, err := parseChunk(b[:n])
+			b = b[n:]
+			if err != nil {
+				continue
+			}
+			for _, ev := range a.add(c, time.Time{}) {
+				_ = ev.Function.String()
+				_ = ev.Function.Direction()
+				_ = ev.Truncated()
+			}
+		}
+		a.expire(time.Time{}.Add(time.Hour), time.Second)
+	})
 }

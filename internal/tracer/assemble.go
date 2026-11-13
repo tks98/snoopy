@@ -150,7 +150,7 @@ func (a *assembler) add(c chunk, now time.Time) []*Event {
 			// The start of this call was lost; drop what's left of it.
 			return done
 		}
-		p = &partial{ev: a.newEvent(c), ts: c.TimestampNs, captured: c.Captured}
+		p = &partial{ev: a.newEvent(c), ts: c.TimestampNs, captured: min(c.Captured, MaxCaptureLimit)}
 		a.pending[c.Tid] = p
 	}
 	p.seen = now
@@ -208,6 +208,8 @@ func (a *assembler) newEvent(c chunk) *Event {
 		ConnID:     c.ConnID,
 		FD:         c.Fd,
 		Size:       c.Size,
-		Data:       make([]byte, 0, c.Captured),
+		// The BPF program captures at most MaxCaptureLimit bytes per call;
+		// a header saying more isn't to be trusted with memory.
+		Data: make([]byte, 0, min(c.Captured, MaxCaptureLimit)),
 	}
 }

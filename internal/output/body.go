@@ -20,6 +20,9 @@ const (
 	maxDecodedBody = 16 << 20 // decoded bytes per body
 	maxLiveBodies  = 256      // bodies being decoded at once, over all connections
 	zstdMaxWindow  = 8 << 20  // what HTTP allows (RFC 9659)
+	// Codings undone per body. Each takes a goroutine and a decompressor;
+	// real bodies have one, rarely two.
+	maxContentCodings = 4
 )
 
 var errBodyTooLarge = fmt.Errorf("decoded body exceeds %d MiB", maxDecodedBody>>20)
@@ -77,6 +80,10 @@ func (p *bodyPool) start(contentEncoding string) *bodyDecoder {
 	b := &bodyDecoder{encoding: contentEncoding, pool: p}
 	if !ok {
 		b.err = fmt.Errorf("can't decode content encoding %q", contentEncoding)
+		return b
+	}
+	if len(codings) > maxContentCodings {
+		b.err = fmt.Errorf("%d content codings, more than snoopy undoes (%d)", len(codings), maxContentCodings)
 		return b
 	}
 	if len(p.live) >= maxLiveBodies {

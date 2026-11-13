@@ -19,7 +19,11 @@ type http2Frame struct {
 	Length    int      // the frame's payload length
 	Flags     []string // e.g. END_STREAM
 	Continued bool     // more of a DATA frame that started in an earlier event
-	Data      []byte   // DATA payload in this event (padding included)
+	// EndsStream is set on what ends its stream: the rest of an END_STREAM
+	// DATA frame's payload, which may come in later events than its header,
+	// or the frame completing a header block whose HEADERS had END_STREAM.
+	EndsStream bool
+	Data       []byte // DATA payload in this event (padding included)
 	// Headers is the decoded header block, on the HEADERS, PUSH_PROMISE or
 	// CONTINUATION frame that completes it.
 	Headers []hpack.HeaderField
@@ -119,9 +123,10 @@ const maxBodyInfos = 1024
 // that started before snoopy is followed from the first call that starts
 // with a frame, without its headers.
 type http2Conns struct {
-	conns map[http2Key]*http2Conn
-	clock uint64 // for evicting the least recently used connection
-	pool  *bodyPool
+	conns   map[http2Key]*http2Conn
+	clock   uint64 // for evicting the least recently used connection
+	pool    *bodyPool
+	schemas *ProtoSchemas // --proto's
 }
 
 type http2Key struct {
@@ -130,9 +135,14 @@ type http2Key struct {
 }
 
 type http2Conn struct {
-	dirs     [2]http2Dir // by tracer.Direction
-	late     bool        // started before snoopy: no preface, no headers
-	noted    bool        // the note saying so was returned
+	dirs [2]http2Dir // by tracer.Direction
+	// paths are the streams' requests' :paths, which their responses'
+	// gRPC messages are named by: the request's and the response's headers
+	// come in different directions.
+	paths    map[uint32]string
+	schemas  *ProtoSchemas
+	late     bool // started before snoopy: no preface, no headers
+	noted    bool // the note saying so was returned
 	lastUsed uint64
 }
 
@@ -143,7 +153,13 @@ type http2Dir struct {
 	buf      []byte         // unparsed bytes, starting at a frame header
 	dataLeft int            // payload bytes still to come of the current DATA frame
 	data     dataFrame
-	block    []byte // header block being assembled
+	block    []byte              // header block being assembled
+	fields   []hpack.HeaderField // the block's fields as they're decoded
+	// The size of fields, and whether some were left out to keep it under
+	// maxHeaderList.
+	fieldsSize int
+	fieldsCut  bool
+	note       string // to return from process
 	// The HEADERS frame the block started with: its stream, and whether it
 	// ends the stream.
 	blockStream    uint32
@@ -152,6 +168,7 @@ type http2Dir struct {
 	bodies         map[uint32]*bodyDecoder // by stream, for encoded bodies
 	infos          map[uint32]*bodyInfo    // by stream
 	grpc           map[uint32]*grpcStream  // by stream, for gRPC calls
+	conn           *http2Conn
 }
 
 // dataFrame is the DATA frame being read, to find its body bytes: a padded
@@ -183,11 +200,20 @@ func (f *dataFrame) bodyBytes(piece []byte) []byte {
 
 const (
 	maxHTTP2Conns   = 4096
-	maxHTTP2Pending = 1 << 20 // larger frames than this are given up on
+	maxHTTP2Pending = 1 << 20 // larger frames and header blocks than this are given up on
+	// The largest HPACK dynamic table followed. Browsers advertise 64 KiB
+	// (SETTINGS_HEADER_TABLE_SIZE), most others the default 4 KiB; a larger
+	// table only makes room for one header to be repeated many times over.
+	maxHPACKTable = 64 << 10
+	// The most of a header block's fields shown, counted as HPACK does (RFC
+	// 9113, section 6.5.2), in the ballpark of the limits servers set on
+	// it. One byte can refer to a table entry, so a small block can
+	// otherwise decode to gigabytes.
+	maxHeaderList = 256 << 10
 )
 
-func newHTTP2Conns(pool *bodyPool) *http2Conns {
-	return &http2Conns{conns: map[http2Key]*http2Conn{}, pool: pool}
+func newHTTP2Conns(pool *bodyPool, schemas *ProtoSchemas) *http2Conns {
+	return &http2Conns{conns: map[http2Key]*http2Conn{}, pool: pool, schemas: schemas}
 }
 
 // process returns the frames in an event of an HTTP/2 connection, and ok.
@@ -217,6 +243,7 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 	if d.broken {
 		return nil, false, ""
 	}
+	d.note = ""
 	if !d.synced {
 		if !http2Aligned(data) { // wait for a call that starts with a frame
 			return nil, false, ""
@@ -238,6 +265,7 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 		d.broken = true
 		return nil, false, "HTTP/2 decoding stopped for this direction of the connection: " + err.Error()
 	}
+	note = d.note
 	if conn.late && !conn.noted {
 		conn.noted = true
 		note = "this HTTP/2 connection started before snoopy, so its headers can't be decoded"
@@ -265,13 +293,14 @@ func (c *http2Conns) start(key http2Key, late bool) *http2Conn {
 		c.conns[oldest].close()
 		delete(c.conns, oldest)
 	}
-	conn := &http2Conn{late: late}
+	conn := &http2Conn{late: late, paths: map[uint32]string{}, schemas: c.schemas}
 	for i := range conn.dirs {
 		d := &conn.dirs[i]
+		d.conn = conn
 		if !late {
-			d.dec = hpack.NewDecoder(4096, nil)
+			d.dec = hpack.NewDecoder(4096, d.field)
 			// The peer's SETTINGS may allow a larger table; we only listen.
-			d.dec.SetAllowedMaxDynamicTableSize(1 << 24)
+			d.dec.SetAllowedMaxDynamicTableSize(maxHPACKTable)
 			d.synced = true
 		}
 		d.bodies = map[uint32]*bodyDecoder{}
@@ -293,6 +322,21 @@ func (d *http2Dir) endBodies(err error) {
 	for stream, dec := range d.bodies {
 		dec.fail(err)
 		delete(d.bodies, stream)
+	}
+}
+
+// trimBodies makes room in d.bodies, which keeps a stream's decoder from
+// its headers to its end: a peer that never ends its streams would
+// otherwise fill it. The pool gives up on all but maxLiveBodies of them,
+// so dropping the ones it gave up on is enough.
+func (d *http2Dir) trimBodies() {
+	if len(d.bodies) < maxBodyInfos {
+		return
+	}
+	for stream, dec := range d.bodies {
+		if dec.err != nil {
+			delete(d.bodies, stream)
+		}
 	}
 }
 
@@ -334,6 +378,11 @@ func (d *http2Dir) add(data []byte, missing int, pool *bodyPool) ([]http2Frame, 
 				if d.dataLeft == 0 && d.data.endStream {
 					delete(d.bodies, d.data.stream)
 					delete(d.infos, d.data.stream)
+					if n := len(frames); n > 0 && frames[n-1].Stream == d.data.stream {
+						frames[n-1].EndsStream = true
+					} else {
+						frames = append(frames, http2Frame{Type: "DATA", Stream: d.data.stream, Continued: true, EndsStream: true})
+					}
 				}
 				return frames, nil
 			}
@@ -413,6 +462,7 @@ func (d *http2Dir) dataPiece(f *http2Frame) {
 		delete(d.infos, stream)
 	}
 	f.Body = decodeBody(dec, body, last)
+	f.EndsStream = last
 }
 
 // info returns what's known about a stream's body, starting to follow it if
@@ -427,6 +477,17 @@ func (d *http2Dir) info(stream uint32) *bodyInfo {
 		d.infos[stream] = info
 	}
 	return info
+}
+
+// field is the HPACK decoder's emit function: it collects a header block's
+// fields, up to maxHeaderList.
+func (d *http2Dir) field(f hpack.HeaderField) {
+	if d.fieldsCut || d.fieldsSize+int(f.Size()) > maxHeaderList {
+		d.fieldsCut = true
+		return
+	}
+	d.fieldsSize += int(f.Size())
+	d.fields = append(d.fields, f)
 }
 
 // headerBlock collects the header block fragments of HEADERS, PUSH_PROMISE
@@ -461,6 +522,9 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 			d.blockStream, d.blockEndStream = f.Stream, flags&endStream != 0
 		}
 	case 9: // CONTINUATION
+		if len(d.block)+len(p) > maxHTTP2Pending {
+			return fmt.Errorf("header block of more than %d bytes is too large to follow", maxHTTP2Pending)
+		}
 		d.block = append(d.block, p...)
 	default:
 		return nil
@@ -468,6 +532,7 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 	if flags&endHeaders == 0 {
 		return nil
 	}
+	f.EndsStream = d.blockEndStream
 	if d.dec == nil {
 		d.block = d.block[:0]
 		f.HeadersLost = true
@@ -476,10 +541,23 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 		}
 		return nil
 	}
-	fields, err := d.dec.DecodeFull(d.block)
+	d.fields, d.fieldsSize, d.fieldsCut = nil, 0, false
+	_, err := d.dec.Write(d.block)
+	if err == nil {
+		err = d.dec.Close()
+	}
 	d.block = d.block[:0]
+	if cap(d.block) > 64<<10 { // let a large block's array go
+		d.block = nil
+	}
+	fields := d.fields
+	d.fields = nil
 	if err != nil {
 		return fmt.Errorf("can't decode header block: %v", err)
+	}
+	if d.fieldsCut {
+		d.note = fmt.Sprintf("a header block on stream %d decoded to more than %d KiB; the rest of its fields aren't shown",
+			f.Stream, maxHeaderList>>10)
 	}
 	f.Headers = fields
 	if stream := d.blockStream; stream != 0 {
@@ -488,17 +566,27 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 			delete(d.grpc, stream) // trailers, or a call without messages
 		} else if typ := contentType(fields); typ != "" {
 			d.info(stream).contentType = typ
+			path, request := headerField(fields, ":path")
+			if request {
+				if len(d.conn.paths) >= maxBodyInfos {
+					clear(d.conn.paths)
+				}
+				d.conn.paths[stream] = path
+			}
 			if isGRPC(typ) && d.grpc[stream] == nil {
 				if len(d.grpc) >= maxBodyInfos {
 					clear(d.grpc)
 				}
-				d.grpc[stream] = &grpcStream{encoding: grpcEncoding(fields)}
+				method := d.conn.paths[stream]
+				d.grpc[stream] = &grpcStream{encoding: grpcEncoding(fields), method: method, request: request,
+					typ: d.conn.schemas.message(method, request)}
 			}
 		}
 		dec := d.bodies[stream]
 		if dec == nil { // not trailers
 			if enc := contentEncoding(fields); enc != "" && !d.blockEndStream {
 				if dec := pool.start(enc); dec != nil {
+					d.trimBodies()
 					d.bodies[stream] = dec
 					if err := dec.failed(); err != nil {
 						f.Body = bodyPart{Encoding: enc, Err: err.Error()}
@@ -511,4 +599,15 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 		}
 	}
 	return nil
+}
+
+// headerField returns a header block's field's value, and whether it has
+// it.
+func headerField(fields []hpack.HeaderField, name string) (string, bool) {
+	for _, f := range fields {
+		if f.Name == name {
+			return f.Value, true
+		}
+	}
+	return "", false
 }

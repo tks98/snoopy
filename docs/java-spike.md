@@ -1,10 +1,16 @@
 # Java spike: results
 
+This is a historical record: what step 1 found, kept as it was written,
+but for two facts corrected below (the frame header's size, and x86-64).
+The agent has moved on since; docs/usage.md's Java section and HANDOFF.md
+describe it as it is.
+
 Step 1 of [plan-java.md](plan-java.md): can a Java agent hand SunJSSE's
 plaintext to snoopy's syscall tracepoint through writes to `/dev/null`, and
 can snoopy load that agent into a running JVM without a JDK? Run on Linux
 arm64 (Ubuntu 26.04, kernel 7.0) with Temurin 21.0.13 and OpenJDK 25.0.4.
-x86-64 hasn't been run yet.
+x86-64 wasn't run for the spike; CI's Java jobs now run the agent's tests
+(`TestJSSE`) on JDK 17, 21 and 25, on x86-64 and arm64.
 
 ## What was built
 
@@ -14,9 +20,10 @@ x86-64 hasn't been run yet.
   `SSLEngineImpl`'s six-argument `wrap` and `unwrap`, at normal returns
   only. The added code calls `snoopy.hooks.Hooks`, which the manifest's
   `Boot-Class-Path` puts in the bootstrap loader, after `redefineModule`
-  lets java.base read it. Hooks writes each capture as a frame (a 48-byte
-  header with the magic "SNPYJV01", a nonce, a connection ID, a sequence
-  number, direction, kind, sizes and ports, then the payload) to a
+  lets java.base read it. Hooks writes each capture as a frame (an 88-byte
+  header, `struct java_frame` in `bpf/snoopy.c`, with the magic "SNPYJV01",
+  a nonce, a connection ID, a sequence number, direction, kind, sizes,
+  ports and addresses and the call's latency, then the payload) to a
   `FileOutputStream` on `/dev/null`. `java/build.sh` builds the two jars.
 - `internal/javaagent` and `tools/javaattach`: the HotSpot attach client in
   Go. It reads the target's namespace PID from `/proc/PID/status`, checks
@@ -79,6 +86,10 @@ rather than the JNI fallback.
   six-argument ones on both.
 
 ## Not done yet
+
+(At the time. `TestJSSE` has since covered x86-64, JDK 17, virtual
+threads, heap, direct, sliced and read-only buffers, HTTP/2, and JVMs of
+another user, in a user namespace and in a container.)
 
 x86-64; JDK 17; virtual threads; heap versus direct, sliced and read-only
 buffers beyond what `HttpClient` uses; writes that throw part way; HTTP/2;

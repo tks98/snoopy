@@ -54,13 +54,23 @@ func main() {
 		{"default", tracer.Options{}},
 		{"--pid", tracer.Options{PID: 1, PerProcess: true}},
 		{"--comm", tracer.Options{Comm: "curl", PerProcess: true}},
+		{"--java --pid", tracer.Options{PID: 1, PerProcess: true, Java: true}},
+		// Where the others are loaded for uprobe_multi links, as loaded for
+		// a link per probe too.
+		{"per-probe links", tracer.Options{LegacyUprobes: true}},
 	} {
 		t, err := tracer.New(tc.opts)
 		if err != nil {
 			fmt.Printf("LOADCHECK %s: FAILED: %+v\n", tc.name, err)
 			continue
 		}
-		fmt.Printf("LOADCHECK %s: loaded, BTF %v, per process %v\n", tc.name, t.ResolvesAddresses(), t.PerProcess())
+		fmt.Printf("LOADCHECK %s: loaded, BTF %v, per process %v, uprobe_multi %v\n",
+			tc.name, t.ResolvesAddresses(), t.PerProcess(), t.UprobeMulti())
+		// The tracer falls back to a link per probe if the kernel's verifier
+		// rejects the programs loaded for uprobe_multi: that's a bug to fix.
+		if !tc.opts.LegacyUprobes && !t.UprobeMulti() && tracer.HaveUprobeMulti() {
+			fmt.Printf("LOADCHECK %s: FAILED: loaded without uprobe_multi links, which the kernel has\n", tc.name)
+		}
 		_ = t.Close()
 	}
 	if pidns {

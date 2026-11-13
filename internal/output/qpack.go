@@ -13,6 +13,19 @@ var (
 	// errBlocked means a field section refers to dynamic table entries
 	// whose insertions haven't been seen yet.
 	errBlocked = errors.New("qpack: waiting for encoder stream")
+	// errFieldsCut comes with a field section's fields when some were left
+	// out, to keep them under maxHeaderList.
+	errFieldsCut = fmt.Errorf("decoded to more than %d KiB; the rest of its fields aren't shown", maxHeaderList>>10)
+)
+
+const (
+	// The largest dynamic table followed. Chrome advertises 64 KiB
+	// (SETTINGS_QPACK_MAX_TABLE_CAPACITY), others less; as with HPACK, a
+	// larger table only makes room for a header to be repeated many times.
+	maxQPACKCapacity = 64 << 10
+	// The longest encoder instruction: one inserting an entry the table can
+	// hold, with Huffman codes of up to 30 bits per byte.
+	maxQPACKInstruction = 4*maxQPACKCapacity + 32
 )
 
 // qpackDecoder decodes the field sections (header blocks) sent in one
@@ -28,6 +41,9 @@ type qpackDecoder struct {
 	// The most entries the table can hold, from the capacity the receiver
 	// advertised; 0 if that isn't known.
 	maxEntries int
+	// The capacity the receiver advertised, if maxKnown.
+	maxCapacity int64
+	maxKnown    bool
 }
 
 // encoderStream processes the next bytes of the encoder stream.
@@ -36,6 +52,9 @@ func (d *qpackDecoder) encoderStream(b []byte) error {
 	for len(d.pending) > 0 {
 		n, err := d.instruction(d.pending)
 		if errors.Is(err, errShort) {
+			if len(d.pending) > maxQPACKInstruction {
+				return fmt.Errorf("qpack: encoder instruction longer than %d bytes", maxQPACKInstruction)
+			}
 			return nil
 		}
 		if err != nil {
@@ -43,6 +62,7 @@ func (d *qpackDecoder) encoderStream(b []byte) error {
 		}
 		d.pending = d.pending[n:]
 	}
+	d.pending = nil // let the array go
 	return nil
 }
 
@@ -87,6 +107,12 @@ func (d *qpackDecoder) instruction(b []byte) (int, error) {
 		capacity, n, err := qpackInt(b, 5)
 		if err != nil {
 			return 0, err
+		}
+		if d.maxKnown && capacity > uint64(d.maxCapacity) {
+			return 0, fmt.Errorf("qpack: table capacity %d exceeds the advertised maximum %d", capacity, d.maxCapacity)
+		}
+		if capacity > maxQPACKCapacity {
+			return 0, fmt.Errorf("qpack: table capacity of %d bytes is more than snoopy follows (%d)", capacity, maxQPACKCapacity)
 		}
 		d.capacity = int(capacity)
 		d.evict(0)
@@ -135,6 +161,8 @@ func (d *qpackDecoder) entry(abs int) ([2]string, error) {
 }
 
 // fieldSection decodes an encoded field section (a HEADERS frame's payload).
+// If the fields come to more than maxHeaderList, it returns those that fit
+// and errFieldsCut.
 func (d *qpackDecoder) fieldSection(b []byte) ([]hpack.HeaderField, error) {
 	encodedRIC, n, err := qpackInt(b, 8)
 	if err != nil {
@@ -163,6 +191,15 @@ func (d *qpackDecoder) fieldSection(b []byte) ([]hpack.HeaderField, error) {
 	}
 
 	var fields []hpack.HeaderField
+	size := 0
+	add := func(f hpack.HeaderField) bool { // false once over maxHeaderList
+		size += int(f.Size())
+		if size > maxHeaderList {
+			return false
+		}
+		fields = append(fields, f)
+		return true
+	}
 	dynamic := func(abs int) ([2]string, error) {
 		if abs >= ric {
 			return [2]string{}, fmt.Errorf("qpack: reference to entry %d beyond the required insert count %d", abs, ric)
@@ -193,7 +230,9 @@ func (d *qpackDecoder) fieldSection(b []byte) ([]hpack.HeaderField, error) {
 			if err != nil {
 				return nil, err
 			}
-			fields = append(fields, hpack.HeaderField{Name: e[0], Value: e[1]})
+			if !add(hpack.HeaderField{Name: e[0], Value: e[1]}) {
+				return fields, errFieldsCut
+			}
 			b = b[n:]
 			continue
 		case b[0]&0xc0 == 0x40: // Literal with name reference: 01 N T index(4), value
@@ -233,7 +272,9 @@ func (d *qpackDecoder) fieldSection(b []byte) ([]hpack.HeaderField, error) {
 			if e, err = dynamic(base + int(index)); err != nil {
 				return nil, err
 			}
-			fields = append(fields, hpack.HeaderField{Name: e[0], Value: e[1]})
+			if !add(hpack.HeaderField{Name: e[0], Value: e[1]}) {
+				return fields, errFieldsCut
+			}
 			b = b[n:]
 			continue
 		default: // Literal with post-base name reference: 0000 N index(3), value
@@ -250,7 +291,9 @@ func (d *qpackDecoder) fieldSection(b []byte) ([]hpack.HeaderField, error) {
 			}
 			m += n
 		}
-		fields = append(fields, hpack.HeaderField{Name: e[0], Value: value})
+		if !add(hpack.HeaderField{Name: e[0], Value: value}) {
+			return fields, errFieldsCut
+		}
 		b = b[m:]
 	}
 	return fields, nil

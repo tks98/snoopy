@@ -4,7 +4,9 @@
 //	quicgo server <port>
 //
 // serves "served <path> on <port>" for any request on 127.0.0.1:<port>, with
-// a self-signed certificate, and prints "listening" once it is ready;
+// a self-signed certificate, and prints "listening" once it is ready. With
+// QUICGO_SPKI_FILE set, it first writes the certificate's public key's
+// SHA-256 there, in base64, for Chrome's --ignore-certificate-errors-spki-list;
 //
 //	quicgo client <port>[,<port>...] <path>
 //
@@ -19,8 +21,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"math/big"
@@ -57,6 +61,16 @@ func serve(port string) {
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		panic(err)
+	}
+	if file := os.Getenv("QUICGO_SPKI_FILE"); file != "" {
+		spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+		if err != nil {
+			panic(err)
+		}
+		sum := sha256.Sum256(spki)
+		if err := os.WriteFile(file, []byte(base64.StdEncoding.EncodeToString(sum[:])), 0o644); err != nil {
+			panic(err)
+		}
 	}
 	srv := &http3.Server{
 		Addr:      "127.0.0.1:" + port,

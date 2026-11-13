@@ -99,7 +99,7 @@ func TestHTTP2Headers(t *testing.T) {
 	// Clients write the 24-byte connection preface in one call; after it,
 	// frames may be split anywhere.
 	for _, sizes := range [][]int{{1 << 20}, {24, 1}, {30, 7, 13, 1000}, {50}} {
-		c := newHTTP2Conns(newBodyPool())
+		c := newHTTP2Conns(newBodyPool(), nil)
 		got := headersOf(t, c, events(tracer.FuncSSLWrite, client.buf.Bytes(), sizes...))
 		want := [][]string{
 			{":method: GET", ":path: /a", ":authority: example.com", "x-snoopy: one"},
@@ -129,7 +129,7 @@ func TestHTTP2MissingBytes(t *testing.T) {
 	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: server.block(":status", "204"), EndHeaders: true, EndStream: true})
 	b := server.buf.Bytes()
 
-	c := newHTTP2Conns(newBodyPool())
+	c := newHTTP2Conns(newBodyPool(), nil)
 	c.start(http2Key{7, 0x1000}, false) // as if the client's preface was seen
 	// One call returns everything, but only the first 100 bytes are captured.
 	ev := &tracer.Event{PID: 7, ConnID: 0x1000, Function: tracer.FuncSSLRead, Size: uint32(len(b)), Data: b[:100]}
@@ -137,7 +137,7 @@ func TestHTTP2MissingBytes(t *testing.T) {
 		t.Errorf("hole across frames: ok %v, note %q", ok, note)
 	}
 
-	c = newHTTP2Conns(newBodyPool())
+	c = newHTTP2Conns(newBodyPool(), nil)
 	c.start(http2Key{7, 0x1000}, false)
 	dataEnd := len(b) - 9 - 1 // the last HEADERS frame: 9-byte header, 1-byte block
 	evs := []*tracer.Event{
@@ -158,7 +158,7 @@ func TestHTTP2StartedBeforeSnoopy(t *testing.T) {
 	server.fr.WriteData(1, true, []byte("</html>"))
 	stream := server.buf.Bytes()
 
-	c := newHTTP2Conns(newBodyPool())
+	c := newHTTP2Conns(newBodyPool(), nil)
 	var got []string
 	var notes int
 	// The first call starts in the middle of the SETTINGS frame, and is
@@ -189,7 +189,7 @@ func TestHTTP2StartedBeforeSnoopy(t *testing.T) {
 	}
 
 	// Data that doesn't start with a frame isn't taken for HTTP/2.
-	c = newHTTP2Conns(newBodyPool())
+	c = newHTTP2Conns(newBodyPool(), nil)
 	if _, ok, _ := c.process(events(tracer.FuncSSLRead, []byte("hello, world"), 1<<20)[0]); ok {
 		t.Error("text taken for HTTP/2")
 	}
@@ -272,7 +272,7 @@ func TestHTTP2RecordsShareTheirSocket(t *testing.T) {
 		{"socket known", 5, true, false},
 		{"socket unknown", -1, false, true}, // each direction on its own: the response's looks like a late connection
 	} {
-		c := newHTTP2Conns(newBodyPool())
+		c := newHTTP2Conns(newBodyPool(), nil)
 		write := events(tracer.FuncRecordSend, client.buf.Bytes(), 1<<20)[0]
 		read := events(tracer.FuncRecordRecv, afterFirstFrame(server.buf.Bytes()), 1<<20)[0]
 		write.ConnID, read.ConnID = 0xaaaa, 0xbbbb
@@ -300,7 +300,7 @@ func TestHTTP2RecordsShareTheirSocket(t *testing.T) {
 // side is often seen first; that's the connection starting, not one that
 // started before snoopy.
 func TestHTTP2ServerSettingsFirst(t *testing.T) {
-	c := newHTTP2Conns(newBodyPool())
+	c := newHTTP2Conns(newBodyPool(), nil)
 	server := newHTTP2Writer(false) // its SETTINGS
 	client := newHTTP2Writer(true)
 	client.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: client.block(":method", "GET", ":path", "/"), EndStream: true, EndHeaders: true})

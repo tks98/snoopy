@@ -5,19 +5,23 @@ receives over TLS, browsers included, without certificates or changes to the
 program. It uses eBPF to read the data where the program hands it to its TLS
 library, before it's encrypted and after it's decrypted.
 
-![snoopy in one terminal and Chromium, opened from another, loading pages while their requests and responses scroll by](docs/demo.gif)
+![snoopy in one terminal and Chromium, opened from another, loading pages while a line for each request and its response scrolls by](docs/demo.gif)
 
-Chromium loading example.com and Cloudflare's test page over HTTP/3, and
-Wikipedia over HTTP/2, recorded with
+`snoopy --requests` while Chromium loads example.com and Cloudflare's test
+page over HTTP/3, and Wikipedia over HTTP/2: one line per request, with its
+status, type, size and time. Recorded with
 [docs/demo/record.sh](docs/demo/record.sh).
 
 ## Quick start
 
-Download a binary for `linux_amd64` or `linux_arm64` from the
+Install a package, or a binary for `linux_amd64` or `linux_arm64`, from the
 [releases page](https://github.com/tks98/snoopy/releases), or build one with
 Go 1.26 or later, and copy it to where `sudo` finds it:
 
 ```bash
+# a package (also .rpm and .apk)
+sudo apt install ./snoopy_*_linux_amd64.deb
+
 # a release binary
 tar xzf snoopy_*_linux_amd64.tar.gz snoopy
 sudo install snoopy /usr/local/bin/
@@ -26,6 +30,10 @@ sudo install snoopy /usr/local/bin/
 go install github.com/tks98/snoopy/v2@latest
 sudo install "$(go env GOPATH)/bin/snoopy" /usr/local/bin/
 ```
+
+Releases after 2.9.1 have attested build provenance:
+`gh attestation verify snoopy_*_linux_amd64.tar.gz --repo tks98/snoopy`
+checks an archive.
 
 Then run `sudo snoopy --brief` and make some requests from another terminal,
 here with curl over HTTP/1.1 and HTTP/2, and Chrome over HTTP/3:
@@ -45,6 +53,7 @@ $ sudo snoopy --brief
 
 ```bash
 sudo snoopy                                 # everything, decoded
+sudo snoopy --requests                      # one line per HTTP request and its response
 sudo snoopy --brief                         # one line per call, like tcpdump
 sudo snoopy --comm firefox                  # processes whose name starts with firefox
 sudo snoopy --pid 1234                      # one process and those it starts
@@ -64,19 +73,21 @@ the output, JSON and pcap, containers, and troubleshooting.
 
 - **TLS libraries:** OpenSSL, BoringSSL (also Bun's and Envoy's, found by
   signature), LibreSSL, GnuTLS, NSS, wolfSSL,
-  Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 (curl's HTTP/3)
-  and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
+  Mbed TLS, s2n-tls, rustls (async too, and HTTP/3 over quinn), ngtcp2 and
+  OpenSSL's own QUIC (curl's HTTP/3) and Go's `crypto/tls` (and HTTP/3 over quic-go), stripped Go
   programs included.
 - **Runtimes:** curl, Python, Ruby, PHP, Node.js (official builds too), .NET,
   Go, Rust and Bun programs, and Java: with Netty's netty-tcnative (gRPC-Java)
   or Conscrypt as is, and Java's own TLS (JSSE) with `--java`, which loads a
-  small agent into the JVM; not Erlang or Deno
+  small agent into the JVM; Erlang and Elixir, when selected with `--comm`,
+  `--pid` or `--container`; not Deno
   ([docs/how-it-works.md](docs/how-it-works.md#languages-and-runtimes)).
 - **Browsers:** Chrome, Brave, Edge and Electron apps, whose BoringSSL has no
   symbols and is found by signature, and Firefox. Their HTTP/3 too.
 - **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded,
   bodies compressed with gzip, deflate, Brotli or zstd decompressed, and
-  gRPC messages decoded as protobuf, without needing the schema.
+  gRPC messages decoded as protobuf, without needing the schema, or with
+  their fields' names given one (`--proto`).
 - **Where:** running processes, those started while snoopy runs, and
   processes in containers. On Kubernetes, `kubectl snoopy POD` traces a pod
   from your machine ([docs/kubernetes.md](docs/kubernetes.md)).
@@ -86,8 +97,9 @@ supported.
 
 ## Requirements
 
-- Linux 5.10 or later, on x86_64 or arm64 (tested on 5.10, 5.15, 6.1, 6.6,
-  6.12 and current kernels).
+- Linux 5.10 or later, on x86_64 or arm64. CI runs the tests on its
+  runners' current kernels, and checks that the eBPF programs load under
+  5.10, 5.15, 6.1, 6.6 and 6.12 whenever they change.
 - Root, or `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE` and `CAP_SYS_PTRACE`
   (and `CAP_SYS_ADMIN` for libraries replaced while in use).
 - Kernel BTF (`/sys/kernel/btf/vmlinux`), which most distributions ship.
@@ -120,6 +132,8 @@ tokens, cookies and personal data. Only use it on systems you are authorized
 to inspect, and treat its output and pcap files as sensitive. `--redact`
 masks credentials, secret fields and recognizable tokens in the output, for
 sharing it ([docs/usage.md](docs/usage.md#sharing-output)).
+
+To report a vulnerability in snoopy, see [SECURITY.md](SECURITY.md).
 
 ## License
 

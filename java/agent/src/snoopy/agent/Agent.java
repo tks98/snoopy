@@ -17,7 +17,7 @@ import org.objectweb.asm.Type;
 import org.objectweb.asm.commons.AdviceAdapter;
 
 /**
- * snoopy's Java agent (spike): instruments SunJSSE's application data paths
+ * snoopy's Java agent: instruments SunJSSE's application data paths
  * to call snoopy.hooks.Hooks, which the manifest's Boot-Class-Path puts in
  * the bootstrap class loader. Loaded at startup (-javaagent) or into a
  * running JVM (the attach mechanism); options are nonce=N,max=N.

@@ -17,12 +17,17 @@ make generate     # recompile bpf/snoopy.c after changing it (needs clang 18 and
 The integration tests use whichever of `curl`, `python3`, `gnutls-cli` and the
 NSS, wolfSSL, Mbed TLS and s2n-tls development files (`libnss3-dev`,
 `libwolfssl-dev`, `libmbedtls-dev`; s2n-tls has to be built from source) are
-installed, and skip the rest. The rustls tests build two clients with
-`cargo`, which takes a while, so they only run with `SNOOPY_TEST_RUSTLS=1`.
-`TestCurlHTTP3` needs a curl with HTTP/3, which Ubuntu's isn't: set
-`SNOOPY_TEST_CURL_HTTP3` to `/` on Fedora, or to a Fedora root filesystem
-(curl is run chrooted in it). CI runs
-them on x86_64 and arm64. To run them on an older kernel in a VM, use
+installed, and skip the rest; with `SNOOPY_TEST_STRICT=1`, as in CI, a
+missing one fails its test instead. The rustls and quinn tests build their
+clients with `cargo`, which takes a while, so they only run with
+`SNOOPY_TEST_RUSTLS=1`. `TestCurlHTTP3` needs a curl with HTTP/3, which
+Ubuntu's isn't: set `SNOOPY_TEST_CURL_HTTP3` to `/` on Fedora, or to a
+Fedora root filesystem (curl is run chrooted in it). CI runs the
+integration tests on x86_64 and arm64 for each pull request, the rustls and
+quinn tests weekly (`rust.yml`), and `TestCurlHTTP3` in the weekly canary.
+When a test times out waiting for an event, it lists the events that did
+arrive, without what they carried; `SNOOPY_TEST_DUMP_DATA=1` adds their
+first bytes, for a machine of your own (never in CI: see AGENTS.md). To run them on an older kernel in a VM, use
 [vimto](https://github.com/lmb/vimto): `make integration-vm KERNEL=5.10`.
 Install vimto with `CGO_ENABLED=0 go install lmb.io/vimto@v0.4.0`; a build
 with cgo refuses to run.
@@ -38,5 +43,11 @@ Chrome) or a Breakpad `.sym` file (Electron publishes them with each release).
 SNOOPY_BORINGSSL_TEST=/opt/google/chrome/chrome=chrome.debug go test ./internal/discover -run TestBoringSSLBinaries -v
 ```
 
-To release, push a tag like `v2.0.0`. GoReleaser builds and publishes the
-binaries.
+To release, push a tag like `v2.0.0`. The release workflow runs
+GoReleaser, which publishes the archives (snoopy with the Java agent's jars,
+and kubectl-snoopy for each platform), an SBOM for each, the jars on their
+own, the krew manifest (`krew-snoopy.yaml`), `checksums.txt` and the image
+at `ghcr.io/tks98/snoopy`; then it attests the build provenance of
+everything in `checksums.txt` and of the image. The archives are
+reproducible from the tag (`release-check.yml` checks this for changes to
+the release's configuration).

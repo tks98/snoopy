@@ -1,0 +1,56 @@
+name: rustls and quinn
+
+# The integration tests for rustls (TestRustls, TestRustlsAsync) and quinn's
+# HTTP/3 (TestQuinnHTTP3), which build their clients with cargo: too slow
+# for every pull request, and what they check changes with the crates, so
+# weekly, and when their programs change.
+on:
+  schedule:
+    - cron: "41 6 * * 1" # Mondays
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/rust.yml
+      - internal/tracer/testdata/rustls*/**
+      - internal/tracer/testdata/quinnh3/**
+
+# Each job asks for what it needs.
+permissions: {}
+
+jobs:
+  rust:
+    name: rustls and quinn (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # The runners have cargo. The crates and the builds, for each
+      # client's lock file: the builds are most of the time.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            internal/tracer/testdata/*/target
+          key: cargo-${{ runner.arch }}-${{ hashFiles('internal/tracer/testdata/*/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.arch }}-
+      - run: go test -c -tags integration -o internal/tracer/tracer.test ./internal/tracer
+      - name: Run (as root)
+        working-directory: internal/tracer
+        # With PATH and HOME, for the runner's cargo and its crates. The
+        # clients only talk to the tests' own servers.
+        run: sudo env "PATH=$PATH" "HOME=$HOME" SNOOPY_TEST_RUSTLS=1 SNOOPY_TEST_STRICT=1 ./tracer.test -test.v -test.timeout 30m -test.run '^(TestRustls|TestRustlsAsync|TestQuinnHTTP3)$'
+      # Built as root, the crates and builds are root's; the cache is saved
+      # by the runner's user.
+      - name: Give the cargo files back to the runner's user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" ~/.cargo internal/tracer/testdata

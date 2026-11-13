@@ -53,9 +53,14 @@ thing it depends on ships.
 - **Already seen:** Chrome 156 stopped inlining `ssl_read_impl` into
   `SSL_read`. Ubuntu's Chromium snap keeps `EVP_AEAD_CTX_open_gather`
   separate, where Google's and Electron's builds inline it, so the rule
-  telling seal from open had to change.
-- **Guarded by:** `TestBoringSSLBinaries` against published symbols, run by
-  hand.
+  telling seal from open had to change. Chrome 157 inlined open into QUIC's
+  decryption, so HTTP/3 responses went missing while requests still showed;
+  received packets are now also seen at the ciphers' `openv_detached`
+  methods. The test checks those against the symbols too, but only where
+  they are; that QUIC stopped calling what's attached to only showed when
+  Chrome ran, which `TestChromeHTTP3` now does in the canary.
+- **Guarded by:** `TestBoringSSLBinaries` against published symbols, and
+  `TestChromeHTTP3` capturing a page over HTTP/3, both in the weekly canary.
 
 ### Which socket a QUIC packet belongs to
 
@@ -136,8 +141,8 @@ thing it depends on ships.
   aws-lc. aws-lc-rs seals TLS 1.2 records with `seal_scatter`, not `seal`.
 
 - **Guarded by:** `TestRustls` and `TestRustlsAsync` (TLS 1.3 and 1.2), only
-  with `SNOOPY_TEST_RUSTLS=1`, and `TestRustlsSymbols` and
-  `TestAwsLCSymbols`.
+  with `SNOOPY_TEST_RUSTLS=1`, which CI runs weekly (`rust.yml`), and
+  `TestRustlsSymbols` and `TestAwsLCSymbols`.
 
 ### HTTP/3 over quinn
 
@@ -150,8 +155,8 @@ thing it depends on ships.
   the peer).
 - **How it shows:** responses show "peer" for the remote address, and
   connections sharing a socket may be decoded mixed together, quietly.
-- **Guarded by:** `TestQuinnHTTP3` (`SNOOPY_TEST_RUSTLS=1`), two
-  connections over one socket with each provider.
+- **Guarded by:** `TestQuinnHTTP3` (`SNOOPY_TEST_RUSTLS=1`, weekly in CI),
+  two connections over one socket with each provider.
 
 ### HTTP/3 over ngtcp2 (curl)
 
@@ -161,12 +166,41 @@ thing it depends on ships.
   and ngtcp2 encrypting packets through them rather than through the TLS
   library directly.
 - **Breaks when:** ngtcp2 changes that API (a major version), or curl moves
-  to another QUIC stack (it also builds with quiche and OpenSSL's own QUIC,
-  which would need their own probes).
+  to another QUIC stack (it also builds with quiche, which isn't supported,
+  and OpenSSL's own QUIC, which is, separately).
 - **How it shows:** renamed functions mean nothing attaches, which is loud;
   a changed `ngtcp2_crypto_aead` means wrong lengths, quietly.
 - **Guarded by:** `TestCurlHTTP3`, only with `SNOOPY_TEST_CURL_HTTP3` set to
   the root of a system with an HTTP/3 curl (Fedora's).
+
+### HTTP/3 through OpenSSL's QUIC
+
+- **Depends on:** OpenSSL's QUIC protecting packets through
+  `EVP_CipherInit_ex`, `EVP_CipherUpdate` (associated data first) and
+  `EVP_CipherFinal_ex`, all public API; and the type at the start of
+  `struct ssl_st`, which is internal, to leave out what's read and written
+  through QUIC streams.
+- **Breaks when:** OpenSSL encrypts packets differently (another EVP call,
+  or a provider called directly), or renumbers its `SSL_TYPE_*` values,
+  as it did in 3.5.
+- **How it shows:** packets not captured, which the UDP-port-443 warning
+  says; or each request and response shown twice, as QUIC and as TLS.
+- **Guarded by:** `TestOpenSSLQUIC`, in the weekly canary against Debian's
+  latest curl and OpenSSL.
+
+### Erlang's ssl
+
+- **Depends on:** OTP's crypto NIF encrypting and decrypting TLS records
+  with `EVP_EncryptUpdate` and `EVP_DecryptUpdate`, associated data first;
+  the VM receiving and sending a record on the scheduler thread that
+  decrypts or encrypts it; and its program being named `beam*`.
+- **Breaks when:** OTP changes how its crypto NIF calls libcrypto; or
+  libcrypto is linked into the NIF without exporting its functions (a
+  version script), so there's nothing to probe by name.
+- **How it shows:** nothing captured for an Erlang VM, quietly; or records
+  without addresses.
+- **Guarded by:** `TestErlangSSL`, in CI with Ubuntu's Erlang, TLS 1.3 and
+  1.2; with libcrypto linked into the NIF, by hand (`SNOOPY_TEST_ERL`).
 
 ### HTTP/3 over quic-go
 
@@ -267,7 +301,11 @@ In order of how much each removes.
    Envoy (checked for one clear answer, having no matching symbols), and
    Firefox (x86-64 and arm64) with Mozilla's, and runs `TestBoringSSLBinaries`
    and `TestFreeblBinaries` on them; and it runs `TestCurlHTTP3` against
-   Fedora's latest curl on both architectures. A release that breaks one of
+   the latest curl of a pinned Fedora release (moved on by hand to each new
+   one) on both architectures, and `TestChromeHTTP3` against the latest
+   Chrome stable and beta, installed: Chrome loads a page over HTTP/3 from
+   the test's quic-go server, and the response has to be captured, which a
+   signature check can't show. A release that breaks one of
    them shows as a failed run within a week. When a release's symbols
    aren't out yet, the job only checks that one answer is found, and warns.
 2. **Check `golang.org/x/arch` bumps before merging them.** Run those

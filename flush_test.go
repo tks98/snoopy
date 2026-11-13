@@ -31,17 +31,24 @@ func (l *lockedBuffer) get() (string, int) {
 func TestFlushWriter(t *testing.T) {
 	var out lockedBuffer
 	f := newFlushWriter(&out)
+	start := time.Now()
 	for range 100 {
 		f.Write([]byte("call\n"))
 	}
-	if s, _ := out.get(); s != "" {
+	// The flush is due flushDelay after the first write. A loaded machine
+	// can stall the loop for longer than that, and then some of it has gone
+	// out already, which is fine; only output sooner than flushDelay isn't.
+	s, _ := out.get()
+	if s != "" && time.Since(start) < flushDelay {
 		t.Fatalf("written at once: %q", s)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for s, _ := out.get(); s == "" && time.Now().Before(deadline); s, _ = out.get() {
+	batched := s == ""
+	deadline := time.Now().Add(5 * time.Second)
+	for s, _ = out.get(); len(s) < 500 && time.Now().Before(deadline); s, _ = out.get() {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if s, n := out.get(); len(s) != 500 || n != 1 {
+	// All buffered before the flush, the 100 calls go out in one write.
+	if s, n := out.get(); len(s) != 500 || n > 100 || batched && n != 1 {
 		t.Errorf("after the delay: %d bytes in %d writes", len(s), n)
 	}
 	f.Write([]byte("last\n"))
@@ -61,8 +68,16 @@ func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken p
 func TestFlushWriterError(t *testing.T) {
 	f := newFlushWriter(failingWriter{})
 	f.Write([]byte("x"))
-	time.Sleep(2 * flushDelay)
-	if _, err := f.Write([]byte("y")); err == nil {
-		t.Error("no error after a failed flush")
+	// Writes before the flush is done just buffer, so keep writing until one
+	// is refused, rather than assuming the flush has run by some time.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := f.Write([]byte("y")); err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no error after a failed flush")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

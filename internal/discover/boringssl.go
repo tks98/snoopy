@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"bytes"
 	"debug/elf"
 	"encoding/json"
 	"errors"
@@ -37,12 +38,17 @@ var Progress func(msg string)
 
 // boringSSLCacheVersion is part of cached results' names: bump it when
 // findBoringSSL would answer differently, so that older answers aren't used.
-const boringSSLCacheVersion = 5
+const boringSSLCacheVersion = 7
 
 // cachedFindBoringSSL is findBoringSSL with its results kept by build ID in
 // the user's cache directory, so a large program (Chrome is 300 MB) is
 // analyzed once. Later runs attach to it right away, which matters for
 // programs found as they start.
+//
+// A build ID is only a claim, which a program in a container can copy from
+// another (a host's Chrome, say) to leave wrong offsets for it. So each
+// entry keeps the first bytes of every function it found, and is used only
+// for a file that has the same bytes at the same offsets.
 func cachedFindBoringSSL(path string, f *elf.File) (map[string]uint64, error) {
 	var file string
 	if id := funcfind.BuildID(f); id != nil {
@@ -51,10 +57,10 @@ func cachedFindBoringSSL(path string, f *elf.File) (map[string]uint64, error) {
 		}
 	}
 	if file != "" {
-		var offsets map[string]uint64
-		if data, err := os.ReadFile(file); err == nil && json.Unmarshal(data, &offsets) == nil &&
-			offsets["SSL_read"] != 0 && offsets["SSL_write"] != 0 {
-			return offsets, nil
+		var cached boringSSLCache
+		if data, err := os.ReadFile(file); err == nil && json.Unmarshal(data, &cached) == nil &&
+			cached.Offsets["SSL_read"] != 0 && cached.Offsets["SSL_write"] != 0 && cached.matches(f) {
+			return cached.Offsets, nil
 		}
 	}
 	offsets, err := findBoringSSL(f, func() {
@@ -63,11 +69,57 @@ func cachedFindBoringSSL(path string, f *elf.File) (map[string]uint64, error) {
 		}
 	})
 	if err == nil && file != "" {
-		if data, err := json.Marshal(offsets); err == nil && os.MkdirAll(filepath.Dir(file), 0o755) == nil {
+		cached := boringSSLCache{Offsets: offsets, Starts: map[string][]byte{}}
+		for name, off := range offsets {
+			if b, ok := bytesAt(f, off, cacheCheckLen); ok {
+				cached.Starts[name] = b
+			}
+		}
+		if data, err := json.Marshal(cached); err == nil && os.MkdirAll(filepath.Dir(file), 0o755) == nil {
 			_ = os.WriteFile(file, data, 0o644) // a cache: failing only costs time
 		}
 	}
 	return offsets, err
+}
+
+// cacheCheckLen is how many of a function's first bytes a cache entry
+// keeps, to tell its file from another with the same build ID.
+const cacheCheckLen = 32
+
+type boringSSLCache struct {
+	Offsets map[string]uint64
+	Starts  map[string][]byte // each function's first cacheCheckLen bytes
+}
+
+// matches reports whether f has each function's first bytes where the
+// entry says.
+func (c boringSSLCache) matches(f *elf.File) bool {
+	if len(c.Starts) != len(c.Offsets) {
+		return false
+	}
+	for name, off := range c.Offsets {
+		b, ok := bytesAt(f, off, cacheCheckLen)
+		if !ok || !bytes.Equal(b, c.Starts[name]) {
+			return false
+		}
+	}
+	return true
+}
+
+// bytesAt reads n bytes at file offset off, from the loadable segment that
+// has them.
+func bytesAt(f *elf.File, off uint64, n int) ([]byte, bool) {
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_LOAD || off < p.Off || off+uint64(n) > p.Off+p.Filesz {
+			continue
+		}
+		b := make([]byte, n)
+		if _, err := p.ReadAt(b, int64(off-p.Off)); err != nil {
+			return nil, false
+		}
+		return b, true
+	}
+	return nil, false
 }
 
 // findBoringSSL locates SSL_read and SSL_write in a program that links
@@ -162,6 +214,9 @@ func findBoringSSL(f *elf.File, onBoringSSL func()) (map[string]uint64, error) {
 	found := map[string]*funcfind.Func{"SSL_read": read, "SSL_write": writes[0]}
 	if seal, open, err := findAEAD(b); err == nil {
 		found["EVP_AEAD_CTX_seal"], found["EVP_AEAD_CTX_open"] = seal, open
+		for name, fn := range findOpenv(b) {
+			found[name] = fn
+		}
 	}
 	out := map[string]uint64{}
 	for name, fn := range found {
@@ -241,4 +296,48 @@ func findAEAD(b *funcfind.Binary) (seal, open *funcfind.Func, err error) {
 		return nil, nil, fmt.Errorf("BoringSSL: %d candidates for EVP_AEAD_CTX_seal, %d for open", len(seals), len(opens))
 	}
 	return seals[0], opens[0], nil
+}
+
+// openvFiles are where the openv_detached methods of the AEADs QUIC uses
+// are, by the names findOpenv gives them: AES-GCM's, and the function
+// ChaCha20-Poly1305's calls with its key.
+var openvFiles = map[string]string{
+	"aead_aes_gcm_openv_detached":      "/cipher/e_aes.cc.inc",
+	"chacha20_poly1305_openv_detached": "/cipher/e_chacha20poly1305.cc",
+}
+
+// findOpenv locates the AEADs' openv_detached methods, which decrypt what
+// EVP_AEAD_CTX_open is given. Chrome 157 inlined open into QUIC's packet
+// decryption, which calls them through the EVP_AEAD's table, so its
+// packets only pass through them. In its file, each is the one function
+// that reports a bad decrypt itself (with the AES-GCM one's implementation
+// inlined into it). They're only called through the table, so they start
+// where their entry is recognizable. Older BoringSSL's open_gather methods
+// report the same codes with other arguments, which the BPF program checks
+// for. A method not found, or not told apart, is left out.
+func findOpenv(b *funcfind.Binary) map[string]*funcfind.Func {
+	out := map[string]*funcfind.Func{}
+	for name, path := range openvFiles {
+		file, ok := b.FindString(path)
+		if !ok {
+			continue
+		}
+		var found []*funcfind.Func
+		seen := map[uint64]bool{}
+		for _, ref := range b.Refs(file) {
+			fn, ok := b.IndirectFuncAt(ref)
+			if !ok || seen[fn.Start] {
+				continue
+			}
+			seen[fn.Start] = true
+			reasons, err := b.ConstArgsNear(fn, file, 2)
+			if err == nil && slices.Contains(reasons, aeadReasonBadDecrypt) && b.ReadsArgs(fn, 5) {
+				found = append(found, fn)
+			}
+		}
+		if len(found) == 1 {
+			out[name] = found[0]
+		}
+	}
+	return out
 }

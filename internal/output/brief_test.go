@@ -79,7 +79,7 @@ func TestBriefHTTP2AndHTTP3(t *testing.T) {
 	q := quicEvent(tracer.FuncQUICRecv, streamFrameBytes(1, 0, stream, true))
 	q.Time, q.Comm = ev.Time, "chrome"
 	got := briefLines(t, q)[0]
-	if !strings.Contains(got, "chrome[9] peer > local QUIC ") || !strings.HasSuffix(got, ": HTTP/3 HEADERS s1 200, br; DATA s1 9 bytes (br, 5 decoded)") {
+	if !strings.Contains(got, "chrome[9] peer:? > local:? QUIC ") || !strings.HasSuffix(got, ": HTTP/3 HEADERS s1 200, br; DATA s1 9 bytes (br, 5 decoded)") {
 		t.Errorf("HTTP/3: %q", got)
 	}
 }
@@ -96,7 +96,7 @@ func TestBriefOther(t *testing.T) {
 	for i, want := range []string{
 		": hello world",
 		"TLS 100: binary [truncated]",
-		"local > peer TLS 4: PING",
+		"local:? > peer:? TLS 4: PING",
 		"aaa…",
 	} {
 		if !strings.HasSuffix(got[i], want) {
@@ -105,5 +105,48 @@ func TestBriefOther(t *testing.T) {
 	}
 	if n := len([]rune(got[3][strings.Index(got[3], ": ")+2:])); n != maxSummary {
 		t.Errorf("long summary is %d characters", n)
+	}
+}
+
+// A body's calls after its first are folded into the one that ends it,
+// unless verbose.
+func TestBriefFoldsBodies(t *testing.T) {
+	server := newHTTP2Writer(false)
+	server.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndHeaders: true,
+		BlockFragment: server.block(":status", "200", "content-type", "text/plain")})
+	head := append([]byte(nil), server.buf.Bytes()...)
+	var calls [][]byte
+	for i := 0; i < 5; i++ {
+		server.buf.Reset()
+		server.fr.WriteData(1, i == 4, bytes.Repeat([]byte("x"), 100))
+		calls = append(calls, append([]byte(nil), server.buf.Bytes()...))
+	}
+	run := func(verbose bool) (string, *Brief) {
+		var out bytes.Buffer
+		b := NewBrief(&out, Options{Verbose: verbose})
+		for _, data := range append([][]byte{head}, calls...) {
+			if err := b.Print(event(tracer.FuncSSLRead, string(data))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return out.String(), b
+	}
+	got, b := run(false)
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 3 || !strings.HasSuffix(lines[2], "DATA s1 100 bytes [END_STREAM] [+3 calls folded, 300 bytes]") || b.Folded() != 3 {
+		t.Errorf("folded %d:\n%s", b.Folded(), got)
+	}
+	if got, _ := run(true); strings.Count(got, "\n") != 6 {
+		t.Errorf("verbose:\n%s", got)
+	}
+
+	// HTTP/1.1, by Content-Length.
+	var out bytes.Buffer
+	b = NewBrief(&out, Options{})
+	b.Print(event(tracer.FuncSSLRead, "HTTP/1.1 200 OK\r\nContent-Length: 30\r\n\r\n0123456789"))
+	b.Print(event(tracer.FuncSSLRead, "0123456789"))
+	b.Print(event(tracer.FuncSSLRead, "0123456789"))
+	if lines := strings.Split(strings.TrimSpace(out.String()), "\n"); len(lines) != 2 || !strings.HasSuffix(lines[1], "[+1 call folded, 10 bytes]") {
+		t.Errorf("HTTP/1.1:\n%s", out.String())
 	}
 }
