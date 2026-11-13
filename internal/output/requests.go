@@ -171,6 +171,8 @@ func (r *Requests) line(e *harEntry, streaming bool) string {
 // chunked framing), and decoded if it has a Content-Encoding.
 func sizeOf(m *harMessage) string {
 	switch {
+	case m.status == 101: // no body, but another protocol: what it switched to
+		return cmpOr(headerValue(m.headers, "upgrade"), "no body")
 	case m.length == 0:
 		return "no body"
 	case m.encoding != "":

@@ -19,7 +19,7 @@ type Options struct {
 	Full bool
 	// Verbose also prints the calls and frames that only keep connections
 	// going: HTTP/2 settings, flow control and pings, QUIC acknowledgments,
-	// and the like.
+	// WebSocket pings and pongs, and the like.
 	Verbose bool
 	// Redact masks what's likely secret: credentials in headers, secret
 	// query parameters and JSON and form fields, and tokens of well-known
@@ -163,12 +163,15 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 			}
 		}
 	} else {
-		dc.http2, dc.isHTTP2, dc.note = d.h2.process(ev)
-		if strings.HasPrefix(dc.note, http2Stopped) && !strings.Contains(dc.note, "ring buffer") {
-			dc.note += d.lost.note()
+		if !d.webSocket(ev) {
+			dc.http2, dc.isHTTP2, dc.note = d.h2.process(ev)
+			if strings.HasPrefix(dc.note, http2Stopped) && !strings.Contains(dc.note, "ring buffer") {
+				dc.note += d.lost.note()
+			}
 		}
 		if !dc.isHTTP2 {
 			dc.http1 = d.h1.process(ev)
+			noteLost(dc.http1, d.lost)
 		}
 	}
 	if d.warn != nil && dc.startedEarly() {
@@ -201,7 +204,7 @@ func (dc decoded) matches(re *regexp.Regexp) bool {
 		return false
 	}
 	for _, s := range dc.http1 {
-		if re.Match(s.body.Decoded) || sseMatches(re, s.sse) {
+		if re.Match(s.body.Decoded) || sseMatches(re, s.sse) || s.ws.matches(re) {
 			return true
 		}
 	}
@@ -252,8 +255,10 @@ func (dc decoded) housekeeping() bool {
 		return !dc.notQUIC && !slices.ContainsFunc(dc.quic, func(it quicItem) bool { return !it.housekeeping() })
 	case dc.isHTTP2:
 		return !slices.ContainsFunc(dc.http2, func(f http2Frame) bool { return !f.housekeeping() })
-	case len(dc.http1) > 0: // only an event stream's keep-alives
-		return !slices.ContainsFunc(dc.http1, func(s http1Segment) bool { return !sseKeepAlive(s.isSSE, s.sse, s.body) })
+	case len(dc.http1) > 0: // only an event stream's keep-alives, or WebSocket pings
+		return !slices.ContainsFunc(dc.http1, func(s http1Segment) bool {
+			return !sseKeepAlive(s.isSSE, s.sse, s.body) && !s.ws.housekeeping()
+		})
 	}
 	return false
 }

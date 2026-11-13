@@ -87,8 +87,9 @@ the output, JSON and pcap, containers, and troubleshooting.
 - **Protocols:** HTTP/1.1, HTTP/2 and HTTP/3 with their headers decoded,
   bodies compressed with gzip, deflate, Brotli or zstd decompressed, gRPC
   messages decoded as protobuf, without needing the schema, or with their
-  fields' names given one (`--proto`), and streamed responses (Server-Sent
-  Events), e.g. from LLM APIs, shown event by event as they arrive.
+  fields' names given one (`--proto`), streamed responses (Server-Sent
+  Events), e.g. from LLM APIs, shown event by event as they arrive, and
+  WebSocket messages, unmasked and decompressed (permessage-deflate).
 - **Where:** running processes, those started while snoopy runs, and
   processes in containers. On Kubernetes, `kubectl snoopy POD` traces a pod
   from your machine ([docs/kubernetes.md](docs/kubernetes.md)).

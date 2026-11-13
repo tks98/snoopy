@@ -117,8 +117,10 @@ OpenSSL's own QUIC (quiche, for example), OpenSSL's QUIC in processes not
 selected with `--comm`, `--pid` or `--container`, or in a process that
 maps libcrypto and `dlopen`s what uses OpenSSL's QUIC more than 3 s after
 it starts (see [maintenance.md](maintenance.md#http3-through-openssls-quic-curl-on-debian)), programs that use OpenSSL only through its BIO layer (e.g.
-`openssl s_server -www`), and bodies compressed with a shared dictionary
-(Chrome's `dcb` and `dcz`), which are shown as sent.
+`openssl s_server -www`), bodies compressed with a shared dictionary
+(Chrome's `dcb` and `dcz`), which are shown as sent, and WebSocket over
+HTTP/2 (RFC 8441) or HTTP/3 (RFC 9220), whose frames are shown as the
+stream's DATA.
 
 
 ## Tracing calls
@@ -191,6 +193,24 @@ buffer starts at a packet the BPF program saw encrypted gives the packet's
 socket, and its destination is sent to user space with the packet's header,
 which tells whose peer it is. Connections whose handshake wasn't seen, or
 that use zero-length IDs, are followed by their socket as before.
+
+## WebSocket
+
+An HTTP/1.1 connection that switches to WebSocket (RFC 6455) with a 101
+response is followed from there as two streams of frames, one per
+direction, which can be split across calls or come several to a call.
+Frames sent by the client are masked; snoopy unmasks them. If the
+response's `Sec-WebSocket-Extensions` accepted permessage-deflate (RFC
+7692), a compressed message is decompressed when its last frame ends,
+with what the earlier messages in its direction decompressed to (their
+last 32 KiB) as the dictionary, unless the handshake said that side
+starts each message afresh (`server_no_context_takeover`,
+`client_no_context_takeover`). A message with bytes missing can't be
+decompressed, and then neither can later ones that refer back to it; the
+decompressor notices, since they point back further than it has. A frame
+that can't be valid, or bytes of a frame header that weren't captured,
+stop the decoding of that direction. A connection that switched before
+snoopy started has no handshake to go by, and is shown as data.
 
 ## TLS records
 

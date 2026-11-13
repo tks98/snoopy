@@ -187,8 +187,8 @@ Output:
                      secret query parameters and JSON and form fields, and
                      tokens of well-known kinds, for output to share
   --verbose          also calls that only keep connections going (HTTP/2
-                     settings and flow control, QUIC acknowledgments), and
-                     every file attached to
+                     settings and flow control, QUIC acknowledgments,
+                     WebSocket pings), and every file attached to
   --count N          stop after N calls (0, the default: don't)
   --duration TIME    stop after this long: 30s, 5m, 1h
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
