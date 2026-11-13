@@ -115,7 +115,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install TLS clients
-        run: sudo apt-get update && sudo apt-get install -y curl python3 gnutls-bin libnss3-dev libwolfssl-dev libmbedtls-dev libssl-dev cmake pkg-config erlang-base erlang-ssl erlang-inets
+        run: sudo apt-get update && sudo apt-get install -y curl python3 python3-websockets gnutls-bin libnss3-dev libwolfssl-dev libmbedtls-dev libssl-dev cmake pkg-config erlang-base erlang-ssl erlang-inets
       # Ubuntu (and Debian) don't package s2n-tls, so TestS2N gets a release
       # built from source, into /usr/local. It takes seconds.
       - name: Build s2n-tls

@@ -511,7 +511,13 @@ signature finding against real binaries (see
   `:protocol websocket` streams in http2.go and the HTTP/2 printers.
   `TestWebSocket` (an integration test in `package tracer_test`, since
   output imports tracer) checks a real library, coder/websocket in
-  `internal/tracer/testdata/wsgo`, with context takeover.
+  `internal/tracer/testdata/wsgo`, with context takeover, and
+  `TestWebSocketPython` another, Python's websockets
+  (`testdata/wspy`, python3-websockets in CI), with 1 KiB windows. By hand
+  (November 2026), Chrome 157 and 158 beta, Chromium 157, Python
+  websockets 17.4, Node's ws 8.23 and gorilla/websocket 1.5.3 decoded
+  cleanly as clients and servers, with and without context takeover and
+  with window bits from 8 to 15.
 - **`--requests`** (`output/requests.go`) is the HAR writer's pairing with
   no entries kept (`maxKept` 0, so bodies are only counted) and a `done`
   hook, called once per exchange when its response ends: an HTTP/2 or

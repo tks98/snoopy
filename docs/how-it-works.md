@@ -212,6 +212,12 @@ that can't be valid, or bytes of a frame header that weren't captured,
 stop the decoding of that direction. A connection that switched before
 snoopy started has no handshake to go by, and is shown as data.
 
+This was tested with Chrome 157 and 158 (beta) and Chromium 157 as
+clients, and with Python's websockets 17.4, Node's ws 8.23,
+gorilla/websocket 1.5.3 and coder/websocket as clients and servers, with
+and without permessage-deflate and context takeover, and with
+`server_max_window_bits` and `client_max_window_bits` from 8 to 15.
+
 ## TLS records
 
 Where a program's plaintext has no read or write function to probe, snoopy
