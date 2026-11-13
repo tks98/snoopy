@@ -161,8 +161,8 @@ Which HTTP exchanges (repeatable, or comma-separated):
 Which calls:
   --grep REGEXP      only calls in which REGEXP (Go's syntax) matches
                      something shown: the data, decoded HTTP/2 and HTTP/3
-                     headers, decompressed bodies, gRPC fields; not with
-                     --requests, whose lines show no bodies
+                     headers, decompressed bodies, gRPC fields, server-sent
+                     events; not with --requests, whose lines show no bodies
 
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
@@ -172,11 +172,13 @@ Which connections (repeatable):
 
 Output:
   --requests         one line per HTTP request and its response: method,
-                     URL, status, type, size and time, once the response ends
+                     URL, status, type, size and time, once the response
+                     ends, and one when a streamed response starts
   --brief            one line per call, like tcpdump
   --json             one JSON object per call
   --full             whole bodies, and binary data as hex dumps (by default,
-                     a body's first 2 KiB, and binary data described)
+                     a body's first 2 KiB, each server-sent event's in an
+                     event stream, and binary data described)
   --hex              payloads as hex dumps
   --proto FILE       decode gRPC messages with their fields' names, from a
                      descriptor set (protoc --descriptor_set_out=FILE

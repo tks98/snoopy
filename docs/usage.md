@@ -48,8 +48,8 @@ Which HTTP exchanges (repeatable, or comma-separated):
 Which calls:
   --grep REGEXP      only calls in which REGEXP (Go's syntax) matches
                      something shown: the data, decoded HTTP/2 and HTTP/3
-                     headers, decompressed bodies, gRPC fields; not with
-                     --requests, whose lines show no bodies
+                     headers, decompressed bodies, gRPC fields, server-sent
+                     events; not with --requests, whose lines show no bodies
 
 Which connections (repeatable):
   --host HOST        only connections with this IP address, network (CIDR)
@@ -59,11 +59,13 @@ Which connections (repeatable):
 
 Output:
   --requests         one line per HTTP request and its response: method,
-                     URL, status, type, size and time, once the response ends
+                     URL, status, type, size and time, once the response
+                     ends, and one when a streamed response starts
   --brief            one line per call, like tcpdump
   --json             one JSON object per call
   --full             whole bodies, and binary data as hex dumps (by default,
-                     a body's first 2 KiB, and binary data described)
+                     a body's first 2 KiB, each server-sent event's in an
+                     event stream, and binary data described)
   --hex              payloads as hex dumps
   --proto FILE       decode gRPC messages with their fields' names, from a
                      descriptor set (protoc --descriptor_set_out=FILE
@@ -209,6 +211,42 @@ grpc-status: 0 (OK)
 
 A message's first 40 lines are shown; `--full` shows all of them.
 
+Streamed responses in Server-Sent Events (`content-type:
+text/event-stream`), as LLM APIs send their answers, show each event as the
+call carrying it arrives: its name (`message` if it has none), its `id` and
+`retry` if it has them, and its data, JSON without the spaces between its
+tokens. An event split across calls is shown with the call that ends it,
+and a compressed stream decompressed as it goes. Each event's data is shown
+up to 2 KiB however long the stream runs; `--full` shows all of it.
+Comments, which servers send to keep the connection open, are left out like
+the other calls that only keep connections going, and `--verbose` shows
+them. Here curl and a test server streaming events over HTTP/2 with gzip:
+
+```console
+19:32:06.092734 curl (pid 25006) SSL_read 127.0.0.1:8743 > 127.0.0.1:40268  53 bytes  9µs  fd 6, conn 0xc29421d0f530
+HTTP/2 HEADERS stream=1 length=44 [END_HEADERS]
+:status: 200
+content-encoding: gzip
+content-type: text/event-stream
+...
+
+19:32:06.092754 curl (pid 25006) SSL_read 127.0.0.1:8743 > 127.0.0.1:40268  105 bytes  12µs  fd 6, conn 0xc29421d0f530
+HTTP/2 DATA stream=1 length=96
+SSE event content_block_delta
+{"type":"content_block_delta","index":0,"delta":{"text":"Hello"}}
+
+19:32:06.493119 curl (pid 25006) SSL_read 127.0.0.1:8743 > 127.0.0.1:40268  24 bytes  47µs  fd 6, conn 0xc29421d0f530
+HTTP/2 DATA stream=1 length=15
+SSE event content_block_delta
+{"type":"content_block_delta","index":1,"delta":{"text":","}}
+...
+
+19:32:07.694068 curl (pid 25006) SSL_read 127.0.0.1:8743 > 127.0.0.1:40268  25 bytes  35µs  fd 6, conn 0xc29421d0f530
+HTTP/2 DATA stream=1 length=16
+SSE event message
+[DONE]
+```
+
 `--brief` shows a large body's first call and the one that ends it, with
 how many were folded in between; `--verbose` shows each:
 
@@ -218,6 +256,9 @@ how many were folded in between; `--verbose` shows each:
 00:50:34.972949 curl[13337] 127.0.0.1:37119 > 127.0.0.1:45112 TLS 4105: HTTP/2 DATA s1 4096 bytes
 00:50:34.974185 curl[13337] 127.0.0.1:37119 > 127.0.0.1:45112 TLS 4105: HTTP/2 DATA s1 4096 bytes [END_STREAM] [+30 calls folded, 122880 bytes]
 ```
+
+An event stream's calls aren't folded: each shows the events it completed,
+as `HTTP/2 DATA s1 SSE content_block_delta {"type":...}`.
 
 ### One line per request
 
@@ -236,9 +277,26 @@ $ sudo snoopy --comm curl --requests
 00:50:32.942369 curl[13219] GET https://127.0.0.1:37119/big HTTP/2 → 200, text/plain, 131072 bytes, 1.66ms
 ```
 
+A streamed response gets a line when it starts too, so that a long answer
+shows at once rather than when it ends: an event stream
+(`text/event-stream`) when its headers arrive, and any other response that's
+still arriving a second after its headers when more of it does. That line
+ends with `streaming` and the time the headers took; the one at the end
+says how many events an event stream had. Both start with the request's
+time:
+
+```console
+$ sudo snoopy --comm curl --requests
+19:32:13.995664 curl[25072] GET https://127.0.0.1:8743/sse HTTP/1.1 → 200, text/event-stream, streaming, 197µs
+19:32:13.995664 curl[25072] GET https://127.0.0.1:8743/sse HTTP/1.1 → 200, text/event-stream, 445 bytes, 5 events, 1.60237s
+19:32:17.365792 curl[25078] GET https://127.0.0.1:8743/ndjson HTTP/2 → 200, application/x-ndjson, streaming, 141µs
+19:32:17.365792 curl[25078] GET https://127.0.0.1:8743/ndjson HTTP/2 → 200, application/x-ndjson, 68 bytes, 2.40402s
+```
+
 Requests and responses are paired as in [HAR files](#har-files). A response
 that hasn't ended when snoopy stops isn't shown, nor one whose body ends
-only when its connection closes. `--count` counts requests then, and
+only when its connection closes, but for the first line of one that was
+streaming. `--count` counts requests then, by their last lines, and
 `--method`, `--path` and `--status` apply to them.
 
 Calls that carry nothing of the requests and responses, only what keeps the
@@ -362,6 +420,7 @@ Each line is one call to a TLS read or write function:
 | `http2` | The HTTP/2 frames in the data: `type`, `stream`, `length`, `flags`, `data_bytes`, `continued` (more of a DATA frame from an earlier call), decoded `headers` (`name`, `value`), `body` (see below), and on a gRPC stream's DATA frames the `grpc_messages` they completed (`method`, the call's path, if its request was seen; `request`, set for a request's messages; `type`, with `--proto`; `bytes`, `compressed`, and `protobuf`, the decoded fields a line each as in the text output, or an `error`). HPACK compresses headers against a table built up over the connection, so on a connection that started before snoopy, frames are followed from the first call that starts with one, and a header block has `headers_not_decoded` instead of `headers`. |
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 | `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, `ring::aead seal`, `ring::aead open`, `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt`, `EVP_CipherUpdate`, `cipher.AEAD.Seal`, `cipher.AEAD.Open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
+| `sse_events` | For a `text/event-stream` body, on its `http1` body pieces and `http2` and `http3` DATA frames (and the trailers that end one): the server-sent events the bytes completed, each with `event` (its name, if it had one), `id` and `retry` if it had them, `data` (its data lines, joined by newlines), `comments`, `bytes` (its length in the body as decoded), and `truncated` (larger than 1 MiB, of which that much is kept) or `incomplete` (the body ended before it did). A comment on its own, which servers send to keep the connection open, is an event with only `comments`. With `--redact`, secrets in `data`, `id` and comments are masked. |
 | `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
 
 Fields that don't apply are left out.

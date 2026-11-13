@@ -32,6 +32,10 @@ type quicItem struct {
 	// bytes came before these.
 	ContentType string
 	Offset      int64
+	// For DATA on a text/event-stream stream: IsSSE, and the events these
+	// bytes completed.
+	IsSSE bool
+	SSE   []sseEvent
 }
 
 // quicConns follows the HTTP/3 traffic in QUIC packets. Packets are
@@ -184,6 +188,7 @@ type quicStream struct {
 	final    uint64 // and is this
 	dataSeen bool   // a DATA frame was read
 	body     bodyInfo
+	sse      *sseStream // for a text/event-stream body
 	lastUsed uint64
 }
 
@@ -685,22 +690,31 @@ func (d *quicDir) deliver(sf streamFrame, s *quicStream) []quicItem {
 		}
 	}
 	items := d.http3(sf.id, s)
-	if dec := d.bodies[sf.id]; dec != nil && s.finSeen && s.next >= s.final {
+	if !s.finSeen || s.next < s.final {
+		return items
+	}
+	// The stream's end: the end of its body, if it's encoded or events.
+	var end bodyPart
+	if dec := d.bodies[sf.id]; dec != nil {
 		delete(d.bodies, sf.id)
-		end := decodeBody(dec, nil, true)
-		if len(end.Decoded) == 0 && end.Err == "" {
-			return items
-		}
-		for i := len(items) - 1; i >= 0; i-- {
-			if it := &items[i]; it.Stream == sf.id && it.Body.Encoding != "" {
+		end = decodeBody(dec, nil, true)
+	}
+	events, isSSE := s.sse.feed(nil, end, true)
+	s.sse = nil
+	if len(end.Decoded) == 0 && end.Err == "" && len(events) == 0 {
+		return items
+	}
+	for i := len(items) - 1; i >= 0; i-- {
+		if it := &items[i]; it.Stream == sf.id && (it.Body.Encoding != "" || it.IsSSE) {
+			if end.Encoding != "" {
 				it.Body.Decoded = append(it.Body.Decoded, end.Decoded...)
 				it.Body.Err = end.Err
-				return items
 			}
+			it.SSE = append(it.SSE, events...)
+			return items
 		}
-		items = append(items, quicItem{HTTP3: "DATA (end)", Stream: sf.id, Body: end})
 	}
-	return items
+	return append(items, quicItem{HTTP3: "DATA (end)", Stream: sf.id, Body: end, IsSSE: isSSE, SSE: events})
 }
 
 // http3 parses the HTTP/3 frames in a stream's delivered bytes (RFC 9114).
@@ -799,6 +813,7 @@ func (s *quicStream) data(typ string, id uint64, data []byte, dec *bodyDecoder) 
 	item := quicItem{HTTP3: typ, Stream: id, Data: data, Body: decodeBody(dec, data, false),
 		ContentType: s.body.contentType, Offset: s.body.seen}
 	s.body.seen += int64(len(data))
+	item.SSE, item.IsSSE = s.sse.feed(data, item.Body, false)
 	return item
 }
 
@@ -839,10 +854,14 @@ func (d *quicDir) decodedItems(id uint64, fields []hpack.HeaderField, err error)
 // the body it heads.
 func (d *quicDir) decoded(id uint64, fields []hpack.HeaderField) quicItem {
 	item := quicItem{HTTP3: "HEADERS", Stream: id, Headers: fields}
-	if s := d.streams[id]; s != nil && !s.dataSeen {
+	s := d.streams[id]
+	if s != nil && !s.dataSeen {
 		s.body.contentType = contentType(fields)
 	}
 	item.Body = d.startBody(id, fields)
+	if s != nil && !s.dataSeen && s.sse == nil && isEventStream(s.body.contentType) {
+		s.sse = newSSEStream(d.bodies[id] != nil)
+	}
 	return item
 }
 

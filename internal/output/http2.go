@@ -41,6 +41,10 @@ type http2Frame struct {
 	// completed.
 	IsGRPC bool
 	GRPC   []grpcMessage
+	// For DATA on a text/event-stream stream, and the trailers ending one:
+	// IsSSE, and the events this frame completed.
+	IsSSE bool
+	SSE   []sseEvent
 }
 
 // bodyPart is what a piece of a message body decoded to.
@@ -184,6 +188,7 @@ type http2Dir struct {
 	bodies         map[uint32]*bodyDecoder // by stream, for encoded bodies
 	infos          map[uint32]*bodyInfo    // by stream
 	grpc           map[uint32]*grpcStream  // by stream, for gRPC calls
+	sse            map[uint32]*sseStream   // by stream, for text/event-stream bodies
 	conn           *http2Conn
 }
 
@@ -322,6 +327,7 @@ func (c *http2Conns) start(key http2Key, late bool) *http2Conn {
 		d.bodies = map[uint32]*bodyDecoder{}
 		d.infos = map[uint32]*bodyInfo{}
 		d.grpc = map[uint32]*grpcStream{}
+		d.sse = map[uint32]*sseStream{}
 	}
 	c.conns[key] = conn
 	return conn
@@ -376,6 +382,9 @@ func (d *http2Dir) add(data []byte, missing int, why string, pool *bodyPool) ([]
 				if missing > d.dataLeft {
 					return frames, fmt.Errorf("bytes after a DATA frame weren't captured (%s)", why)
 				}
+				if missing > 0 {
+					d.sse[d.data.stream].lose()
+				}
 				if dec := d.bodies[d.data.stream]; dec != nil && missing > 0 {
 					dec.fail(fmt.Errorf("bytes of the body weren't captured (%s)", why))
 					if p := decodeBody(dec, nil, false); p.Err != "" {
@@ -394,6 +403,7 @@ func (d *http2Dir) add(data []byte, missing int, why string, pool *bodyPool) ([]
 				if d.dataLeft == 0 && d.data.endStream {
 					delete(d.bodies, d.data.stream)
 					delete(d.infos, d.data.stream)
+					delete(d.sse, d.data.stream)
 					if n := len(frames); n > 0 && frames[n-1].Stream == d.data.stream {
 						frames[n-1].EndsStream = true
 					} else {
@@ -450,6 +460,7 @@ func (d *http2Dir) add(data []byte, missing int, why string, pool *bodyPool) ([]
 				delete(d.bodies, stream)
 			}
 			delete(d.infos, stream)
+			delete(d.sse, stream)
 		}
 		frames = append(frames, f)
 	}
@@ -479,6 +490,12 @@ func (d *http2Dir) dataPiece(f *http2Frame) {
 	}
 	f.Body = decodeBody(dec, body, last)
 	f.EndsStream = last
+	if ss := d.sse[stream]; ss != nil {
+		f.SSE, f.IsSSE = ss.feed(body, f.Body, last)
+		if last {
+			delete(d.sse, stream)
+		}
+	}
 }
 
 // info returns what's known about a stream's body, starting to follow it if
@@ -613,8 +630,24 @@ func (d *http2Dir) headerBlock(f *http2Frame, typ, flags byte, p []byte, pool *b
 			delete(d.bodies, stream)
 			f.Body = decodeBody(dec, nil, true)
 		}
+		d.sseHeaders(f, stream, fields)
 	}
 	return nil
+}
+
+// sseHeaders starts reading a text/event-stream body's events at its
+// headers, and ends it at its trailers.
+func (d *http2Dir) sseHeaders(f *http2Frame, stream uint32, fields []hpack.HeaderField) {
+	switch ss := d.sse[stream]; {
+	case ss != nil && d.blockEndStream:
+		f.SSE, f.IsSSE = ss.feed(nil, f.Body, true)
+		delete(d.sse, stream)
+	case ss == nil && !d.blockEndStream && isEventStream(contentType(fields)):
+		if len(d.sse) >= maxBodyInfos {
+			clear(d.sse)
+		}
+		d.sse[stream] = newSSEStream(d.bodies[stream] != nil)
+	}
 }
 
 // headerField returns a header block's field's value, and whether it has

@@ -56,7 +56,7 @@ func bodyRefs(ev *tracer.Event, dc decoded) (refs []bodyRef, onlyBody bool) {
 		for _, it := range dc.quic {
 			switch {
 			case it.housekeeping():
-			case strings.HasPrefix(it.HTTP3, "DATA") && it.Err == "":
+			case strings.HasPrefix(it.HTTP3, "DATA") && it.Err == "" && !it.IsSSE: // each event is shown
 				refs = append(refs, bodyRef{bodyKey{conn, dir, it.Stream}, len(it.Data), ends[it.Stream]})
 			default:
 				onlyBody = false
@@ -66,7 +66,7 @@ func bodyRefs(ev *tracer.Event, dc decoded) (refs []bodyRef, onlyBody bool) {
 		for _, f := range dc.http2 {
 			switch {
 			case f.housekeeping():
-			case f.Type == "DATA" && len(f.GRPC) == 0:
+			case f.Type == "DATA" && len(f.GRPC) == 0 && !f.IsSSE:
 				refs = append(refs, bodyRef{bodyKey{conn, dir, uint64(f.Stream)}, len(f.Data), ends[uint64(f.Stream)]})
 			default:
 				onlyBody = false
@@ -74,7 +74,7 @@ func bodyRefs(ev *tracer.Event, dc decoded) (refs []bodyRef, onlyBody bool) {
 		}
 	case dc.http1 != nil:
 		for _, s := range dc.http1 {
-			if !s.inBody {
+			if !s.inBody || s.isSSE {
 				onlyBody = false
 				continue
 			}
