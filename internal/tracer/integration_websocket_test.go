@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -136,18 +137,75 @@ func traceWebSocket(t *testing.T, name string, args, env []string, messages ...s
 		// response is written and read; context takeover compresses every
 		// message.
 		if fmt.Sprint(got) == fmt.Sprint(want) && stats.closes >= 2 && stats.upgrades == 2 && stats.compressed == 4*len(messages) {
+			// The HAR log has the same messages, on the two ends' entries
+			// of the upgrade request.
+			if got, entries := harWebSocket(t, evs); fmt.Sprint(got) != fmt.Sprint(want) || entries != 2 {
+				t.Errorf("HAR: %d WebSocket entries, messages by length %v", entries, lengths(got))
+			}
 			return
 		}
 	}
-	// Only lengths: the messages are long.
-	lengths := func(m map[string]int) map[int]int {
-		out := map[int]int{}
-		for k, v := range m {
-			out[len(k)] = v
-		}
-		return out
-	}
 	t.Errorf("messages by length: got %v, want %v (%+v)", lengths(got), lengths(want), stats)
+}
+
+// lengths counts messages by length, to show: the messages are long.
+func lengths(m map[string]int) map[int]int {
+	out := map[int]int{}
+	for k, v := range m {
+		out[len(k)] = v
+	}
+	return out
+}
+
+// harWebSocket writes events to a HAR log as snoopy --har does and returns
+// the WebSocket messages it lists, counted, and how many entries are
+// WebSocket connections.
+func harWebSocket(t *testing.T, evs []*tracer.Event) (msgs map[string]int, entries int) {
+	t.Helper()
+	var buf bytes.Buffer
+	h := output.NewHAR(&buf, "test", output.Options{})
+	for _, ev := range evs {
+		if err := h.Print(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var log struct {
+		Log struct {
+			Entries []struct {
+				ResourceType string `json:"_resourceType"`
+				Messages     []struct {
+					Type   string `json:"type"`
+					Opcode int    `json:"opcode"`
+					Data   string `json:"data"`
+				} `json:"_webSocketMessages"`
+			} `json:"entries"`
+		} `json:"log"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &log); err != nil {
+		t.Fatal(err)
+	}
+	msgs = map[string]int{}
+	for _, e := range log.Log.Entries {
+		if e.ResourceType != "websocket" {
+			continue
+		}
+		entries++
+		for _, m := range e.Messages {
+			data := m.Data
+			if m.Opcode != 1 {
+				b, err := base64.StdEncoding.DecodeString(m.Data)
+				if err != nil {
+					t.Fatalf("message data not base64: %v", err)
+				}
+				data = string(b)
+			}
+			msgs[data]++
+		}
+	}
+	return msgs, entries
 }
 
 // wsStats counts close frames with status 1000 and the reason "done", 101
