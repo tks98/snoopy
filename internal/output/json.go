@@ -180,6 +180,10 @@ type jsonHTTP3Frame struct {
 	Body      *jsonBody    `json:"body,omitempty"`
 	// The server-sent events a text/event-stream stream's DATA completed.
 	SSE []jsonSSEEvent `json:"sse_events,omitempty"`
+	// On a stream that's a WebSocket (RFC 9220): the frames in its DATA,
+	// and why decoding stopped, if it did, as on HTTP/1.1.
+	WebSocket      []jsonWSFrame `json:"websocket,omitempty"`
+	WebSocketError string        `json:"websocket_error,omitempty"`
 }
 
 type jsonHTTP2Frame struct {
@@ -198,6 +202,10 @@ type jsonHTTP2Frame struct {
 	GRPC []jsonGRPCMessage `json:"grpc_messages,omitempty"`
 	// The server-sent events a text/event-stream stream's DATA completed.
 	SSE []jsonSSEEvent `json:"sse_events,omitempty"`
+	// On a stream that's a WebSocket (RFC 8441): the frames in its DATA,
+	// and why decoding stopped, if it did, as on HTTP/1.1.
+	WebSocket      []jsonWSFrame `json:"websocket,omitempty"`
+	WebSocketError string        `json:"websocket_error,omitempty"`
 }
 
 type jsonGRPCMessage struct {
@@ -271,7 +279,10 @@ func (j *JSON) Print(ev *tracer.Event) error {
 				continue
 			}
 			jf := jsonHTTP3Frame{Type: it.HTTP3, Stream: it.Stream, DataBytes: len(it.Data), Error: it.Err, Body: newJSONBody(it.Body),
-				SSE: jsonSSE(it.SSE)}
+				SSE: jsonSSE(it.SSE), WebSocket: jsonWSFrames(it.WS, j.redact)}
+			if it.WS != nil {
+				jf.WebSocketError = it.WS.Err
+			}
 			for _, h := range it.Headers {
 				jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
 			}
@@ -296,7 +307,11 @@ func (j *JSON) Print(ev *tracer.Event) error {
 	}
 	for _, f := range dc.http2 {
 		jf := jsonHTTP2Frame{Type: f.Type, Stream: f.Stream, Length: f.Length, Flags: f.Flags, Continued: f.Continued,
-			DataBytes: len(f.Data), HeadersNotDecoded: f.HeadersLost, Body: newJSONBody(f.Body), SSE: jsonSSE(f.SSE)}
+			DataBytes: len(f.Data), HeadersNotDecoded: f.HeadersLost, Body: newJSONBody(f.Body), SSE: jsonSSE(f.SSE),
+			WebSocket: jsonWSFrames(f.WS, j.redact)}
+		if f.WS != nil {
+			jf.WebSocketError = f.WS.Err
+		}
 		for _, h := range f.Headers {
 			jf.Headers = append(jf.Headers, jsonHeader{h.Name, h.Value})
 		}

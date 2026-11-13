@@ -506,12 +506,33 @@ signature finding against real binaries (see
   frame can pass it. Text and `--brief` show a message's frames in one
   call as one (`wsRuns`); pings and pongs are housekeeping. `--requests`
   ends an exchange at a 101's headers (`headersOnly`), which it didn't
-  before, so upgrades weren't shown. WebSocket over HTTP/2 (extended
-  CONNECT, RFC 8441) isn't decoded: it would mean following
-  `:protocol websocket` streams in http2.go and the HTTP/2 printers.
+  before, so upgrades weren't shown.
+  WebSocket over HTTP/2 and HTTP/3 (extended CONNECT, RFC 8441 and 9220):
+  `wsConnect` spots the request, `wsAccept` the 2xx response, made into
+  a `wsConn` by `newWSStream` from its `sec-websocket-extensions` (as
+  `newWSConn` does for a 101). HTTP/2 keeps the offers and accepted
+  streams on the `http2Conn` (`wsOffers`, `ws`, forgotten at RST_STREAM
+  or both END_STREAMs); HTTP/3, whose directions are separate `quicDir`s,
+  keeps the offer on the client's and puts the `wsConn` on both
+  directions' `quicStream`s, found through `quicDir.peer` (the other
+  direction, set per packet). DATA payloads (padding left out) go to
+  `wsConn.decode`, the per-direction decoder HTTP/1 uses too (its
+  `segments` wraps it), and come out as `http2Frame.WS` and
+  `quicItem.WS`, which the printers, folding, `--grep` and `--redact`
+  handle as they do `http1Segment.ws`; bytes after an invalid header are
+  `wsPart.Rest`. HAR ends a CONNECT's exchange at its 2xx response
+  (`harEntry.tunnel`), so `--requests` prints its line then, and the
+  streaming line never fires for it.
   `TestWebSocket` (an integration test in `package tracer_test`, since
   output imports tracer) checks a real library, coder/websocket in
   `internal/tracer/testdata/wsgo`, with context takeover.
+  `TestWebSocketStreams` checks HTTP/2 (net/http's server, x/net/http2's
+  client, `GODEBUG=http2xconnect=1`) and HTTP/3 (quic-go) with
+  `testdata/wsstreams`, which frames WebSocket itself: no library there
+  speaks RFC 8441 or 9220. Its quic-go client needs its own
+  `quic.Transport`: `quic.DialAddr`'s uses zero-length connection IDs,
+  so the server's short headers are 2 or 3 bytes, under the 5 that
+  `go_quic_header` wants, and its packets aren't captured.
 - **`--requests`** (`output/requests.go`) is the HAR writer's pairing with
   no entries kept (`maxKept` 0, so bodies are only counted) and a `done`
   hook, called once per exchange when its response ends: an HTTP/2 or

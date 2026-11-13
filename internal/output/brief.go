@@ -144,6 +144,8 @@ func briefQUIC(items []quicItem, verbose bool) string {
 			parts = append(parts, fmt.Sprintf("%s s%d: %s", it.HTTP3, it.Stream, it.Err))
 		case it.Headers != nil:
 			parts = append(parts, fmt.Sprintf("%s s%d %s%s", it.HTTP3, it.Stream, briefFields(it.Headers), bodyNote(it.Body)))
+		case it.WS != nil:
+			parts = append(parts, fmt.Sprintf("DATA s%d %s", it.Stream, briefWebSocket(it.WS, verbose)))
 		case strings.HasPrefix(it.HTTP3, "DATA") && briefSSE(it.SSE) != "":
 			parts = append(parts, fmt.Sprintf("DATA s%d %s", it.Stream, briefSSE(it.SSE)))
 		case strings.HasPrefix(it.HTTP3, "DATA"):
@@ -192,6 +194,8 @@ func briefHTTP2(frames []http2Frame, verbose bool) string {
 			if len(f.GRPC) > 1 {
 				p += "s"
 			}
+		case f.WS != nil:
+			p = fmt.Sprintf("DATA s%d %s", f.Stream, briefWebSocket(f.WS, verbose))
 		case f.Type == "DATA" && briefSSE(f.SSE) != "":
 			p = fmt.Sprintf("DATA s%d %s", f.Stream, briefSSE(f.SSE))
 		case f.Type == "DATA":

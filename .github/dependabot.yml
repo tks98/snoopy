@@ -24,6 +24,7 @@ updates:
     directories:
       - /internal/tracer/testdata/quicgo
       - /internal/tracer/testdata/wsgo
+      - /internal/tracer/testdata/wsstreams
     schedule:
       interval: weekly
     groups:

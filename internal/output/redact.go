@@ -465,7 +465,12 @@ func (dc decoded) redact(r *redactStreams, conn harConnKey, dir tracer.Direction
 	frames := make([]http2Frame, len(dc.http2))
 	for i, f := range dc.http2 {
 		f.Headers = redactFields(f.Headers)
-		f.Data = r.text(key(partFrame, uint64(f.Stream)), f.Data)
+		if f.WS != nil { // its payloads are the stream's, masked or not
+			f.WS = f.WS.redact(r, key(partFrame, uint64(f.Stream)), key(partFrameDecoded, uint64(f.Stream)))
+			f.Data = redactText(f.Data)
+		} else {
+			f.Data = r.text(key(partFrame, uint64(f.Stream)), f.Data)
+		}
 		f.Body.Decoded = r.text(key(partFrameDecoded, uint64(f.Stream)), f.Body.Decoded)
 		msgs := make([]grpcMessage, len(f.GRPC))
 		for j, m := range f.GRPC {
@@ -484,9 +489,13 @@ func (dc decoded) redact(r *redactStreams, conn harConnKey, dir tracer.Direction
 	items := make([]quicItem, len(dc.quic))
 	for i, it := range dc.quic {
 		it.Headers = redactFields(it.Headers)
-		if strings.HasPrefix(it.HTTP3, "DATA") {
+		switch {
+		case it.WS != nil:
+			it.WS = it.WS.redact(r, key(partFrame, it.Stream), key(partFrameDecoded, it.Stream))
+			it.Data = redactText(it.Data)
+		case strings.HasPrefix(it.HTTP3, "DATA"):
 			it.Data = r.text(key(partFrame, it.Stream), it.Data)
-		} else {
+		default:
 			it.Data = redactText(it.Data) // a summary's details
 		}
 		it.Body.Decoded = r.text(key(partFrameDecoded, it.Stream), it.Body.Decoded)

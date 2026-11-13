@@ -36,6 +36,9 @@ type quicItem struct {
 	// bytes completed.
 	IsSSE bool
 	SSE   []sseEvent
+	// WS is, for DATA on a stream that's a WebSocket (RFC 9220), the
+	// WebSocket frames in these bytes.
+	WS *wsPart
 }
 
 // quicConns follows the HTTP/3 traffic in QUIC packets. Packets are
@@ -93,6 +96,13 @@ type quicDir struct {
 	held             int    // bytes held for streams: their early and buf, with overhead
 	blockedBytes     int    // in blocked
 	clock            uint64 // for evicting the least recently used stream
+	// The direction this is, and the other one of the connection, if it's
+	// known, as of the packet being processed.
+	direction tracer.Direction
+	peer      *quicDir
+	// The streams this direction's requests made extended CONNECTs for
+	// WebSocket on, until the other direction's responses.
+	wsOffers map[uint64]bool
 }
 
 func newQUICDir(pool *bodyPool) *quicDir {
@@ -189,6 +199,7 @@ type quicStream struct {
 	dataSeen bool   // a DATA frame was read
 	body     bodyInfo
 	sse      *sseStream // for a text/event-stream body
+	ws       *wsConn    // once the stream is a WebSocket, shared with the other direction's
 	lastUsed uint64
 }
 
@@ -289,6 +300,7 @@ func (c *quicConns) process(ev *tracer.Event) (items []quicItem, ok bool) {
 	if o != nil && (c.locals[other] != c.locals[key]) {
 		o = nil // the other direction's state is from an earlier socket
 	}
+	d.direction, d.peer = ev.Function.Direction(), o
 	if o != nil && o.maxTableCapacity >= 0 {
 		d.qpack.maxEntries = int(o.maxTableCapacity / 32)
 		d.qpack.maxCapacity, d.qpack.maxKnown = o.maxTableCapacity, true
@@ -758,7 +770,7 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 	for len(s.buf) > 0 {
 		if s.dataLeft > 0 { // more of a DATA frame
 			n := min(s.dataLeft, uint64(len(s.buf)))
-			items = append(items, s.data("DATA (continued)", id, s.buf[:n], d.bodies[id]))
+			items = append(items, s.data("DATA (continued)", id, s.buf[:n], d.bodies[id], d.direction))
 			s.buf, s.dataLeft = s.buf[n:], s.dataLeft-n
 			continue
 		}
@@ -775,7 +787,7 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 			s.dataSeen = true
 			avail := min(length, uint64(len(s.buf)-header))
 			data := s.buf[header : header+int(avail)]
-			items = append(items, s.data("DATA", id, data, d.bodies[id]))
+			items = append(items, s.data("DATA", id, data, d.bodies[id], d.direction))
 			s.buf, s.dataLeft = s.buf[header+int(avail):], length-avail
 			continue
 		}
@@ -808,12 +820,16 @@ func (d *quicDir) http3(id uint64, s *quicStream) []quicItem {
 	return items
 }
 
-// data returns the item for a piece of a DATA frame's payload.
-func (s *quicStream) data(typ string, id uint64, data []byte, dec *bodyDecoder) quicItem {
+// data returns the item for a piece of a DATA frame's payload, which the
+// stream's direction dir carried.
+func (s *quicStream) data(typ string, id uint64, data []byte, dec *bodyDecoder, dir tracer.Direction) quicItem {
 	item := quicItem{HTTP3: typ, Stream: id, Data: data, Body: decodeBody(dec, data, false),
 		ContentType: s.body.contentType, Offset: s.body.seen}
 	s.body.seen += int64(len(data))
 	item.SSE, item.IsSSE = s.sse.feed(data, item.Body, false)
+	if s.ws != nil && len(data) > 0 {
+		item.WS = s.ws.decode(dir, data)
+	}
 	return item
 }
 
@@ -862,7 +878,37 @@ func (d *quicDir) decoded(id uint64, fields []hpack.HeaderField) quicItem {
 	if s != nil && !s.dataSeen && s.sse == nil && isEventStream(s.body.contentType) {
 		s.sse = newSSEStream(d.bodies[id] != nil)
 	}
+	d.wsHeaders(id, s, fields)
 	return item
+}
+
+// wsHeaders notes a request that's an extended CONNECT for WebSocket, and
+// follows its stream (s, nil if it's done with) as a WebSocket, in both
+// directions, once a 2xx response accepts it.
+func (d *quicDir) wsHeaders(id uint64, s *quicStream, fields []hpack.HeaderField) {
+	if wsConnect(fields) {
+		if d.wsOffers == nil || len(d.wsOffers) >= maxBodyInfos {
+			d.wsOffers = map[uint64]bool{}
+		}
+		d.wsOffers[id] = true
+		return
+	}
+	p := d.peer
+	status, ok := headerField(fields, ":status")
+	if !ok || p == nil || !p.wsOffers[id] || strings.HasPrefix(status, "1") {
+		return
+	}
+	delete(p.wsOffers, id)
+	ws := wsAccept(fields, d.direction)
+	if ws == nil {
+		return
+	}
+	if s != nil {
+		s.ws = ws
+	}
+	if ps := p.streams[id]; ps != nil {
+		ps.ws = ws
+	}
 }
 
 // startBody starts decoding the body of a request or response whose
