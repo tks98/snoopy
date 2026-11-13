@@ -50,7 +50,7 @@ jobs:
         run: |
           sudo env "PATH=$PATH" docs/benchmark/run.sh 10 | tee benchmark.txt
           { echo '```'; cat benchmark.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: 21
