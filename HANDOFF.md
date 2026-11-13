@@ -545,7 +545,13 @@ signature finding against real binaries (see
   streaming line never fires for it.
   `TestWebSocket` (an integration test in `package tracer_test`, since
   output imports tracer) checks a real library, coder/websocket in
-  `internal/tracer/testdata/wsgo`, with context takeover.
+  `internal/tracer/testdata/wsgo`, with context takeover, and
+  `TestWebSocketPython` another, Python's websockets
+  (`testdata/wspy`, python3-websockets in CI), with 1 KiB windows. By hand
+  (November 2026), Chrome 157, Chromium 157, Python
+  websockets 17.4, Node's ws 8.23 and gorilla/websocket 1.5.3 decoded
+  cleanly as clients and servers, with and without context takeover and
+  with window bits from 8 to 15.
   `TestWebSocketStreams` checks HTTP/2 (net/http's server, x/net/http2's
   client, `GODEBUG=http2xconnect=1`) and HTTP/3 (quic-go) with
   `testdata/wsstreams`, which frames WebSocket itself: no library there

@@ -213,6 +213,11 @@ that can't be valid, or bytes of a frame header that weren't captured,
 stop the decoding of that direction. A connection that switched before
 snoopy started has no handshake to go by, and is shown as data.
 
+Over HTTP/1.1, this was tested with Chrome 157 and Chromium 157 as clients, and with Python's websockets 17.4, Node's ws 8.23,
+gorilla/websocket 1.5.3 and coder/websocket as clients and servers, with
+and without permessage-deflate and context takeover, and with
+`server_max_window_bits` and `client_max_window_bits` from 8 to 15.
+
 WebSocket over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) is the same, on one
 stream: a request with `:method CONNECT` and `:protocol websocket` (an
 extended CONNECT) and a 2xx response make the stream's DATA, in each
