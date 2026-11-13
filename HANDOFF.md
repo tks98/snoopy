@@ -514,7 +514,7 @@ signature finding against real binaries (see
   `internal/tracer/testdata/wsgo`, with context takeover, and
   `TestWebSocketPython` another, Python's websockets
   (`testdata/wspy`, python3-websockets in CI), with 1 KiB windows. By hand
-  (November 2026), Chrome 157 and 158 beta, Chromium 157, Python
+  (November 2026), Chrome 157, Chromium 157, Python
   websockets 17.4, Node's ws 8.23 and gorilla/websocket 1.5.3 decoded
   cleanly as clients and servers, with and without context takeover and
   with window bits from 8 to 15.
