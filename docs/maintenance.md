@@ -1094,3 +1094,16 @@ These follow published standards and rarely need fixing.
   call of just a valid frame header counts. It's a heuristic over 9-byte
   headers, so if data that isn't HTTP/2 gets taken for it, make
   `http2Aligned` stricter rather than the decoder more forgiving.
+- **Server-sent events:** `internal/output/sse.go` follows the HTML
+  standard's event stream format, which doesn't change; what can change is
+  how clients read it. If `--requests` shows an LLM SDK's call as
+  `streaming` and never gives it its last line, the SDK probably stopped
+  reading before the body's end, as OpenAI's Python SDK does at
+  `data: [DONE]` (`sseDone`). Compare with `--brief`: the last call shown
+  is the last the program read. To check HTTP/3 by hand,
+  `testdata/quicgo server <port>` serves events at
+  `/events?n=5&gap=300ms&big=5000&gzip=1` and an EventSource page at
+  `/page` (with the same query) for Chrome, which `TestChromeHTTP3` shows
+  how to point at it; `quicgo client <port> /events?...` prints the pieces
+  as they arrive, and so does `curl -N --http3-only` in the Fedora root
+  that `TestCurlHTTP3` uses.

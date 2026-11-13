@@ -177,6 +177,9 @@ func (h *HAR) Print(ev *tracer.Event) error {
 					e.side(dir).events += sseEvents(s.sse)
 					e.end = ev.Time
 					h.touch(e, dir)
+					if dir != e.reqDir && sseDone(s.sse) {
+						h.ended(e)
+					}
 				}
 			}
 			if e := c.current[dir]; s.ends && e != nil && dir != e.reqDir {
@@ -360,6 +363,9 @@ func (h *HAR) data(c *harConn, ev *tracer.Event, dir tracer.Direction, stream ui
 	e.side(dir).events += sseEvents(events)
 	e.end = ev.Time
 	h.touch(e, dir)
+	if dir != e.reqDir && sseDone(events) {
+		h.ended(e)
+	}
 }
 
 // add adds bytes of the message's body as sent, and what they decoded to

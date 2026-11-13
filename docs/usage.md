@@ -321,8 +321,9 @@ shows at once rather than when it ends: an event stream
 (`text/event-stream`) when its headers arrive, and any other response that's
 still arriving a second after its headers when more of it does. That line
 ends with `streaming` and the time the headers took; the one at the end
-says how many events an event stream had. Both start with the request's
-time:
+says how many events an event stream had. An event stream ends at an
+OpenAI-style `data: [DONE]` event, since OpenAI's Python SDK stops reading
+there, before the body's end. Both start with the request's time:
 
 ```console
 $ sudo snoopy --comm curl --requests

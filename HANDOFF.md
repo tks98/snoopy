@@ -544,7 +544,13 @@ signature finding against real binaries (see
   (`SSE`/`sse`, `IsSSE` on all of a stream's), so Text, Brief (which doesn't
   fold them), JSON (`sse_events`), redaction (each event whole), `--grep`
   and HAR's event count all read them there. Once a compressed stream's
-  decoding stops, the rest isn't read as events (`stopped`).
+  decoding stops, the rest isn't read as events (`stopped`). For
+  `--requests` (HAR's `done`), a response ends at a `data: [DONE]` event
+  (`sseDone`): OpenAI's Python SDK breaks out of its loop there and closes
+  the connection without reading the chunked body's last chunk, so its
+  calls never got their last line. `TestSSELLMStreams` has the shapes of
+  OpenAI's, Anthropic's and Gemini's streams, and `TestSSEHTTP3` traces
+  `testdata/quicgo`'s `/events` end to end.
 - **`--brief`'s folding** (`output/fold.go`): once a body's first call is
   shown, calls carrying only more of it (`bodyRefs`) are counted, not
   shown, and the call that ends it says how many. Folded calls aren't
