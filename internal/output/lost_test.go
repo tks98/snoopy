@@ -72,7 +72,12 @@ func TestHTTP2LostCall(t *testing.T) {
 	// Once seen above zero, the count isn't read again.
 	reads := 0
 	l := &lostCheck{count: func() (uint64, error) { reads++; return 1, nil }}
-	if l.note() != lostNote || l.note() != lostNote || reads != 1 {
+	for range 2 {
+		if l.note() != lostNote {
+			t.Error("no note")
+		}
+	}
+	if reads != 1 {
 		t.Errorf("read the count %d times", reads)
 	}
 	if (&lostCheck{}).note() != "" {
