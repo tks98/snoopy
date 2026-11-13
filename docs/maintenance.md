@@ -722,10 +722,28 @@ own, without associated data.
   connections and streams is in the packets, so the `SSL_read`/`SSL_write`
   probes leave those objects out (`ossl_quic_object`), by the type that
   starts `struct ssl_st` from 3.2: 1 and 2, or from 3.5 0x80 and 0x81.
-- **Only for the processes selected:** libcrypto is the `OpenSSLQUIC`
-  target, found in a process's libraries (`processLibPatterns`), not across
-  the system, from OpenSSL 3.2 on (symbols versioned `OPENSSL_3.2.0` or
-  later), and attached to only with `--comm`, `--pid` or `--container`.
+- **Only for the processes selected, that use OpenSSL's QUIC:** libcrypto
+  is the `OpenSSLQUIC` target, found in a process's libraries
+  (`processLibPatterns`), not across the system, from OpenSSL 3.2 on
+  (symbols versioned `OPENSSL_3.2.0` or later), and attached to only with
+  `--comm`, `--pid` or `--container`, and only for a process that imports
+  `OSSL_QUIC_client_method`, `OSSL_QUIC_client_thread_method` or
+  `OSSL_QUIC_server_method` in one of the ELF files it maps, its
+  executable included (Debian's libcurl imports the first; Ruby's and
+  PHP's OpenSSL extensions none). Otherwise every TLS record of an
+  ordinary OpenSSL program would go through the probes for nothing.
+  `quicUsers` (`internal/discover/quic.go`) reads each file's dynamic
+  symbols once, remembered by file identity, and looks at 1024 files of a
+  process at most; `Watcher.Process` looks only when a libcrypto has an
+  `OpenSSLQUIC` target, and `Watcher.Needed` at the libraries a process
+  that has just started will load. `Watcher.Root` returns none: it lists
+  library directories, not what a process loads.
+- **Late loads:** a process is looked at again when it maps a library
+  whose name is in `tls_library_names` (libcrypto's is), and 0, 50 and
+  500 ms and 3 s after its exec. A program that maps libcrypto, and
+  `dlopen`s a library that uses OpenSSL's QUIC later than that, under a
+  name not in that list, isn't attached to for it. curl links libcurl, so
+  it isn't affected.
 
 ### How to tell it broke, and how to fix it
 

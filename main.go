@@ -596,6 +596,9 @@ func run(cfg config) error {
 
 	var attached []discover.Target
 	watcher := discover.NewWatcher(targets, t.PerProcess())
+	if !t.ProcessTargets() {
+		watcher.SkipOpenSSLQUIC() // not attached to
+	}
 	if t.PerProcess() {
 		for _, target := range targets {
 			if slices.Contains(cfg.libs, target.Path) { // asked for: for every process

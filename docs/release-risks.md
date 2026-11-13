@@ -179,12 +179,17 @@ thing it depends on ships.
   `EVP_CipherInit_ex`, `EVP_CipherUpdate` (associated data first) and
   `EVP_CipherFinal_ex`, all public API; and the type at the start of
   `struct ssl_st`, which is internal, to leave out what's read and written
-  through QUIC streams.
+  through QUIC streams; and programs that use OpenSSL's QUIC importing
+  `OSSL_QUIC_client_method` (or its thread or server variant), public API,
+  which is how snoopy tells which processes to probe libcrypto in.
 - **Breaks when:** OpenSSL encrypts packets differently (another EVP call,
   or a provider called directly), or renumbers its `SSL_TYPE_*` values,
-  as it did in 3.5.
+  as it did in 3.5; or a program gets to OpenSSL's QUIC another way, such
+  as a new method function, `dlsym`, or a library it `dlopen`s late.
 - **How it shows:** packets not captured, which the UDP-port-443 warning
-  says; or each request and response shown twice, as QUIC and as TLS.
+  says (`--verbose` then lists no libcrypto "for OpenSSL's QUIC" for the
+  process); or each request and response shown twice, as QUIC and as
+  TLS.
 - **Guarded by:** `TestOpenSSLQUIC`, in the weekly canary against Debian's
   latest curl and OpenSSL.
 
