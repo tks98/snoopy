@@ -93,6 +93,10 @@ type harEntry struct {
 	ended      bool      // done was called for it
 	reset      bool      // its stream was reset
 	announced  bool      // Requests printed it as streaming
+	// tunnel is, for an HTTP/2 or HTTP/3 CONNECT that a 2xx response
+	// accepted, what its stream carries since: the extended CONNECT's
+	// :protocol (e.g. websocket), else "tunnel".
+	tunnel string
 }
 
 type harMessage struct {
@@ -177,6 +181,9 @@ func (h *HAR) Print(ev *tracer.Event) error {
 					e.side(dir).events += sseEvents(s.sse)
 					e.end = ev.Time
 					h.touch(e, dir)
+					if dir != e.reqDir && sseDone(s.sse) {
+						h.ended(e)
+					}
 				}
 			}
 			if e := c.current[dir]; s.ends && e != nil && dir != e.reqDir {
@@ -344,6 +351,12 @@ func (h *HAR) headers(c *harConn, ev *tracer.Event, dir tracer.Direction, stream
 		e.resp = harMessage{seen: true, status: n, version: version, headers: headers}
 		e.end, e.respAt = ev.Time, ev.Time
 		h.touch(e, dir)
+		if e.req.method == "CONNECT" && n >= 200 && n < 300 {
+			// The stream is a tunnel now, as a 101 makes an HTTP/1.1
+			// connection another protocol's: the exchange is done.
+			e.tunnel = cmpOr(headerValue(e.req.headers, ":protocol"), "tunnel")
+			h.ended(e)
+		}
 	case e != nil: // trailers
 		m := e.side(dir)
 		m.headers = append(m.headers, headers...)
@@ -360,6 +373,9 @@ func (h *HAR) data(c *harConn, ev *tracer.Event, dir tracer.Direction, stream ui
 	e.side(dir).events += sseEvents(events)
 	e.end = ev.Time
 	h.touch(e, dir)
+	if dir != e.reqDir && sseDone(events) {
+		h.ended(e)
+	}
 }
 
 // add adds bytes of the message's body as sent, and what they decoded to

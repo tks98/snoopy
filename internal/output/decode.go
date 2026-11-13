@@ -209,7 +209,7 @@ func (dc decoded) matches(re *regexp.Regexp) bool {
 		}
 	}
 	for _, f := range dc.http2 {
-		if headers(f.Headers) || re.Match(f.Data) || re.Match(f.Body.Decoded) || sseMatches(re, f.SSE) {
+		if headers(f.Headers) || re.Match(f.Data) || re.Match(f.Body.Decoded) || sseMatches(re, f.SSE) || f.WS.matches(re) {
 			return true
 		}
 		for _, m := range f.GRPC {
@@ -219,7 +219,7 @@ func (dc decoded) matches(re *regexp.Regexp) bool {
 		}
 	}
 	for _, it := range dc.quic {
-		if headers(it.Headers) || re.Match(it.Data) || re.Match(it.Body.Decoded) || sseMatches(re, it.SSE) {
+		if headers(it.Headers) || re.Match(it.Data) || re.Match(it.Body.Decoded) || sseMatches(re, it.SSE) || it.WS.matches(re) {
 			return true
 		}
 	}
@@ -273,6 +273,9 @@ func (f http2Frame) housekeeping() bool {
 	case "HEADERS", "PUSH_PROMISE", "CONTINUATION":
 		return f.Headers == nil && !f.HeadersLost && f.Body.Encoding == ""
 	case "DATA":
+		if f.WS != nil { // pings, pongs, or part of a frame header
+			return f.WS.housekeeping()
+		}
 		return len(f.Data) == 0 && len(f.Body.Decoded) == 0 && f.Body.Err == "" && sseEvents(f.SSE) == 0 ||
 			sseKeepAlive(f.IsSSE, f.SSE, f.Body)
 	}
@@ -297,6 +300,8 @@ func (it quicItem) housekeeping() bool {
 		return false
 	case strings.HasPrefix(it.HTTP3, "stream: "), it.HTTP3 == "SETTINGS", it.HTTP3 == "MAX_PUSH_ID":
 		return true
+	case it.WS != nil:
+		return it.WS.housekeeping()
 	case strings.HasPrefix(it.HTTP3, "DATA"):
 		return len(it.Data) == 0 && len(it.Body.Decoded) == 0 && it.Body.Err == "" && sseEvents(it.SSE) == 0 ||
 			sseKeepAlive(it.IsSSE, it.SSE, it.Body)

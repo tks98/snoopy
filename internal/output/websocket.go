@@ -11,14 +11,19 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/tks98/snoopy/v2/internal/tracer"
 )
 
 // WebSocket (RFC 6455) is followed on HTTP/1.1 connections that switch to
 // it: after a 101 response with "Upgrade: websocket", each direction is a
 // stream of frames, which can be split across calls or come several to a
-// call. A client's frames are masked, and unmasked here. Messages compressed
-// with permessage-deflate (RFC 7692), when the handshake negotiated it, are
+// call. On HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220), a stream whose extended
+// CONNECT for WebSocket got a 2xx response is the same, in its DATA frames'
+// payloads: each direction of a wsConn is then a direction of the stream.
+// A client's frames are masked, and unmasked here. Messages compressed with
+// permessage-deflate (RFC 7692), when the handshake negotiated it, are
 // decompressed when their last frame ends. A connection whose handshake
 // wasn't seen, because it started before snoopy, is shown as raw data.
 
@@ -86,6 +91,9 @@ type wsPart struct {
 	Partial int
 	// Err says why decoding stopped for this direction of the connection.
 	Err string
+	// Rest is, on HTTP/2 and HTTP/3, the bytes from where the framing was
+	// lost on, shown as sent. (HTTP/1.x shows them as a raw segment.)
+	Rest []byte
 }
 
 // wsConn follows a WebSocket connection's frames, in both directions.
@@ -141,6 +149,14 @@ func newWSConn(headers [][2]string, server tracer.Direction) *wsConn {
 	if !websocket {
 		return nil
 	}
+	return newWSStream(extensions, server)
+}
+
+// newWSStream returns a decoder for a WebSocket connection whose handshake's
+// response, sent in direction server, accepted these extensions (its
+// Sec-WebSocket-Extensions values): on HTTP/1.1 a 101, on HTTP/2 and HTTP/3
+// a 2xx response to an extended CONNECT.
+func newWSStream(extensions []string, server tracer.Direction) *wsConn {
 	c := &wsConn{}
 	for _, ext := range strings.Split(strings.Join(extensions, ","), ",") {
 		params := strings.Split(ext, ";")
@@ -168,6 +184,31 @@ func newWSConn(headers [][2]string, server tracer.Direction) *wsConn {
 	return c
 }
 
+// wsConnect reports whether a request's header fields are an extended
+// CONNECT for WebSocket, on HTTP/2 (RFC 8441, section 4) or HTTP/3 (RFC
+// 9220).
+func wsConnect(fields []hpack.HeaderField) bool {
+	method, _ := headerField(fields, ":method")
+	protocol, _ := headerField(fields, ":protocol")
+	return method == "CONNECT" && strings.EqualFold(protocol, "websocket")
+}
+
+// wsAccept returns the decoder for a stream whose extended CONNECT for
+// WebSocket got a response with these header fields, sent in direction
+// server; nil if it didn't accept it: only a 2xx response does.
+func wsAccept(fields []hpack.HeaderField, server tracer.Direction) *wsConn {
+	if status, _ := headerField(fields, ":status"); len(status) != 3 || status[0] != '2' {
+		return nil
+	}
+	var extensions []string
+	for _, f := range fields {
+		if f.Name == "sec-websocket-extensions" {
+			extensions = append(extensions, f.Value)
+		}
+	}
+	return newWSStream(extensions, server)
+}
+
 // webSocket reports whether an event is on a connection that switched to
 // WebSocket, and doesn't start a new HTTP/2 one reusing its handle. HTTP/2
 // is then left out: it takes a call that starts with what looks like its
@@ -187,47 +228,72 @@ func (c *wsConn) atFrame(dir tracer.Direction) bool {
 	return d.stopped || !d.inFrame && len(d.hdr) == 0
 }
 
-// segments decodes the next bytes of a direction: as frames, and as raw
-// bytes once the framing is lost.
-func (c *wsConn) segments(dir tracer.Direction, data []byte) []http1Segment {
+// decode decodes the next bytes of a direction, for HTTP/1.1 and for
+// HTTP/2's and HTTP/3's streams alike: the frames in them, and if the
+// framing is lost in them, why and the bytes from there on (Err and Rest).
+// It returns nil once the framing was lost before: the bytes are then only
+// data.
+func (c *wsConn) decode(dir tracer.Direction, data []byte) *wsPart {
 	d := &c.dirs[dir]
 	if d.stopped {
-		return []http1Segment{{raw: data}}
+		return nil
 	}
 	frames, rest, err := d.add(data)
 	part := &wsPart{Frames: frames}
 	if !d.inFrame {
 		part.Partial = len(d.hdr)
 	}
-	segs := []http1Segment{{ws: part}}
 	if err != nil {
-		part.Err = d.stop(err)
-		if len(rest) > 0 {
-			segs = append(segs, http1Segment{raw: rest})
-		}
+		part.Err, part.Rest = d.stop(err), rest
 	}
-	return segs
+	return part
 }
 
-// lose accounts for n bytes of a direction that weren't captured, which
-// followed segs; why says why (see missingWhy). They can be skipped in a
-// frame's payload; anywhere else, the framing is lost.
-func (c *wsConn) lose(dir tracer.Direction, segs []http1Segment, n int, why string) []http1Segment {
+// skip accounts for n bytes of a direction that weren't captured, which
+// followed what part (nil if none) holds of the call; why says why (see
+// missingWhy). They can be skipped in a frame's payload; anywhere else, the
+// framing is lost. It returns part, or a new one if part is nil, or nil if
+// the framing was lost before.
+func (c *wsConn) skip(dir tracer.Direction, part *wsPart, n int, why string) *wsPart {
 	d := &c.dirs[dir]
 	if d.stopped {
-		return segs
+		return part
 	}
-	var part *wsPart
-	if k := len(segs); k > 0 && segs[k-1].ws != nil {
-		part = segs[k-1].ws
-	} else {
+	if part == nil {
 		part = &wsPart{}
-		segs = append(segs, http1Segment{ws: part})
 	}
 	frames, err := d.lose(n, why, part.Frames)
 	part.Frames = frames
 	if err != nil {
 		part.Err, part.Partial = d.stop(err), 0
+	}
+	return part
+}
+
+// segments decodes the next bytes of an HTTP/1.1 connection's direction: as
+// frames, and as raw bytes once the framing is lost.
+func (c *wsConn) segments(dir tracer.Direction, data []byte) []http1Segment {
+	part := c.decode(dir, data)
+	if part == nil {
+		return []http1Segment{{raw: data}}
+	}
+	segs := []http1Segment{{ws: part}}
+	if len(part.Rest) > 0 {
+		segs = append(segs, http1Segment{raw: part.Rest})
+		part.Rest = nil
+	}
+	return segs
+}
+
+// lose accounts for n bytes of an HTTP/1.1 connection's direction that
+// weren't captured, which followed segs (see skip).
+func (c *wsConn) lose(dir tracer.Direction, segs []http1Segment, n int, why string) []http1Segment {
+	var part *wsPart
+	if k := len(segs); k > 0 && segs[k-1].ws != nil {
+		part = segs[k-1].ws
+	}
+	if p := c.skip(dir, part, n, why); p != nil && part == nil {
+		segs = append(segs, http1Segment{ws: p})
 	}
 	return segs
 }
@@ -682,6 +748,9 @@ func (t *Text) writeWebSocket(b *strings.Builder, p *wsPart) {
 	if p.Err != "" {
 		b.WriteString(t.warn("["+p.Err+"]") + "\n")
 	}
+	if len(p.Rest) > 0 {
+		t.writeBody(b, p.Rest, "", 0, "")
+	}
 }
 
 // briefWebSocket describes an event's WebSocket frames: a message's size
@@ -748,7 +817,7 @@ func (p *wsPart) matches(re *regexp.Regexp) bool {
 			return true
 		}
 	}
-	return false
+	return re.Match(p.Rest)
 }
 
 // redact returns a copy of the frames with secrets masked in their
@@ -776,6 +845,7 @@ func (p *wsPart) redact(r *redactStreams, data, decoded redactKey) *wsPart {
 		f.Body.Decoded = r.text(decoded, f.Body.Decoded)
 		out.Frames[i] = f
 	}
+	out.Rest = redactText(p.Rest)
 	return &out
 }
 
@@ -806,11 +876,18 @@ type jsonWSFrame struct {
 // and why decoding stopped, if it did.
 func jsonWebSocket(segs []http1Segment, redact bool) (frames []jsonWSFrame, stopped string) {
 	for _, s := range segs {
-		if s.ws == nil {
-			continue
+		if s.ws != nil {
+			frames = append(frames, jsonWSFrames(s.ws, redact)...)
+			stopped = cmpOr(stopped, s.ws.Err)
 		}
-		stopped = cmpOr(stopped, s.ws.Err)
-		for _, f := range s.ws.Frames {
+	}
+	return frames, stopped
+}
+
+// jsonWSFrames returns the frames of a part, for JSON; nil for none.
+func jsonWSFrames(p *wsPart, redact bool) (frames []jsonWSFrame) {
+	if p != nil {
+		for _, f := range p.Frames {
 			jf := jsonWSFrame{Opcode: wsOpcodeName(f.Opcode), Fin: f.Fin, Masked: f.Masked, Compressed: f.Compressed,
 				Length: f.Length, Continued: f.Continued, DataBytes: len(f.Data), End: f.endsMessage(),
 				CloseCode: f.CloseCode, CloseReason: f.CloseReason, Body: newJSONBody(f.Body)}
@@ -829,5 +906,5 @@ func jsonWebSocket(segs []http1Segment, redact bool) (frames []jsonWSFrame, stop
 			frames = append(frames, jf)
 		}
 	}
-	return frames, stopped
+	return frames
 }

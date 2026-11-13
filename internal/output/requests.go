@@ -18,7 +18,9 @@ import (
 // order, on HTTP/2 and HTTP/3 by stream), keeping no bodies, only their
 // sizes. A response whose body ends with its connection, or that hasn't
 // ended when snoopy stops, isn't shown, unless it was streaming: a
-// streaming response (see progress) also gets a line before its end.
+// streaming response (see progress) also gets a line before its end. An
+// event stream ends at OpenAI's "data: [DONE]" (sseDone), past which its
+// Python SDK doesn't read.
 type Requests struct {
 	w        io.Writer
 	opts     Options
@@ -147,7 +149,7 @@ func (r *Requests) line(e *harEntry, streaming bool) string {
 		return b.String()
 	}
 	if resp.seen {
-		b.WriteString(", " + sizeOf(resp))
+		b.WriteString(", " + cmpOr(e.tunnel, sizeOf(resp)))
 		if isEventStream(ct) || resp.events > 0 {
 			b.WriteString(", " + fmt.Sprint(resp.events) + " " + plural(resp.events, "event", "events"))
 		}

@@ -506,9 +506,23 @@ signature finding against real binaries (see
   frame can pass it. Text and `--brief` show a message's frames in one
   call as one (`wsRuns`); pings and pongs are housekeeping. `--requests`
   ends an exchange at a 101's headers (`headersOnly`), which it didn't
-  before, so upgrades weren't shown. WebSocket over HTTP/2 (extended
-  CONNECT, RFC 8441) isn't decoded: it would mean following
-  `:protocol websocket` streams in http2.go and the HTTP/2 printers.
+  before, so upgrades weren't shown.
+  WebSocket over HTTP/2 and HTTP/3 (extended CONNECT, RFC 8441 and 9220):
+  `wsConnect` spots the request, `wsAccept` the 2xx response, made into
+  a `wsConn` by `newWSStream` from its `sec-websocket-extensions` (as
+  `newWSConn` does for a 101). HTTP/2 keeps the offers and accepted
+  streams on the `http2Conn` (`wsOffers`, `ws`, forgotten at RST_STREAM
+  or both END_STREAMs); HTTP/3, whose directions are separate `quicDir`s,
+  keeps the offer on the client's and puts the `wsConn` on both
+  directions' `quicStream`s, found through `quicDir.peer` (the other
+  direction, set per packet). DATA payloads (padding left out) go to
+  `wsConn.decode`, the per-direction decoder HTTP/1 uses too (its
+  `segments` wraps it), and come out as `http2Frame.WS` and
+  `quicItem.WS`, which the printers, folding, `--grep` and `--redact`
+  handle as they do `http1Segment.ws`; bytes after an invalid header are
+  `wsPart.Rest`. HAR ends a CONNECT's exchange at its 2xx response
+  (`harEntry.tunnel`), so `--requests` prints its line then, and the
+  streaming line never fires for it.
   `TestWebSocket` (an integration test in `package tracer_test`, since
   output imports tracer) checks a real library, coder/websocket in
   `internal/tracer/testdata/wsgo`, with context takeover, and
@@ -518,6 +532,13 @@ signature finding against real binaries (see
   websockets 17.4, Node's ws 8.23 and gorilla/websocket 1.5.3 decoded
   cleanly as clients and servers, with and without context takeover and
   with window bits from 8 to 15.
+  `TestWebSocketStreams` checks HTTP/2 (net/http's server, x/net/http2's
+  client, `GODEBUG=http2xconnect=1`) and HTTP/3 (quic-go) with
+  `testdata/wsstreams`, which frames WebSocket itself: no library there
+  speaks RFC 8441 or 9220. Its quic-go client needs its own
+  `quic.Transport`: `quic.DialAddr`'s uses zero-length connection IDs,
+  so the server's short headers are 2 or 3 bytes, under the 5 that
+  `go_quic_header` wants, and its packets aren't captured.
 - **`--requests`** (`output/requests.go`) is the HAR writer's pairing with
   no entries kept (`maxKept` 0, so bodies are only counted) and a `done`
   hook, called once per exchange when its response ends: an HTTP/2 or
@@ -550,7 +571,13 @@ signature finding against real binaries (see
   (`SSE`/`sse`, `IsSSE` on all of a stream's), so Text, Brief (which doesn't
   fold them), JSON (`sse_events`), redaction (each event whole), `--grep`
   and HAR's event count all read them there. Once a compressed stream's
-  decoding stops, the rest isn't read as events (`stopped`).
+  decoding stops, the rest isn't read as events (`stopped`). For
+  `--requests` (HAR's `done`), a response ends at a `data: [DONE]` event
+  (`sseDone`): OpenAI's Python SDK breaks out of its loop there and closes
+  the connection without reading the chunked body's last chunk, so its
+  calls never got their last line. `TestSSELLMStreams` has the shapes of
+  OpenAI's, Anthropic's and Gemini's streams, and `TestSSEHTTP3` traces
+  `testdata/quicgo`'s `/events` end to end.
 - **`--brief`'s folding** (`output/fold.go`): once a body's first call is
   shown, calls carrying only more of it (`bodyRefs`) are counted, not
   shown, and the call that ends it says how many. Folded calls aren't

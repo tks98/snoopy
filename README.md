@@ -89,7 +89,8 @@ the output, JSON and pcap, containers, and troubleshooting.
   messages decoded as protobuf, without needing the schema, or with their
   fields' names given one (`--proto`), streamed responses (Server-Sent
   Events), e.g. from LLM APIs, shown event by event as they arrive, and
-  WebSocket messages, unmasked and decompressed (permessage-deflate).
+  WebSocket messages, unmasked and decompressed (permessage-deflate), over
+  HTTP/1.1, HTTP/2 and HTTP/3.
 - **Where:** running processes, those started while snoopy runs, and
   processes in containers. On Kubernetes, `kubectl snoopy POD` traces a pod
   from your machine ([docs/kubernetes.md](docs/kubernetes.md)).

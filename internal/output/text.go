@@ -312,6 +312,8 @@ func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int)
 			fmt.Fprintf(b, "%s: %s\n", t.header(escapeText([]byte(h.Name))), value)
 		}
 		switch {
+		case f.WS != nil:
+			t.writeWebSocket(b, f.WS)
 		case f.IsGRPC:
 			t.writeGRPC(b, f)
 		case f.IsSSE:
@@ -400,6 +402,8 @@ func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
 			}
 			b.WriteString(t.dim(line) + "\n")
 			switch {
+			case it.WS != nil:
+				t.writeWebSocket(b, it.WS)
 			case it.IsSSE:
 				t.writeSSE(b, it.SSE, it.Data, it.Offset, it.Body, it.ContentType, false)
 			case it.Body.Encoding != "":

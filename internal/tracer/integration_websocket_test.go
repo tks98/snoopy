@@ -30,6 +30,34 @@ import (
 // checks that snoopy's JSON output has each message, decompressed, from
 // both ends of both directions.
 func TestWebSocket(t *testing.T) {
+	// As in testdata/wsgo/main.go.
+	short := strings.Repeat("snoopy decodes WebSocket messages. ", 8)
+	long := strings.Repeat("a long message that compresses well, ", 2000)
+	traceWebSocket(t, "wsgo", nil, nil, short, short, long, "fragment one, fragment two", "\x00\x01\x02 binary")
+}
+
+// TestWebSocketStreams does the same for WebSocket over a stream of an
+// HTTP/2 connection (RFC 8441) and of an HTTP/3 one (RFC 9220), with
+// net/http and quic-go (testdata/wsstreams, which frames WebSocket itself).
+func TestWebSocketStreams(t *testing.T) {
+	// As in testdata/wsstreams/main.go.
+	short := strings.Repeat("snoopy decodes WebSocket over HTTP/2 and HTTP/3. ", 8)
+	long := strings.Repeat("a long message that compresses well, ", 2000)
+	for _, tc := range []struct {
+		name string
+		env  []string
+	}{{"h2", []string{"GODEBUG=http2xconnect=1"}}, {"h3", nil}} {
+		t.Run(tc.name, func(t *testing.T) {
+			traceWebSocket(t, "wsstreams", []string{tc.name}, tc.env, short, short, long, "fragment one, fragment two", "\x00\x01\x02 binary")
+		})
+	}
+}
+
+// traceWebSocket builds the test program in testdata/name, runs it with
+// args and env added to the environment, while tracing it, and checks that
+// it sent and received the messages, each compressed, and a close with
+// the status 1000 and the reason "done".
+func traceWebSocket(t *testing.T, name string, args, env []string, messages ...string) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root")
 	}
@@ -40,17 +68,17 @@ func TestWebSocket(t *testing.T) {
 		}
 		t.Skip("go not installed")
 	}
-	program := filepath.Join(t.TempDir(), "wsgo")
+	program := filepath.Join(t.TempDir(), name)
 	build := exec.Command(goTool, "build", "-o", program, ".")
-	build.Dir = "testdata/wsgo"
+	build.Dir = filepath.Join("testdata", name)
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build WebSocket program: %v: %s", err, out)
+		t.Fatalf("build %s: %v: %s", name, err, out)
 	}
 	targets, err := discover.Inspect(program)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr, err := tracer.New(tracer.Options{Comm: "wsgo"})
+	tr, err := tracer.New(tracer.Options{Comm: name})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,15 +109,16 @@ func TestWebSocket(t *testing.T) {
 		}
 	}()
 
-	if out, err := exec.Command(program).CombinedOutput(); err != nil || string(out) != "ok\n" {
-		t.Fatalf("WebSocket program: %v: %s", err, out)
+	cmd := exec.Command(program, args...)
+	cmd.Env = append(os.Environ(), env...)
+	var stderr bytes.Buffer // quic-go warns there about UDP buffer sizes
+	cmd.Stderr = &stderr
+	if out, err := cmd.Output(); err != nil || string(out) != "ok\n" {
+		t.Fatalf("%s: %v: %s%s", name, err, out, stderr.Bytes())
 	}
 
-	// As in testdata/wsgo/main.go.
-	short := strings.Repeat("snoopy decodes WebSocket messages. ", 8)
-	long := strings.Repeat("a long message that compresses well, ", 2000)
 	want := map[string]int{}
-	for _, m := range []string{short, short, long, "fragment one, fragment two", "\x00\x01\x02 binary"} {
+	for _, m := range messages {
 		want[m] += 4 // the client's write, the server's read, and the echo's write and read
 	}
 	var got map[string]int
@@ -103,10 +132,10 @@ func TestWebSocket(t *testing.T) {
 		if len(errs) > 0 {
 			t.Fatalf("decoding failed: %q (%+v)", errs, stats)
 		}
-		// The close frame is the client's, written and read; the 101
+		// The close frame is the client's, written and read; the handshake's
 		// response is written and read; context takeover compresses every
 		// message.
-		if fmt.Sprint(got) == fmt.Sprint(want) && stats.closes >= 2 && stats.upgrades == 2 && stats.compressed == 20 {
+		if fmt.Sprint(got) == fmt.Sprint(want) && stats.closes >= 2 && stats.upgrades == 2 && stats.compressed == 4*len(messages) {
 			return
 		}
 	}
@@ -122,12 +151,14 @@ func TestWebSocket(t *testing.T) {
 }
 
 // wsStats counts close frames with status 1000 and the reason "done", 101
-// responses, and compressed messages.
+// responses (or, on HTTP/2 and HTTP/3, 200 responses), and compressed
+// messages.
 type wsStats struct{ closes, upgrades, compressed int }
 
 // decodeWebSocket prints events as snoopy --json does and returns the
 // WebSocket messages they hold, counted, what else it counts, and why
-// decoding failed, if it did.
+// decoding failed, if it did: on HTTP/1.1 connections, and on HTTP/2 and
+// HTTP/3 streams.
 func decodeWebSocket(t *testing.T, evs []*tracer.Event) (msgs map[string]int, stats wsStats, errs []string) {
 	t.Helper()
 	// Events from different CPUs can arrive out of order; each connection's
@@ -151,8 +182,17 @@ func decodeWebSocket(t *testing.T, evs []*tracer.Event) (msgs map[string]int, st
 			Error   string  `json:"error"`
 		} `json:"body"`
 	}
+	type stream struct {
+		Stream  uint64 `json:"stream"`
+		Headers []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"headers"`
+		WebSocket      []frame `json:"websocket"`
+		WebSocketError string  `json:"websocket_error"`
+	}
 	msgs = map[string]int{}
-	pending := map[string]string{} // by connection and direction
+	pending := map[string]string{} // by connection, direction and stream
 	sc := bufio.NewScanner(&buf)
 	sc.Buffer(nil, 4<<20)
 	for sc.Scan() {
@@ -162,41 +202,51 @@ func decodeWebSocket(t *testing.T, evs []*tracer.Event) (msgs map[string]int, st
 			HTTP1     []struct {
 				Status int `json:"status"`
 			} `json:"http1"`
-			WebSocket      []frame `json:"websocket"`
-			WebSocketError string  `json:"websocket_error"`
+			WebSocket      []frame  `json:"websocket"`
+			WebSocketError string   `json:"websocket_error"`
+			HTTP2          []stream `json:"http2"`
+			HTTP3          []stream `json:"http3"`
 		}
 		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
 			t.Fatal(err)
-		}
-		if ev.WebSocketError != "" {
-			errs = append(errs, ev.WebSocketError)
 		}
 		for _, p := range ev.HTTP1 {
 			if p.Status == 101 {
 				stats.upgrades++
 			}
 		}
-		key := ev.ConnID + " " + ev.Direction
-		for _, f := range ev.WebSocket {
-			switch {
-			case f.Opcode == "close":
-				if f.End && f.CloseCode == 1000 && f.CloseReason == "done" {
-					stats.closes++
+		streams := append([]stream{{WebSocket: ev.WebSocket, WebSocketError: ev.WebSocketError}}, append(ev.HTTP2, ev.HTTP3...)...)
+		for _, s := range streams {
+			for _, h := range s.Headers {
+				if h.Name == ":status" && h.Value == "200" {
+					stats.upgrades++
 				}
-			case f.Opcode == "ping" || f.Opcode == "pong":
-			case f.Body != nil && f.Body.Error != "":
-				errs = append(errs, f.Body.Error)
-			case f.Body != nil && f.Body.Decoded != nil:
-				msgs[*f.Body.Decoded]++
-				stats.compressed++
-				delete(pending, key)
-			default:
-				if f.Payload != nil {
-					pending[key] += *f.Payload
-				}
-				if f.End {
-					msgs[pending[key]]++
+			}
+			if s.WebSocketError != "" {
+				errs = append(errs, s.WebSocketError)
+			}
+			key := fmt.Sprintf("%s %s %d", ev.ConnID, ev.Direction, s.Stream)
+			for _, f := range s.WebSocket {
+				switch {
+				case f.Opcode == "close":
+					if f.End && f.CloseCode == 1000 && f.CloseReason == "done" {
+						stats.closes++
+					}
+				case f.Opcode == "ping" || f.Opcode == "pong":
+				case f.Body != nil && f.Body.Error != "":
+					errs = append(errs, f.Body.Error)
+				case f.Body != nil && f.Body.Decoded != nil:
+					msgs[*f.Body.Decoded]++
+					stats.compressed++
 					delete(pending, key)
+				default:
+					if f.Payload != nil {
+						pending[key] += *f.Payload
+					}
+					if f.End {
+						msgs[pending[key]]++
+						delete(pending, key)
+					}
 				}
 			}
 		}

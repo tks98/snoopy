@@ -283,8 +283,27 @@ direction from a call whose bytes weren't all captured (raise
 `--max-size`), if a frame header was among them; bytes missing inside a
 message only keep it from being decompressed, and, if its sender keeps its
 compression context from message to message, the later ones that refer
-back to it. WebSocket over HTTP/2 (RFC 8441) is shown as the HTTP/2
-stream's DATA.
+back to it.
+
+WebSocket over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) runs on one stream,
+opened with an extended CONNECT (`:method CONNECT`, `:protocol websocket`);
+once a 2xx response accepts it, the stream's DATA is shown as WebSocket
+frames in the same way, under each DATA frame's line:
+
+```console
+08:08:01.369960 wsstreams (pid 17730, tid 17736) crypto/tls.(*Conn).Write 127.0.0.1:38084 > 127.0.0.1:36881  66 bytes  26µs  fd 8, conn 0x242f73a16008
+HTTP/2 DATA stream=1 length=57
+WebSocket text length=51 [FIN,compressed]
+[permessage-deflate: 51 bytes decoded to 392]
+snoopy decodes WebSocket over HTTP/2 and HTTP/3. snoopy decodes WebSocket over HTTP/2 and HTTP/3. ...
+```
+
+and with `--brief`:
+
+```console
+08:07:33.337368 wsstreams[17533] 127.0.0.1:58476 > 127.0.0.1:36725 TLS 26: HTTP/2 DATA s1 WebSocket continuation (text) 11 bytes (permessage-deflate, 26 decoded): fragment one, fragment two
+08:07:33.378263 wsstreams[17541] 127.0.0.1:43162 > 127.0.0.1:47152 QUIC 26: HTTP/3 DATA s0 WebSocket close 1000 (normal closure): done
+```
 
 `--brief` shows a large body's first call and the one that ends it, with
 how many were folded in between; `--verbose` shows each:
@@ -321,8 +340,9 @@ shows at once rather than when it ends: an event stream
 (`text/event-stream`) when its headers arrive, and any other response that's
 still arriving a second after its headers when more of it does. That line
 ends with `streaming` and the time the headers took; the one at the end
-says how many events an event stream had. Both start with the request's
-time:
+says how many events an event stream had. An event stream ends at an
+OpenAI-style `data: [DONE]` event, since OpenAI's Python SDK stops reading
+there, before the body's end. Both start with the request's time:
 
 ```console
 $ sudo snoopy --comm curl --requests
@@ -336,7 +356,9 @@ Requests and responses are paired as in [HAR files](#har-files). A response
 that hasn't ended when snoopy stops isn't shown, nor one whose body ends
 only when its connection closes, but for the first line of one that was
 streaming. A WebSocket handshake is shown when its response arrives, as
-`→ 101, websocket`; its messages aren't requests. `--count` counts
+`→ 101, websocket`, or on HTTP/2 and HTTP/3 as `CONNECT https://host/path
+HTTP/2 → 200, websocket` (another CONNECT's as `tunnel`); its messages
+aren't requests. `--count` counts
 requests then, by their last lines, and
 `--method`, `--path` and `--status` apply to them.
 
@@ -462,8 +484,8 @@ Each line is one call to a TLS read or write function:
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 | `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, `ring::aead seal`, `ring::aead open`, `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt`, `EVP_CipherUpdate`, `cipher.AEAD.Seal`, `cipher.AEAD.Open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
 | `sse_events` | For a `text/event-stream` body, on its `http1` body pieces and `http2` and `http3` DATA frames (and the trailers that end one): the server-sent events the bytes completed, each with `event` (its name, if it had one), `id` and `retry` if it had them, `data` (its data lines, joined by newlines), `comments`, `bytes` (its length in the body as decoded), and `truncated` (larger than 1 MiB, of which that much is kept) or `incomplete` (the body ended before it did). A comment on its own, which servers send to keep the connection open, is an event with only `comments`. With `--redact`, secrets in `data`, `id` and comments are masked. |
-| `websocket` | On a connection that switched to WebSocket, its frames in the data, or the parts of them: `opcode` (`text`, `binary`, `continuation`, `close`, `ping`, `pong`), `message` (a continuation frame's message type), `fin`, `masked`, `compressed` (permessage-deflate), `length` (the payload's), `continued` (more of a frame whose header was in an earlier event), `data_bytes`, the payload in this event, unmasked, as `payload` (UTF-8) or `payload_base64`, `close_code` and `close_reason`, and `end` on the frame that ends its message, and on a whole control frame. A compressed message's payload is in `body` (see below), on the frame that ends it. With `--redact`, payloads are masked as bodies are, and `payload_base64` left out. |
-| `websocket_error` | Why WebSocket decoding stopped for this direction of the connection, e.g. because bytes of a frame header weren't captured. Later events of it have no `websocket`. |
+| `websocket` | On a connection that switched to WebSocket, and on the `http2` and `http3` DATA frames of a stream that's a WebSocket (RFC 8441, RFC 9220), its frames in the data, or the parts of them: `opcode` (`text`, `binary`, `continuation`, `close`, `ping`, `pong`), `message` (a continuation frame's message type), `fin`, `masked`, `compressed` (permessage-deflate), `length` (the payload's), `continued` (more of a frame whose header was in an earlier event), `data_bytes`, the payload in this event, unmasked, as `payload` (UTF-8) or `payload_base64`, `close_code` and `close_reason`, and `end` on the frame that ends its message, and on a whole control frame. A compressed message's payload is in `body` (see below), on the frame that ends it. With `--redact`, payloads are masked as bodies are, and `payload_base64` left out. |
+| `websocket_error` | Why WebSocket decoding stopped for this direction of the connection (or of the HTTP/2 or HTTP/3 stream, on its DATA frame), e.g. because bytes of a frame header weren't captured. Later events of it have no `websocket`. |
 | `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, on the WebSocket frame that ends a compressed message (`permessage-deflate`), and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
 
 Fields that don't apply are left out.
@@ -488,7 +510,7 @@ POST /v1/charges]`, or `answers` in JSON). A request from before snoopy
 started has no method or path to match. With `--har`, whole entries are
 kept or left out; `--pcap` isn't filtered. A WebSocket connection's
 messages go with the handshake's request, whose response's status is
-101. The summary at the end says how
+101 (on HTTP/2 and HTTP/3, 200). The summary at the end says how
 many calls were left out.
 
 `--grep REGEXP` keeps the calls in which a regular expression (Go's syntax)
