@@ -43,10 +43,10 @@ make integration-vm KERNEL=5.10   # the same on another kernel, with vimto
   `SNOOPY_TEST_LEGACY_UPROBES=1` attaches a link per probe, as kernels
   before 6.6 do, on a kernel that has uprobe_multi links; CI runs the
   tests both ways.
-  `TestQuicGoHTTP3` and `TestSSEHTTP3` download quic-go with the Go
-  toolchain, for the test program in `internal/tracer/testdata/quicgo`,
-  which is its own module, and `TestWebSocket` coder/websocket, for
-  `testdata/wsgo`.
+  `TestQuicGoHTTP3`, `TestQuicGoDialAddr` and `TestSSEHTTP3` download
+  quic-go with the Go toolchain, for the test program in
+  `internal/tracer/testdata/quicgo`, which is its own module, and
+  `TestWebSocket` coder/websocket, for `testdata/wsgo`.
 - `SNOOPY_BORINGSSL_TEST` and `SNOOPY_FREEBL_TEST` check the signature-based
   finding against real browser binaries; see
   [CONTRIBUTING.md](CONTRIBUTING.md).

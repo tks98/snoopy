@@ -149,9 +149,9 @@ func runH3() error {
 	go srv.Serve(udp)
 	defer srv.Close()
 
-	// A Transport of its own gives the client connection IDs (4 bytes):
-	// quic.DialAddr's has none, which makes the server's short headers
-	// too short for snoopy to take the packets for QUIC.
+	// A Transport of its own gives the client connection IDs (4 bytes), as
+	// http3.Transport's default does; quic.DialAddr's zero-length ones are
+	// TestQuicGoDialAddr's.
 	clientUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return err

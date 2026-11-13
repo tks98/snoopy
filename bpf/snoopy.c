@@ -2951,15 +2951,20 @@ static __always_inline void go_aead_args(struct pt_regs *ctx, struct go_aead_arg
 // Go programs use AES-GCM for other things too, so the associated data has
 // to look like a QUIC packet's header (RFC 9000, section 17), not just be
 // unlike a TLS record's: the fixed bit set, and a long header's version 1
-// or 2.
+// or 2. A short header can be as short as 2 bytes, the flags and a 1-byte
+// packet number, when its destination's connection ID is zero-length, as a
+// client's from quic.DialAddr is; classify_aad has checked there are 2. So
+// only the flags are read first, and the version only for a long header,
+// which always has it.
 static __always_inline bool go_quic_header(__u64 ad, __u64 ad_len)
 {
 	__u8 h[5] = {};
-	if (classify_aad(ad, ad_len) != AAD_QUIC || ad_len < sizeof(h) ||
-	    bpf_probe_read_user(h, sizeof(h), (void *)ad) || !(h[0] & 0x40))
+	if (classify_aad(ad, ad_len) != AAD_QUIC || bpf_probe_read_user(h, 1, (void *)ad) || !(h[0] & 0x40))
 		return false;
 	if (!(h[0] & 0x80))
 		return true;
+	if (ad_len < sizeof(h) || bpf_probe_read_user(h, sizeof(h), (void *)ad))
+		return false;
 	__u32 version = (__u32)h[1] << 24 | (__u32)h[2] << 16 | (__u32)h[3] << 8 | h[4];
 	return version == 1 || version == 0x6b3343cf;
 }

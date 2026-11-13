@@ -209,6 +209,14 @@ func wsAccept(fields []hpack.HeaderField, server tracer.Direction) *wsConn {
 	return newWSStream(extensions, server)
 }
 
+// negotiated returns d, a direction whose frames were read before the
+// handshake's response (see wsEarly), with the extensions that n, the same
+// direction as the response set it up, has.
+func (d wsDir) negotiated(n wsDir) wsDir {
+	d.deflate, d.takeover, d.otherExt = n.deflate, n.takeover, n.otherExt
+	return d
+}
+
 // webSocket reports whether an event is on a connection that switched to
 // WebSocket, and doesn't start a new HTTP/2 one reusing its handle. HTTP/2
 // is then left out: it takes a call that starts with what looks like its

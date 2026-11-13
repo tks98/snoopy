@@ -453,6 +453,29 @@ stops: a long run, or one that's killed, keeps what it captured. A large
 log is rewritten less often. `--har -` writes to stdout once, when snoopy
 stops. `--redact` applies to it as to the other outputs.
 
+A WebSocket connection is the entry of its upgrade request (an HTTP/1.1
+GET with its 101 response, or an HTTP/2 or HTTP/3 CONNECT with its 200),
+with `_resourceType` `websocket` and its messages in
+`_webSocketMessages`, as Chrome writes them (and shows them, in the
+request's Messages tab, once imported): each message is `type` (`send` or
+`receive`, from the traced program's side), `time` (seconds since the
+epoch, when its last byte was seen), `opcode` (1 for text, 2 for binary) and
+`data`, the text or, for binary, base64. A message is listed once it ends,
+however it was split into frames, and compressed ones
+(permessage-deflate) as they decompressed. Pings and pongs aren't listed,
+and close frames are said in the entry's `comment`, with their status
+codes; the entry's `time` lasts until the last frame. An entry keeps up to
+100000 messages, 16 MiB of them in all and 4 MiB of each; the comment says
+how many more were left out or cut, and which messages had bytes that
+weren't captured (see `--max-size`). With `--redact`, secrets in text
+messages are masked and binary messages' `data` is left empty.
+
+A `text/event-stream` response's events are also listed in
+`_eventSourceMessages`, as Chrome lists them (`time`, `eventName`, which is
+`message` for an event with no `event` field, `eventId` and `data`),
+keep-alive comments left out. Events after a `[DONE]` are listed too,
+though `--requests` ends the exchange there. The body is kept as it is.
+
 ## JSON output
 
 Each line is one call to a TLS read or write function:

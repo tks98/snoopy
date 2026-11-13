@@ -13,9 +13,12 @@ import (
 // only the destination's, whose length its receiver chose. So a connection is
 // learned from its long headers, the IDs it issues later from its
 // NEW_CONNECTION_ID frames, and its short headers are matched against the
-// IDs learned. A connection whose handshake wasn't seen, or which uses
-// zero-length IDs, is followed by its socket instead, as Chromium's and
-// Firefox's are anyway.
+// IDs learned. A connection whose handshake wasn't seen, or where either
+// side uses zero-length IDs (quic-go's clients from quic.DialAddr do), is
+// followed by its socket instead, as Chromium's and Firefox's are anyway.
+// Such a client has a socket to itself, but a server's connections from
+// several of them at once share one and can't be told apart: their packets
+// are decoded as one connection's, mixed together.
 
 // cidConn is a connection identified by its connection IDs.
 type cidConn struct {
@@ -59,10 +62,14 @@ func (c *cidConns) of(ev *tracer.Event) *cidConn {
 	}
 	send := ev.Function.Direction() == tracer.Write
 	if h[0]&0x80 == 0 {
-		// A short header: flags, then the receiver's ID.
+		// A short header: flags, then the receiver's ID, then a packet
+		// number of 1 to 4 bytes. The ID may be zero-length, and then the
+		// header is 2 to 5 bytes; counting the packet number's first byte
+		// keeps the rest of it from being taken for an ID of 4 bytes or
+		// more, as most stacks' are.
 		own := !send
 		for _, n := range c.lens[cidLenKey{ev.PID, own}] {
-			if len(h) >= 1+n {
+			if len(h) >= 2+n {
 				if cc := c.conns[cidKey{ev.PID, own, string(h[1 : 1+n])}]; cc != nil {
 					return cc
 				}

@@ -190,7 +190,10 @@ header. quinn encrypts a packet where it's then sent from, so a send whose
 buffer starts at a packet the BPF program saw encrypted gives the packet's
 socket, and its destination is sent to user space with the packet's header,
 which tells whose peer it is. Connections whose handshake wasn't seen, or
-that use zero-length IDs, are followed by their socket as before.
+that use zero-length IDs, are followed by their socket as before. A client
+with zero-length IDs (quic-go's `quic.DialAddr` gives one) has a socket to
+itself, but a server's connections from several such clients at once share
+its socket and can't be told apart, so their packets are decoded together.
 
 ## WebSocket
 

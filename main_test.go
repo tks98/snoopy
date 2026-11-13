@@ -258,7 +258,7 @@ func TestPipelineAddresses(t *testing.T) {
 	long := func(dcid, scid []byte) []byte {
 		return append(append([]byte{0xc3, 0, 0, 0, 1, byte(len(dcid))}, dcid...), append([]byte{byte(len(scid))}, scid...)...)
 	}
-	short := func(dcid []byte) []byte { return append([]byte{0x41}, dcid...) }
+	short := func(dcid []byte) []byte { return append(append([]byte{0x41}, dcid...), 0x00, 0x07) } // and a packet number
 	crypto := []byte{0x06, 0x00, 0x01, 0xff}
 	// A STREAM frame on stream 0 with an HTTP/3 DATA frame.
 	data := []byte{0x0f, 0x00, 0x00, 0x07, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'}

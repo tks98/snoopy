@@ -25,7 +25,19 @@ type http1Conn struct {
 	dirs     [2]http1Dir // by tracer.Direction
 	headSent bool        // the last request was HEAD, so its response has no body
 	ws       *wsConn     // once it switched to WebSocket
-	lastUsed uint64
+	// Events come in the order their calls returned, and a write can
+	// return after the peer has read what it sent, so the two directions'
+	// calls around a switch to WebSocket can come out of order. wsAsk is
+	// set from a request asking for the switch until its response, with
+	// the request's direction and the extensions it offered (see wsEarly);
+	// wsLate from a 101 whose request wasn't seen, until wsAskDir's next
+	// call, which may be that request.
+	wsAsk     bool
+	wsAskDir  tracer.Direction
+	wsAskExt  []string
+	wsLate    bool
+	wsGuessed bool // ws was started by wsEarly, before the 101
+	lastUsed  uint64
 }
 
 // What the next bytes of a direction are.
@@ -82,6 +94,9 @@ type http1Segment struct {
 	sse   []sseEvent
 	// ws is set on the segments of a connection that switched to WebSocket.
 	ws *wsPart
+	// lateRequest is set on a request that came after its 101 response,
+	// whose call returned first (see http1Conn.wsLate).
+	lateRequest bool
 }
 
 const (
@@ -157,6 +172,9 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 	for len(data) > 0 {
 		switch d.state {
 		case h1Start:
+			if !startsHTTP1(data) && conn.wsEarly(d) {
+				continue
+			}
 			if !startsHTTP1(data) {
 				if startLinePrefix(data) { // the start line continues in the next call
 					d.head, d.state = append(d.head[:0], data...), h1Head
@@ -225,6 +243,15 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 			return append(segs, d.bodySegment(data, data, decodeBody(d.body, data, false), false))
 		case h1WS:
 			dir := conn.dirOf(d)
+			if conn.wsLate && dir == conn.wsAskDir {
+				conn.wsLate = false
+				if end := headEnd(data); end >= 0 && http1Request.Match(data) && conn.ws.atFrame(dir) {
+					m, _ := parseHTTP1(data[:end])
+					segs = append(segs, http1Segment{msg: &m, ends: true, lateRequest: true})
+					data = data[end:]
+					continue
+				}
+			}
 			if conn.ws.atFrame(dir) && startsHTTP1(data) { // a new connection with the same handle
 				conn.dirs, conn.ws, conn.headSent = [2]http1Dir{}, nil, false
 				continue
@@ -288,13 +315,12 @@ func (conn *http1Conn) startBody(d *http1Dir, m httpMessage, pool *bodyPool) {
 	if response, ok := strings.CutPrefix(m.startLine, "HTTP/"); ok {
 		_, rest, _ := strings.Cut(response, " ")
 		status, _ := strconv.Atoi(strings.TrimSpace(rest[:min(3, len(rest))]))
+		if status >= 200 {
+			conn.wsRefused()
+		}
 		switch {
 		case status == 101: // switching protocols, e.g. to WebSocket
-			state := h1Gone
-			if conn.ws = newWSConn(m.headers, conn.dirOf(d)); conn.ws != nil {
-				state = h1WS
-			}
-			conn.dirs[tracer.Read], conn.dirs[tracer.Write] = http1Dir{state: state}, http1Dir{state: state}
+			conn.switchProtocols(m.headers, conn.dirOf(d))
 			return
 		case status < 200 || status == 204 || status == 304 || conn.headSent:
 			return // no body
@@ -308,6 +334,15 @@ func (conn *http1Conn) startBody(d *http1Dir, m httpMessage, pool *bodyPool) {
 	} else {
 		method, _, _ := strings.Cut(m.startLine, " ")
 		conn.headSent = method == "HEAD"
+		conn.wsAsk, conn.wsAskExt = false, nil
+		if method == "GET" && hasToken(header("Upgrade"), "websocket") {
+			conn.wsAsk, conn.wsAskDir = true, conn.dirOf(d)
+			for _, h := range m.headers {
+				if strings.EqualFold(strings.TrimSpace(h[0]), "Sec-WebSocket-Extensions") {
+					conn.wsAskExt = append(conn.wsAskExt, h[1])
+				}
+			}
+		}
 		switch {
 		case method == "CONNECT": // a tunnel follows
 			d.state = h1Gone
@@ -330,6 +365,66 @@ func (conn *http1Conn) startBody(d *http1Dir, m httpMessage, pool *bodyPool) {
 			d.sse = newSSEStream(d.body != nil)
 		}
 	}
+}
+
+// hasToken reports whether a comma-separated header value has a token, in
+// any case.
+func hasToken(value, token string) bool {
+	for _, p := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(p), token) {
+			return true
+		}
+	}
+	return false
+}
+
+// switchProtocols follows a connection that a 101 response, sent in
+// direction server with these headers, switched to another protocol: to
+// WebSocket, from its next bytes in each direction, if it says so.
+func (conn *http1Conn) switchProtocols(headers [][2]string, server tracer.Direction) {
+	client := opposite(server)
+	asked, early := conn.wsAsk, conn.ws
+	guessed := conn.wsGuessed
+	conn.wsAsk, conn.wsAskExt, conn.wsGuessed, conn.wsLate = false, nil, false, false
+	state := h1Gone
+	if conn.ws = newWSConn(headers, server); conn.ws != nil {
+		state = h1WS
+		// Without the request before it, the request's call returned after
+		// this one: it may come next, before the client's frames.
+		conn.wsLate, conn.wsAskDir = !asked, client
+	}
+	clientDir := conn.dirs[client]
+	conn.dirs[tracer.Read], conn.dirs[tracer.Write] = http1Dir{state: state}, http1Dir{state: state}
+	if guessed && conn.ws != nil { // keep reading the frames wsEarly started on
+		conn.ws.dirs[client] = early.dirs[client].negotiated(conn.ws.dirs[client])
+		conn.dirs[client] = clientDir
+	}
+}
+
+// wsEarly starts reading a direction as WebSocket when bytes that aren't
+// HTTP/1.x follow its request to switch to WebSocket before the response
+// came (see wsAsk): the server's write of the 101 can return after it read
+// the client's first frames. The offered extensions stand in for the
+// accepted ones until the response. It reports whether it did.
+func (conn *http1Conn) wsEarly(d *http1Dir) bool {
+	dir := conn.dirOf(d)
+	if !conn.wsAsk || conn.wsGuessed || dir != conn.wsAskDir {
+		return false
+	}
+	conn.ws, conn.wsGuessed = newWSStream(conn.wsAskExt, opposite(dir)), true
+	d.state = h1WS
+	return true
+}
+
+// wsRefused gives up on a switch to WebSocket that a final response other
+// than 101 refused. If wsEarly took the client's bytes for frames, there's
+// no telling where its next message starts.
+func (conn *http1Conn) wsRefused() {
+	if conn.wsGuessed {
+		conn.dirs[conn.wsAskDir] = http1Dir{state: h1Gone}
+		conn.ws = nil
+	}
+	conn.wsAsk, conn.wsAskExt, conn.wsGuessed = false, nil, false
 }
 
 // chunked reads chunked framing from b: it returns how many bytes it used,

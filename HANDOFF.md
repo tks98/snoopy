@@ -403,13 +403,18 @@ signature finding against real binaries (see
   `tls.Conn`'s methods, stripped binaries included, but only in programs
   with quic-go (`quicGoFunc`): every Go TLS record goes through them, and
   other code uses AES-GCM too. `go_quic_header` also wants a plausible QUIC
-  header. Their thirteen argument words spill to the stack on amd64
-  (`go_aead_args`). `Seal` emits at entry and notes the packet for
-  `sealed_packets`; `Open` is pushed for every call, so `(*tls.Conn).Read`'s
-  depth matching holds, and emits at its RETs. quic-go uses one
-  unconnected socket and separate goroutines like quinn, so the same
-  `quic_procs`, packet-sent notices and connection IDs give sockets and
-  peers.
+  header: the fixed bit, and a long header's version. It reads the version
+  only for a long header, since a short header to a zero-length connection
+  ID, as quic-go's `quic.DialAddr` clients get, is only the flags and the
+  packet number, 2 to 5 bytes (`TestQuicGoDialAddr`). Their thirteen
+  argument words spill to the stack on amd64 (`go_aead_args`). `Seal`
+  emits at entry and notes the packet for `sealed_packets`; `Open` is
+  pushed for every call, so `(*tls.Conn).Read`'s depth matching holds, and
+  emits at its RETs. quic-go uses one unconnected socket and separate
+  goroutines like quinn, so the same `quic_procs`, packet-sent notices and
+  connection IDs give sockets and peers. A `quic.DialAddr` client has a
+  socket of its own and zero-length IDs, so is followed by socket; a server
+  with several such clients at once can't tell them apart (`cidConns`).
 - **Warnings for quiet failures:** `quic_traffic` counts, per traced
   process, datagrams on UDP sockets connected to port 443 (`note_udp443`,
   only the datagram syscalls, up to 64) and untraceable Firefox packets;
@@ -507,6 +512,21 @@ signature finding against real binaries (see
   call as one (`wsRuns`); pings and pongs are housekeeping. `--requests`
   ends an exchange at a 101's headers (`headersOnly`), which it didn't
   before, so upgrades weren't shown.
+  Events come in the order their calls returned, and a write can return
+  after the peer has read what it sent, so the handshake can come out of
+  order with the other direction (seen under load in CI, with
+  coder/websocket over net/http). On the server, a read of the client's
+  first frame (net/http's background read of a byte, then the rest) can
+  come before the server's write of the 101: `wsEarly` then starts
+  reading the request's direction as WebSocket, with the extensions the
+  request offered, when bytes that aren't HTTP/1 follow an upgrade request
+  (`wsAsk`), and `switchProtocols` keeps those frames and applies what the
+  101 accepted (`wsDir.negotiated`); a refusal leaves that direction
+  `h1Gone`. On the client, the read of the 101 can come before the write
+  of its request: `wsLate` takes the request direction's next call, if
+  it's a request, as that request (`http1Segment.lateRequest`, which HAR
+  and the filters pair with the 101) rather than a new connection on the
+  handle. `TestWebSocketHandshakeOutOfOrder` has both.
   WebSocket over HTTP/2 and HTTP/3 (extended CONNECT, RFC 8441 and 9220):
   `wsConnect` spots the request, `wsAccept` the 2xx response, made into
   a `wsConn` by `newWSStream` from its `sec-websocket-extensions` (as
@@ -535,10 +555,8 @@ signature finding against real binaries (see
   `TestWebSocketStreams` checks HTTP/2 (net/http's server, x/net/http2's
   client, `GODEBUG=http2xconnect=1`) and HTTP/3 (quic-go) with
   `testdata/wsstreams`, which frames WebSocket itself: no library there
-  speaks RFC 8441 or 9220. Its quic-go client needs its own
-  `quic.Transport`: `quic.DialAddr`'s uses zero-length connection IDs,
-  so the server's short headers are 2 or 3 bytes, under the 5 that
-  `go_quic_header` wants, and its packets aren't captured.
+  speaks RFC 8441 or 9220. Its quic-go client has its own
+  `quic.Transport`, as the quicgo program's does by default.
 - **`--requests`** (`output/requests.go`) is the HAR writer's pairing with
   no entries kept (`maxKept` 0, so bodies are only counted) and a `done`
   hook, called once per exchange when its response ends: an HTTP/2 or
@@ -596,6 +614,24 @@ signature finding against real binaries (see
   file renamed over the old one, every `harInterval` while the log
   changes, less often if writing takes long. HAR's printer has a mutex for
   that, since its writer runs in its own goroutine.
+- **WebSocket messages and server-sent events in HAR**
+  (`output/har_websocket.go`) follow Chrome's DevTools, whose import reads
+  them: `_webSocketMessages` and `_resourceType` on the upgrade request's
+  entry, `_eventSourceMessages` on an event stream's (devtools-frontend's
+  `models/har/Log.ts` and `Importer.ts`, and the protocol's
+  `Network.WebSocketFrame`, a whole message whose data is base64 unless
+  its opcode is 1). `harEntry.webSocket` takes an event's `wsPart`, from
+  the HTTP/1 segments after a 101, and joins each direction's frames into
+  messages (`pending`), compressed ones from the last frame's `Body`;
+  bytes missing from a message show as fewer captured than its frames'
+  lengths. Control frames aren't messages, as in DevTools; closes go in
+  the comment. Only kept entries collect them, so `--requests` (`maxKept`
+  0) doesn't, and its durations stay at the 101. The limits
+  (`maxHARMessages` and the byte limits) are per entry, counted in the
+  comment past them. Over HTTP/2 and HTTP/3, `HAR.data` gives a stream's
+  `WS` parts to `webSocket` instead of adding its DATA to a body, and
+  `isWebSocket` goes by `tunnel`. `sseDone` only calls `done`, so events
+  after a `[DONE]` are still listed.
 - **The Java agent is embedded** (`internal/javaagent/jars`), for `go
   install`: committed, built by `make jars` with the release's JDK, and
   checked by CI as the BPF objects are. `build.sh` dates the jars'
