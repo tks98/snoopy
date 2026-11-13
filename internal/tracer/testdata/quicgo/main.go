@@ -16,6 +16,10 @@
 // certificate, and prints each response's status and body. For one port and
 // a path under /events, it prints the body's pieces as they arrive instead,
 // each on a line of its own after the time since the response's headers.
+// With QUICGO_DIAL=addr, each connection is dialed with quic.DialAddrEarly
+// instead, which gives it a socket of its own and a zero-length connection
+// ID, so the server's short headers are only 2 to 5 bytes; with
+// QUICGO_DIAL=default, http3.Transport dials as it does by default.
 //
 // It has its own module, so quic-go isn't a dependency of snoopy's.
 package main
@@ -153,21 +157,25 @@ es.addEventListener("done", e => { show(e); es.close(); out.textContent += "clos
 </script>`
 
 func get(ports []string, path string) {
-	// One socket for every connection, as quic-go's Transport does.
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		panic(err)
-	}
-	tr := &quic.Transport{Conn: conn}
-	rt := &http3.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error) {
+	rt := &http3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	switch os.Getenv("QUICGO_DIAL") {
+	case "addr":
+		rt.Dial = quic.DialAddrEarly
+	case "default":
+	default:
+		// One socket for every connection, as quic-go's Transport does.
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			panic(err)
+		}
+		tr := &quic.Transport{Conn: conn}
+		rt.Dial = func(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error) {
 			udp, err := net.ResolveUDPAddr("udp", addr)
 			if err != nil {
 				return nil, err
 			}
 			return tr.DialEarly(ctx, udp, tlsConf, conf)
-		},
+		}
 	}
 	defer rt.Close()
 	client := &http.Client{Transport: rt}

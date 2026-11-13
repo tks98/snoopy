@@ -904,6 +904,10 @@ bpftrace -e "uprobe:$B:$F { printf(\"pt=%d ad=%d\n\", reg(\"r8\"), reg(\"r11\"))
   could again.
 - **Garbage or nothing:** the arguments moved. Rerun the bpftrace session
   above and update `go_aead_args`.
+- **Only one direction:** `go_quic_header` turned the other's packets
+  away. A short header to a zero-length connection ID is 2 to 5 bytes, so
+  nothing past its first byte can be required of it; print `ad_len` in the
+  bpftrace session above to see the lengths a program uses.
 - **To test:** `TestQuicGoHTTP3` builds `internal/tracer/testdata/quicgo`,
   its own module, so updating quic-go there doesn't touch snoopy's
   dependencies (`go get github.com/quic-go/quic-go@latest` in that
