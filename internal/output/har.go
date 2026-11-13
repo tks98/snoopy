@@ -97,6 +97,9 @@ type harEntry struct {
 	// accepted, what its stream carries since: the extended CONNECT's
 	// :protocol (e.g. websocket), else "tunnel".
 	tunnel string
+	// ws is what's kept of the WebSocket messages or server-sent events
+	// that follow the request (har_websocket.go).
+	ws *harWS
 }
 
 type harMessage struct {
@@ -155,7 +158,7 @@ func (h *HAR) Print(ev *tracer.Event) error {
 			case it.HTTP3 == "HEADERS" && it.Headers != nil:
 				h.headers(c, ev, dir, it.Stream, it.Headers, "HTTP/3")
 			case strings.HasPrefix(it.HTTP3, "DATA"):
-				h.data(c, ev, dir, it.Stream, it.Data, it.Body, it.SSE)
+				h.data(c, ev, dir, it.Stream, it.Data, it.Body, it.SSE, it.WS)
 			}
 		}
 	case dc.isHTTP2:
@@ -164,21 +167,26 @@ func (h *HAR) Print(ev *tracer.Event) error {
 			case f.Headers != nil:
 				h.headers(c, ev, dir, uint64(f.Stream), f.Headers, "HTTP/2")
 				if f.IsSSE { // trailers ending an event stream
-					h.data(c, ev, dir, uint64(f.Stream), nil, bodyPart{}, f.SSE)
+					h.data(c, ev, dir, uint64(f.Stream), nil, bodyPart{}, f.SSE, nil)
 				}
 			case f.Type == "DATA":
-				h.data(c, ev, dir, uint64(f.Stream), f.Data, f.Body, f.SSE)
+				h.data(c, ev, dir, uint64(f.Stream), f.Data, f.Body, f.SSE, f.WS)
 			}
 		}
 	default:
 		for _, s := range dc.http1 {
 			switch {
+			case s.ws != nil:
+				if e := c.current[dir]; e != nil {
+					e.webSocket(ev.Time, dir, s.ws)
+				}
 			case s.msg != nil:
 				h.http1Message(c, ev, dir, s.msg)
 			case s.inBody || s.body.Encoding != "":
 				if e := c.current[dir]; e != nil {
 					e.add(dir, s.raw, s.payload, s.body)
 					e.side(dir).events += sseEvents(s.sse)
+					e.sse(ev.Time, s.sse)
 					e.end = ev.Time
 					h.touch(e, dir)
 					if dir != e.reqDir && sseDone(s.sse) {
@@ -364,13 +372,18 @@ func (h *HAR) headers(c *harConn, ev *tracer.Event, dir tracer.Direction, stream
 	}
 }
 
-func (h *HAR) data(c *harConn, ev *tracer.Event, dir tracer.Direction, stream uint64, data []byte, part bodyPart, events []sseEvent) {
+func (h *HAR) data(c *harConn, ev *tracer.Event, dir tracer.Direction, stream uint64, data []byte, part bodyPart, events []sseEvent, ws *wsPart) {
 	e := c.streams.get(stream)
 	if e == nil {
 		return
 	}
+	if ws != nil { // a WebSocket's frames, which are its messages, not a body
+		e.webSocket(ev.Time, dir, ws)
+		return
+	}
 	e.add(dir, data, data, part)
 	e.side(dir).events += sseEvents(events)
+	e.sse(ev.Time, events)
 	e.end = ev.Time
 	h.touch(e, dir)
 	if dir != e.reqDir && sseDone(events) {
@@ -548,6 +561,10 @@ func (h *HAR) encode(w io.Writer) error {
 		PID      uint32         `json:"_pid"`
 		Comment  string         `json:"comment,omitempty"`
 		Contain  string         `json:"_container,omitempty"`
+		// Chrome's (see har_websocket.go).
+		ResourceType string              `json:"_resourceType,omitempty"`
+		WSMessages   *[]harWSMessageJSON `json:"_webSocketMessages,omitempty"`
+		SSEMessages  []harSSEEventJSON   `json:"_eventSourceMessages,omitempty"`
 	}
 	var entries []entry
 	for _, e := range h.entries {
@@ -601,6 +618,19 @@ func (h *HAR) encode(w io.Writer) error {
 		case !resp.seen:
 			out.Comment = "no response was seen"
 		}
+		messages, events, notes := e.ws.json(h.redact)
+		if e.isWebSocket() {
+			out.ResourceType = "websocket"
+			if messages == nil {
+				messages = []harWSMessageJSON{}
+			}
+			out.WSMessages = &messages
+		}
+		out.SSEMessages = events
+		if out.Comment != "" {
+			notes = append([]string{out.Comment}, notes...)
+		}
+		out.Comment = strings.Join(notes, "; ")
 		entries = append(entries, out)
 	}
 	if entries == nil {

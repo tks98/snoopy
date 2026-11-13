@@ -590,6 +590,24 @@ signature finding against real binaries (see
   file renamed over the old one, every `harInterval` while the log
   changes, less often if writing takes long. HAR's printer has a mutex for
   that, since its writer runs in its own goroutine.
+- **WebSocket messages and server-sent events in HAR**
+  (`output/har_websocket.go`) follow Chrome's DevTools, whose import reads
+  them: `_webSocketMessages` and `_resourceType` on the upgrade request's
+  entry, `_eventSourceMessages` on an event stream's (devtools-frontend's
+  `models/har/Log.ts` and `Importer.ts`, and the protocol's
+  `Network.WebSocketFrame`, a whole message whose data is base64 unless
+  its opcode is 1). `harEntry.webSocket` takes an event's `wsPart`, from
+  the HTTP/1 segments after a 101, and joins each direction's frames into
+  messages (`pending`), compressed ones from the last frame's `Body`;
+  bytes missing from a message show as fewer captured than its frames'
+  lengths. Control frames aren't messages, as in DevTools; closes go in
+  the comment. Only kept entries collect them, so `--requests` (`maxKept`
+  0) doesn't, and its durations stay at the 101. The limits
+  (`maxHARMessages` and the byte limits) are per entry, counted in the
+  comment past them. Over HTTP/2 and HTTP/3, `HAR.data` gives a stream's
+  `WS` parts to `webSocket` instead of adding its DATA to a body, and
+  `isWebSocket` goes by `tunnel`. `sseDone` only calls `done`, so events
+  after a `[DONE]` are still listed.
 - **The Java agent is embedded** (`internal/javaagent/jars`), for `go
   install`: committed, built by `make jars` with the release's JDK, and
   checked by CI as the BPF objects are. `build.sh` dates the jars'

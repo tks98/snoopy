@@ -219,18 +219,21 @@ func TestWebSocketHTTP2NotAccepted(t *testing.T) {
 	}
 }
 
-// HTTP/3: the same, with QPACK's static table and literals.
-func TestWebSocketHTTP3(t *testing.T) {
+// wsHTTP3 returns the events of a WebSocket over HTTP/3, with QPACK's
+// static table and literals: the handshake, a compressed message from the
+// client, and the server's reply in two DATA frames, out of order, and a
+// ping; and the client's message's frame.
+func wsHTTP3(t *testing.T) (evs []*tracer.Event, msg []byte) {
 	// :method CONNECT (static 15), :scheme https (23), :protocol, :authority
 	// and :path as literals; then :status 200 (25).
 	req := cat([]byte{0x00, 0x00, 0xcf, 0xd7}, literalField(":protocol", "websocket"),
 		literalField(":authority", "example.com"), literalField(":path", "/chat"))
 	resp := cat([]byte{0x00, 0x00, 0xd9}, literalField("sec-websocket-extensions", "permessage-deflate; server_no_context_takeover"))
 	z := &deflater{}
-	msg := wsFrameBytes(wsText, true, true, wsKey, z.message(t, "hello over HTTP/3, hello over HTTP/3"))
+	msg = wsFrameBytes(wsText, true, true, wsKey, z.message(t, "hello over HTTP/3, hello over HTTP/3"))
 	reply := wsFrameBytes(wsText, true, false, nil, []byte("hi back"))
 	ping := wsFrameBytes(wsPing, true, false, nil, nil)
-	evs := []*tracer.Event{
+	evs = []*tracer.Event{
 		quicEvent(tracer.FuncQUICSend, streamFrameBytes(0, 0, h3Frame(0x01, req), false)),
 		quicEvent(tracer.FuncQUICRecv, streamFrameBytes(0, 0, h3Frame(0x01, resp), false)),
 		quicEvent(tracer.FuncQUICSend, streamFrameBytes(0, uint64(len(h3Frame(0x01, req))), h3Frame(0x00, msg), false)),
@@ -239,6 +242,12 @@ func TestWebSocketHTTP3(t *testing.T) {
 			cat(h3Frame(0x00, reply[4:]), h3Frame(0x00, ping)), false)),
 		quicEvent(tracer.FuncQUICRecv, streamFrameBytes(0, uint64(len(h3Frame(0x01, resp))), h3Frame(0x00, reply[:4]), false)),
 	}
+	return evs, msg
+}
+
+// HTTP/3: the same, with QPACK's static table and literals.
+func TestWebSocketHTTP3(t *testing.T) {
+	evs, msg := wsHTTP3(t)
 	got, hidden := textOf(t, Options{}, evs...)
 	if !strings.Contains(got[1], "HTTP/3 HEADERS stream=0\n:status: 200\n") {
 		t.Errorf("response:\n%s", got[1])
