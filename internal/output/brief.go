@@ -144,6 +144,8 @@ func briefQUIC(items []quicItem, verbose bool) string {
 			parts = append(parts, fmt.Sprintf("%s s%d: %s", it.HTTP3, it.Stream, it.Err))
 		case it.Headers != nil:
 			parts = append(parts, fmt.Sprintf("%s s%d %s%s", it.HTTP3, it.Stream, briefFields(it.Headers), bodyNote(it.Body)))
+		case strings.HasPrefix(it.HTTP3, "DATA") && briefSSE(it.SSE) != "":
+			parts = append(parts, fmt.Sprintf("DATA s%d %s", it.Stream, briefSSE(it.SSE)))
 		case strings.HasPrefix(it.HTTP3, "DATA"):
 			parts = append(parts, fmt.Sprintf("DATA s%d %d bytes%s", it.Stream, len(it.Data), bodyNote(it.Body)))
 		default:
@@ -190,6 +192,8 @@ func briefHTTP2(frames []http2Frame, verbose bool) string {
 			if len(f.GRPC) > 1 {
 				p += "s"
 			}
+		case f.Type == "DATA" && briefSSE(f.SSE) != "":
+			p = fmt.Sprintf("DATA s%d %s", f.Stream, briefSSE(f.SSE))
 		case f.Type == "DATA":
 			p = fmt.Sprintf("DATA s%d %d bytes%s", f.Stream, len(f.Data), bodyNote(f.Body))
 		case f.Stream != 0 && f.Type != "CONTINUATION":
@@ -275,6 +279,9 @@ func briefHTTP1(segs []http1Segment) string {
 		case s.msg != nil:
 			flushBody()
 			parts = append(parts, briefMessage(s.msg))
+		case briefSSE(s.sse) != "":
+			flushBody()
+			parts = append(parts, briefSSE(s.sse))
 		case !s.inBody:
 			if len(s.raw) > 0 { // the rest of a header block, or not HTTP
 				parts = append(parts, briefData(s.raw))

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,11 @@ type HAR struct {
 	// ended: an HTTP/2 or HTTP/3 stream's end or reset, or an HTTP/1.x
 	// response's last body byte.
 	done func(*harEntry)
+	// progress, if set, is called after each event that carried a
+	// response's headers or some of its body but didn't end it, with the
+	// event's time.
+	progress func(*harEntry, time.Time)
+	touched  []*harEntry // by the event being printed, for progress
 }
 
 // maxHARBody bounds how much of a body a HAR entry keeps, and maxHAREntries
@@ -82,9 +88,11 @@ type harEntry struct {
 	container  string
 	server     netip.AddrPort
 	conn       string
-	kept       bool // in HAR.entries
-	ended      bool // done was called for it
-	reset      bool // its stream was reset
+	respAt     time.Time // when the response's headers arrived
+	kept       bool      // in HAR.entries
+	ended      bool      // done was called for it
+	reset      bool      // its stream was reset
+	announced  bool      // Requests printed it as streaming
 }
 
 type harMessage struct {
@@ -102,6 +110,7 @@ type harMessage struct {
 	length    int    // the body's own bytes (Content-Length's), framing left out
 	decoded   int    // the body's length decoded, if it has a Content-Encoding, kept or not
 	encoding  string // its Content-Encoding, if any
+	events    int    // server-sent events in a text/event-stream body
 	truncated bool
 }
 
@@ -142,7 +151,7 @@ func (h *HAR) Print(ev *tracer.Event) error {
 			case it.HTTP3 == "HEADERS" && it.Headers != nil:
 				h.headers(c, ev, dir, it.Stream, it.Headers, "HTTP/3")
 			case strings.HasPrefix(it.HTTP3, "DATA"):
-				h.data(c, ev, dir, it.Stream, it.Data, it.Body)
+				h.data(c, ev, dir, it.Stream, it.Data, it.Body, it.SSE)
 			}
 		}
 	case dc.isHTTP2:
@@ -150,8 +159,11 @@ func (h *HAR) Print(ev *tracer.Event) error {
 			switch {
 			case f.Headers != nil:
 				h.headers(c, ev, dir, uint64(f.Stream), f.Headers, "HTTP/2")
+				if f.IsSSE { // trailers ending an event stream
+					h.data(c, ev, dir, uint64(f.Stream), nil, bodyPart{}, f.SSE)
+				}
 			case f.Type == "DATA":
-				h.data(c, ev, dir, uint64(f.Stream), f.Data, f.Body)
+				h.data(c, ev, dir, uint64(f.Stream), f.Data, f.Body, f.SSE)
 			}
 		}
 	default:
@@ -162,7 +174,9 @@ func (h *HAR) Print(ev *tracer.Event) error {
 			case s.inBody || s.body.Encoding != "":
 				if e := c.current[dir]; e != nil {
 					e.add(dir, s.raw, s.payload, s.body)
+					e.side(dir).events += sseEvents(s.sse)
 					e.end = ev.Time
+					h.touch(e, dir)
 				}
 			}
 			if e := c.current[dir]; s.ends && e != nil && dir != e.reqDir {
@@ -178,7 +192,23 @@ func (h *HAR) Print(ev *tracer.Event) error {
 			h.ended(e)
 		}
 	}
+	if h.progress != nil {
+		for _, e := range h.touched {
+			if !e.ended {
+				h.progress(e, ev.Time)
+			}
+		}
+		h.touched = h.touched[:0]
+	}
 	return nil
+}
+
+// touch notes that an event carried part of an exchange's response, for
+// progress.
+func (h *HAR) touch(e *harEntry, dir tracer.Direction) {
+	if h.progress != nil && dir != e.reqDir && !slices.Contains(h.touched, e) {
+		h.touched = append(h.touched, e)
+	}
 }
 
 // ended tells done, once, that an exchange's response has ended.
@@ -256,8 +286,9 @@ func (h *HAR) http1Message(c *harConn, ev *tracer.Event, dir tracer.Direction, m
 			e = h.newEntry(ev, version, opposite(dir))
 		}
 		e.resp = harMessage{seen: true, status: n, reason: reason, version: version, headers: m.headers}
-		e.end = ev.Time
+		e.end, e.respAt = ev.Time, ev.Time
 		c.current[dir] = e
+		h.touch(e, dir)
 		return
 	}
 	method, rest, _ := strings.Cut(m.startLine, " ")
@@ -311,7 +342,8 @@ func (h *HAR) headers(c *harConn, ev *tracer.Event, dir tracer.Direction, stream
 			c.streams.set(stream, e)
 		}
 		e.resp = harMessage{seen: true, status: n, version: version, headers: headers}
-		e.end = ev.Time
+		e.end, e.respAt = ev.Time, ev.Time
+		h.touch(e, dir)
 	case e != nil: // trailers
 		m := e.side(dir)
 		m.headers = append(m.headers, headers...)
@@ -319,13 +351,15 @@ func (h *HAR) headers(c *harConn, ev *tracer.Event, dir tracer.Direction, stream
 	}
 }
 
-func (h *HAR) data(c *harConn, ev *tracer.Event, dir tracer.Direction, stream uint64, data []byte, part bodyPart) {
+func (h *HAR) data(c *harConn, ev *tracer.Event, dir tracer.Direction, stream uint64, data []byte, part bodyPart, events []sseEvent) {
 	e := c.streams.get(stream)
 	if e == nil {
 		return
 	}
 	e.add(dir, data, data, part)
+	e.side(dir).events += sseEvents(events)
 	e.end = ev.Time
+	h.touch(e, dir)
 }
 
 // add adds bytes of the message's body as sent, and what they decoded to

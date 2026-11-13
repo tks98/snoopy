@@ -51,7 +51,8 @@ type http1Dir struct {
 	chunk int
 	line  []byte // a chunk-size or trailer line so far
 	body  *bodyDecoder
-	info  bodyInfo // of the body being read
+	info  bodyInfo   // of the body being read
+	sse   *sseStream // for a text/event-stream body
 }
 
 // http1Segment is a part of an event's data: a start line and headers, or
@@ -72,6 +73,10 @@ type http1Segment struct {
 	// its bytes came before these (chunked framing included).
 	contentType string
 	offset      int64
+	// For a text/event-stream body: isSSE, and the events these bytes
+	// completed.
+	isSSE bool
+	sse   []sseEvent
 }
 
 const (
@@ -185,7 +190,7 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 		case h1Length:
 			n := min(int64(len(data)), d.left)
 			d.left -= n
-			seg := d.bodySegment(data[:n], data[:n], decodeBody(d.body, data[:n], d.left == 0))
+			seg := d.bodySegment(data[:n], data[:n], decodeBody(d.body, data[:n], d.left == 0), d.left == 0)
 			seg.ends = d.left == 0
 			segs = append(segs, seg)
 			if d.left == 0 {
@@ -194,7 +199,7 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 			data = data[n:]
 		case h1Chunked:
 			n, body, done, ok := d.chunked(data)
-			seg := d.bodySegment(data[:n], body, decodeBody(d.body, body, done && ok))
+			seg := d.bodySegment(data[:n], body, decodeBody(d.body, body, done && ok), done && ok)
 			if !ok {
 				// Lost track of the framing; wait for the next message.
 				d.endBody(errors.New("bad chunked framing"))
@@ -210,7 +215,7 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 			}
 			data = data[n:]
 		case h1ToClose:
-			return append(segs, d.bodySegment(data, data, decodeBody(d.body, data, false)))
+			return append(segs, d.bodySegment(data, data, decodeBody(d.body, data, false), false))
 		default: // h1Gone
 			return append(segs, http1Segment{raw: data})
 		}
@@ -218,10 +223,12 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 	return segs
 }
 
-// bodySegment returns the segment for bytes of the body being read.
-func (d *http1Dir) bodySegment(raw, payload []byte, part bodyPart) http1Segment {
+// bodySegment returns the segment for bytes of the body being read; last
+// is set if they end it.
+func (d *http1Dir) bodySegment(raw, payload []byte, part bodyPart, last bool) http1Segment {
 	seg := http1Segment{raw: raw, payload: payload, inBody: true, body: part, contentType: d.info.contentType, offset: d.info.seen}
 	d.info.seen += int64(len(raw))
+	seg.sse, seg.isSSE = d.sse.feed(payload, part, last)
 	return seg
 }
 
@@ -285,10 +292,13 @@ func (conn *http1Conn) startBody(d *http1Dir, m httpMessage, pool *bodyPool) {
 		d.state = h1Start
 		return
 	}
-	d.chunk, d.line = chunkSize, nil
+	d.chunk, d.line, d.sse = chunkSize, nil, nil
 	if d.state != h1Start {
 		d.body = pool.start(header("Content-Encoding"))
 		d.info = bodyInfo{contentType: header("Content-Type")}
+		if isEventStream(d.info.contentType) {
+			d.sse = newSSEStream(d.body != nil)
+		}
 	}
 }
 
@@ -355,6 +365,7 @@ func join(parts [][]byte) []byte {
 func (d *http1Dir) lose(n int) *bodyDecoder {
 	dec := d.body
 	d.info.seen += int64(n)
+	d.sse.lose()
 	switch d.state {
 	case h1Length:
 		d.endBody(errors.New("bytes of the body weren't captured (raise --max-size)"))

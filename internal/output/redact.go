@@ -455,6 +455,7 @@ func (dc decoded) redact(r *redactStreams, conn harConnKey, dir tracer.Direction
 		s.msg = redactMessage(s.msg)
 		s.raw = r.text(key(partRaw, 0), s.raw)
 		s.body.Decoded = r.text(key(partDecoded, 0), s.body.Decoded)
+		s.sse = redactSSE(s.sse)
 		segs[i] = s
 	}
 	if dc.http1 != nil {
@@ -473,6 +474,7 @@ func (dc decoded) redact(r *redactStreams, conn harConnKey, dir tracer.Direction
 		if f.GRPC != nil {
 			f.GRPC = msgs
 		}
+		f.SSE = redactSSE(f.SSE)
 		frames[i] = f
 	}
 	if dc.http2 != nil {
@@ -487,6 +489,7 @@ func (dc decoded) redact(r *redactStreams, conn harConnKey, dir tracer.Direction
 			it.Data = redactText(it.Data) // a summary's details
 		}
 		it.Body.Decoded = r.text(key(partFrameDecoded, it.Stream), it.Body.Decoded)
+		it.SSE = redactSSE(it.SSE)
 		items[i] = it
 	}
 	if dc.quic != nil {

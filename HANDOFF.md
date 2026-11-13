@@ -481,7 +481,29 @@ signature finding against real binaries (see
   isn't shown. `--count` counts its lines, and the pipeline asks it how
   many (`Shown`). HTTP/1 segments carry the body's own bytes
   (`payload`, chunked framing left out), which HAR keeps; before, it kept
-  a chunked body's framing.
+  a chunked body's framing. A `progress` hook, after each event carrying
+  part of a response that didn't end it, prints a first line ending in
+  `streaming` for an event stream at its headers, and for any other
+  response once more of it arrives `streamingAfter` (1 s) after them
+  (`harEntry.announced`, once). It goes by the events' times: there's no
+  timer, so a response that goes quiet gets its line with its next bytes.
+  Only the last lines count for `--count`, so `--count 1` waits for a
+  stream's end.
+- **Server-sent events** (`output/sse.go`): a `text/event-stream` body's
+  events are read by an `sseStream` per body, made at its headers like
+  `grpcStream` (per `http1Dir`, per HTTP/2 stream in `http2Dir.sse`, per
+  `quicStream`), fed the body as decoded (`feed`: what the Content-Encoding
+  decoded to, else the bytes as sent) and ended with the body. Lines end in
+  LF, CRLF or CR, split anywhere; an event is kept up to 1 MiB
+  (`maxSSEEvent`), and bytes not captured drop the event they were in and
+  skip to the next blank line (`lose`). Events are shown as sent, not as
+  EventSource dispatches them: one without data is shown, and a comment on
+  its own (a keep-alive) is an event too, counted as housekeeping
+  (`sseKeepAlive`). Each event goes with the frame or segment that ended it
+  (`SSE`/`sse`, `IsSSE` on all of a stream's), so Text, Brief (which doesn't
+  fold them), JSON (`sse_events`), redaction (each event whole), `--grep`
+  and HAR's event count all read them there. Once a compressed stream's
+  decoding stops, the rest isn't read as events (`stopped`).
 - **`--brief`'s folding** (`output/fold.go`): once a body's first call is
   shown, calls carrying only more of it (`bodyRefs`) are counted, not
   shown, and the call that ends it says how many. Folded calls aren't

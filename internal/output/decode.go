@@ -163,12 +163,12 @@ func (dc decoded) matches(re *regexp.Regexp) bool {
 		return false
 	}
 	for _, s := range dc.http1 {
-		if re.Match(s.body.Decoded) {
+		if re.Match(s.body.Decoded) || sseMatches(re, s.sse) {
 			return true
 		}
 	}
 	for _, f := range dc.http2 {
-		if headers(f.Headers) || re.Match(f.Data) || re.Match(f.Body.Decoded) {
+		if headers(f.Headers) || re.Match(f.Data) || re.Match(f.Body.Decoded) || sseMatches(re, f.SSE) {
 			return true
 		}
 		for _, m := range f.GRPC {
@@ -178,7 +178,7 @@ func (dc decoded) matches(re *regexp.Regexp) bool {
 		}
 	}
 	for _, it := range dc.quic {
-		if headers(it.Headers) || re.Match(it.Data) || re.Match(it.Body.Decoded) {
+		if headers(it.Headers) || re.Match(it.Data) || re.Match(it.Body.Decoded) || sseMatches(re, it.SSE) {
 			return true
 		}
 	}
@@ -214,6 +214,8 @@ func (dc decoded) housekeeping() bool {
 		return !dc.notQUIC && !slices.ContainsFunc(dc.quic, func(it quicItem) bool { return !it.housekeeping() })
 	case dc.isHTTP2:
 		return !slices.ContainsFunc(dc.http2, func(f http2Frame) bool { return !f.housekeeping() })
+	case len(dc.http1) > 0: // only an event stream's keep-alives
+		return !slices.ContainsFunc(dc.http1, func(s http1Segment) bool { return !sseKeepAlive(s.isSSE, s.sse, s.body) })
 	}
 	return false
 }
@@ -228,7 +230,8 @@ func (f http2Frame) housekeeping() bool {
 	case "HEADERS", "PUSH_PROMISE", "CONTINUATION":
 		return f.Headers == nil && !f.HeadersLost && f.Body.Encoding == ""
 	case "DATA":
-		return len(f.Data) == 0 && len(f.Body.Decoded) == 0 && f.Body.Err == ""
+		return len(f.Data) == 0 && len(f.Body.Decoded) == 0 && f.Body.Err == "" && sseEvents(f.SSE) == 0 ||
+			sseKeepAlive(f.IsSSE, f.SSE, f.Body)
 	}
 	return false
 }
@@ -245,7 +248,8 @@ func (it quicItem) housekeeping() bool {
 	case strings.HasPrefix(it.HTTP3, "stream: "), it.HTTP3 == "SETTINGS", it.HTTP3 == "MAX_PUSH_ID":
 		return true
 	case strings.HasPrefix(it.HTTP3, "DATA"):
-		return len(it.Data) == 0 && len(it.Body.Decoded) == 0 && it.Body.Err == ""
+		return len(it.Data) == 0 && len(it.Body.Decoded) == 0 && it.Body.Err == "" && sseEvents(it.SSE) == 0 ||
+			sseKeepAlive(it.IsSSE, it.SSE, it.Body)
 	}
 	return false
 }

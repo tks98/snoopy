@@ -153,6 +153,8 @@ func (t *Text) writeHTTP1(b *strings.Builder, segs []http1Segment) {
 			if s.msg.complete && i+1 < len(segs) {
 				b.WriteString("\n")
 			}
+		case s.isSSE:
+			t.writeSSE(b, s.sse, s.payload, s.offset, s.body, s.contentType, s.ends)
 		case s.body.Encoding != "":
 			t.writeBodyPart(b, s.raw, s.offset, s.body, s.contentType)
 		case s.inBody:
@@ -310,6 +312,8 @@ func (t *Text) writeHTTP2(b *strings.Builder, frames []http2Frame, captured int)
 		switch {
 		case f.IsGRPC:
 			t.writeGRPC(b, f)
+		case f.IsSSE:
+			t.writeSSE(b, f.SSE, f.Data, f.Offset, f.Body, f.ContentType, f.EndsStream)
 		case f.Body.Encoding != "":
 			t.writeBodyPart(b, f.Data, f.Offset, f.Body, f.ContentType)
 		case len(f.Data) > 0:
@@ -394,6 +398,8 @@ func (t *Text) writeQUIC(b *strings.Builder, items []quicItem) {
 			}
 			b.WriteString(t.dim(line) + "\n")
 			switch {
+			case it.IsSSE:
+				t.writeSSE(b, it.SSE, it.Data, it.Offset, it.Body, it.ContentType, false)
 			case it.Body.Encoding != "":
 				t.writeBodyPart(b, it.Data, it.Offset, it.Body, it.ContentType)
 			case len(it.Data) > 0:

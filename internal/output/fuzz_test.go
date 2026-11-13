@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net/netip"
+	"reflect"
 	"testing"
 	"time"
 
@@ -127,8 +128,40 @@ func FuzzTLSStream(f *testing.F) {
 		h2Frame(0, 9, 1, cat([]byte{2}, fzGzip("body"), []byte{0, 0})),
 		h2Frame(1, 5, 3, fzHPACK("grpc-status", "0")))
 	f.Add(cat(fzRec(1, c2s), fzRec(0, s2c)))
+	// Event streams: chunked over HTTP/1.1, and gzipped over HTTP/2.
+	f.Add(cat(fzRec(1, []byte("GET /events HTTP/1.1\r\nHost: h\r\n\r\n")),
+		fzRec(0, []byte("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"+
+			"10\r\nevent: a\ndata: {\"\r\n")),
+		fzRec(2, []byte("x\":1}\n\n: ping\n\n")),
+		fzRec(0, []byte("e\r\nid: 1\rdata: x\r\r\n0\r\n\r\n"))))
+	f.Add(cat(fzRec(1, cat([]byte(http2Preface), h2Frame(1, 5, 1, fzHPACK(":method", "GET", ":path", "/sse")))),
+		fzRec(0, cat(h2Frame(1, 4, 1, fzHPACK(":status", "200", "content-type", "text/event-stream", "content-encoding", "gzip")),
+			h2Frame(0, 0, 1, fzGzip("data: {\"token\": \"secret\"}\n\nevent: end\ndata")),
+			h2Frame(1, 5, 1, fzHPACK("x-trailer", "1"))))))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		fzRun(fzEvents(b, false))
+	})
+}
+
+// FuzzSSE reads an event stream in pieces of any size, which must give the
+// same events as reading it whole, none keeping more than maxSSEEvent.
+func FuzzSSE(f *testing.F) {
+	f.Add([]byte("\xef\xbb\xbf: hi\r\n\r\nevent: e\rdata: {\"a\": 1}\r\rid: 3\nretry: 10\ndata\n\ndata: end"), uint8(3))
+	f.Fuzz(func(t *testing.T, b []byte, step uint8) {
+		whole := newSSEStream(false).add(b, true)
+		got := sseAll(newSSEStream(false), b, int(step)%64+1)
+		if !reflect.DeepEqual(got, whole) {
+			t.Fatalf("in %d-byte pieces:\n%+v\nwhole:\n%+v", int(step)%64+1, got, whole)
+		}
+		for _, e := range got {
+			kept := len(e.Data) + len(e.Type) + len(e.ID)
+			for _, c := range e.Comments {
+				kept += len(c)
+			}
+			if kept > maxSSEEvent {
+				t.Fatalf("an event keeps %d bytes", kept)
+			}
+		}
 	})
 }
 
