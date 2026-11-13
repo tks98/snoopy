@@ -21,7 +21,9 @@ updates:
   # The programs the integration tests build, which aren't shipped, but
   # which vulnscan.yml checks too.
   - package-ecosystem: gomod
-    directory: /internal/tracer/testdata/quicgo
+    directories:
+      - /internal/tracer/testdata/quicgo
+      - /internal/tracer/testdata/wsgo
     schedule:
       interval: weekly
     groups:

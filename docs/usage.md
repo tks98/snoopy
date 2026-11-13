@@ -74,8 +74,8 @@ Output:
                      secret query parameters and JSON and form fields, and
                      tokens of well-known kinds, for output to share
   --verbose          also calls that only keep connections going (HTTP/2
-                     settings and flow control, QUIC acknowledgments), and
-                     every file attached to
+                     settings and flow control, QUIC acknowledgments,
+                     WebSocket pings), and every file attached to
   --count N          stop after N calls (0, the default: don't)
   --duration TIME    stop after this long: 30s, 5m, 1h
   --pcap FILE        also write the plaintext as TCP streams to a pcap file
@@ -247,6 +247,45 @@ SSE event message
 [DONE]
 ```
 
+A connection that switches to WebSocket (an HTTP/1.1 `101 Switching
+Protocols` with `Upgrade: websocket`) shows its messages from then on: the
+client's unmasked, and compressed ones (permessage-deflate, when the
+handshake agreed on it) decompressed once they end. Text and binary
+messages are shown as bodies are, the first 2 KiB of each, and a close
+frame with its status code and reason. A message's frames in one call are
+shown as one; here coder/websocket, which sends a frame per write:
+
+```console
+19:37:48.659789 wsgo (pid 33752, tid 33759) crypto/tls.(*Conn).Write 127.0.0.1:46272 > 127.0.0.1:38957  66 bytes  24µs  fd 8, conn 0x48c4b9c08008
+WebSocket text length=48 in 3 frames [FIN,compressed]
+[permessage-deflate: 48 bytes decoded to 280]
+snoopy decodes WebSocket messages. snoopy decodes WebSocket messages. ...
+
+19:37:48.660457 wsgo (pid 33752, tid 33758) crypto/tls.(*Conn).Write 127.0.0.1:38957 > 127.0.0.1:46272  50 bytes  210µs  fd 9, conn 0x48c4b9b5c708
+WebSocket text length=48 [FIN,compressed]
+[permessage-deflate: 48 bytes decoded to 280]
+snoopy decodes WebSocket messages. snoopy decodes WebSocket messages. ...
+```
+
+and with `--brief`:
+
+```console
+19:37:52.954864 wsgo[33804] 127.0.0.1:35761 > 127.0.0.1:35892 TLS 212: HTTP/1.1 101 Switching Protocols
+19:37:52.956247 wsgo[33804] 127.0.0.1:35892 > 127.0.0.1:35761 TLS 68: WebSocket text 32 bytes in 6 frames (permessage-deflate, 26 decoded): fragment one, fragment two
+19:37:52.956306 wsgo[33804] 127.0.0.1:35892 > 127.0.0.1:35761 TLS 52: WebSocket binary 16 bytes in 6 frames (permessage-deflate, 10 decoded)
+19:37:52.956362 wsgo[33804] 127.0.0.1:35892 > 127.0.0.1:35761 TLS 12: WebSocket close 1000 (normal closure): done
+```
+
+Pings and pongs are left out, as HTTP/2's are (`--verbose` shows them), and
+a large message's calls are folded in `--brief` as a body's are. A
+connection that switched before snoopy started is shown as data. So is a
+direction from a call whose bytes weren't all captured (raise
+`--max-size`), if a frame header was among them; bytes missing inside a
+message only keep it from being decompressed, and, if its sender keeps its
+compression context from message to message, the later ones that refer
+back to it. WebSocket over HTTP/2 (RFC 8441) is shown as the HTTP/2
+stream's DATA.
+
 `--brief` shows a large body's first call and the one that ends it, with
 how many were folded in between; `--verbose` shows each:
 
@@ -296,7 +335,9 @@ $ sudo snoopy --comm curl --requests
 Requests and responses are paired as in [HAR files](#har-files). A response
 that hasn't ended when snoopy stops isn't shown, nor one whose body ends
 only when its connection closes, but for the first line of one that was
-streaming. `--count` counts requests then, by their last lines, and
+streaming. A WebSocket handshake is shown when its response arrives, as
+`→ 101, websocket`; its messages aren't requests. `--count` counts
+requests then, by their last lines, and
 `--method`, `--path` and `--status` apply to them.
 
 Calls that carry nothing of the requests and responses, only what keeps the
@@ -421,7 +462,9 @@ Each line is one call to a TLS read or write function:
 | `http2_error` | Why HTTP/2 decoding stopped for this direction of the connection, e.g. because bytes weren't captured. Later events of it have no `http2`. |
 | `quic_frames`, `http3` | For a QUIC packet (`EVP_AEAD_CTX_seal`, `EVP_AEAD_CTX_open`, `ring::aead seal`, `ring::aead open`, `ngtcp2_crypto_encrypt`, `ngtcp2_crypto_decrypt`, `EVP_CipherUpdate`, `cipher.AEAD.Seal`, `cipher.AEAD.Open` and `AES_AEAD` events, whose data is the packet's decrypted frames): a summary of each frame, and the HTTP/3 frames its stream data completed: `type`, `stream`, `data_bytes`, decoded `headers`, an `error` if they couldn't be decoded, and `body` (see below). |
 | `sse_events` | For a `text/event-stream` body, on its `http1` body pieces and `http2` and `http3` DATA frames (and the trailers that end one): the server-sent events the bytes completed, each with `event` (its name, if it had one), `id` and `retry` if it had them, `data` (its data lines, joined by newlines), `comments`, `bytes` (its length in the body as decoded), and `truncated` (larger than 1 MiB, of which that much is kept) or `incomplete` (the body ended before it did). A comment on its own, which servers send to keep the connection open, is an event with only `comments`. With `--redact`, secrets in `data`, `id` and comments are masked. |
-| `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
+| `websocket` | On a connection that switched to WebSocket, its frames in the data, or the parts of them: `opcode` (`text`, `binary`, `continuation`, `close`, `ping`, `pong`), `message` (a continuation frame's message type), `fin`, `masked`, `compressed` (permessage-deflate), `length` (the payload's), `continued` (more of a frame whose header was in an earlier event), `data_bytes`, the payload in this event, unmasked, as `payload` (UTF-8) or `payload_base64`, `close_code` and `close_reason`, and `end` on the frame that ends its message, and on a whole control frame. A compressed message's payload is in `body` (see below), on the frame that ends it. With `--redact`, payloads are masked as bodies are, and `payload_base64` left out. |
+| `websocket_error` | Why WebSocket decoding stopped for this direction of the connection, e.g. because bytes of a frame header weren't captured. Later events of it have no `websocket`. |
+| `body` | For the bytes of a body with a `Content-Encoding` (gzip, deflate, br, zstd, or several): `content_encoding`, what they decompressed to as `decoded` (UTF-8) or `decoded_base64`, and an `error` once decompressing stops, e.g. because bytes weren't captured. On HTTP/2 and HTTP/3 frames, on the WebSocket frame that ends a compressed message (`permessage-deflate`), and on the event for HTTP/1.x, whose bodies snoopy follows from their headers through `Content-Length` or chunked framing. Bodies are decompressed up to 16 MiB each. |
 
 Fields that don't apply are left out.
 
@@ -443,12 +486,15 @@ kept with it. Since a request's status isn't known when it's sent,
 `--status` shows responses only, each with the request it answers (`[for
 POST /v1/charges]`, or `answers` in JSON). A request from before snoopy
 started has no method or path to match. With `--har`, whole entries are
-kept or left out; `--pcap` isn't filtered. The summary at the end says how
+kept or left out; `--pcap` isn't filtered. A WebSocket connection's
+messages go with the handshake's request, whose response's status is
+101. The summary at the end says how
 many calls were left out.
 
 `--grep REGEXP` keeps the calls in which a regular expression (Go's syntax)
 matches what they show: the data, HTTP/2's and HTTP/3's headers as
-decoded, bodies decompressed, gRPC messages' fields. So it finds a value in
+decoded, bodies decompressed, gRPC messages' fields, WebSocket messages
+unmasked and decompressed. So it finds a value in
 a gzipped JSON body or an HTTP/2 header, which a search of the raw bytes
 wouldn't. It matches after `--redact`. `--duration` stops snoopy after a
 while, `--count` after a number of calls.

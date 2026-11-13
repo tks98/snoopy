@@ -251,7 +251,7 @@ func (t *exchangeTracker) touched(ev *tracer.Event, dc decoded) []*exchange {
 			switch {
 			case s.msg != nil:
 				add(c.http1(dir, s.msg))
-			case s.inBody || s.body.Encoding != "":
+			case s.inBody || s.body.Encoding != "" || s.ws != nil: // WebSocket after its handshake too
 				add(c.current[dir])
 			}
 		}

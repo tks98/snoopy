@@ -124,7 +124,7 @@ func (b *Brief) summary(ev *tracer.Event, dc decoded) string {
 	case dc.note != "":
 		return dc.note
 	case dc.http1 != nil:
-		return briefHTTP1(dc.http1)
+		return briefHTTP1(dc.http1, b.opts.Verbose)
 	}
 	return briefData(dc.data)
 }
@@ -265,7 +265,7 @@ func briefFields(fields []hpack.HeaderField) string {
 	return fmt.Sprintf("%d fields", len(fields))
 }
 
-func briefHTTP1(segs []http1Segment) string {
+func briefHTTP1(segs []http1Segment, verbose bool) string {
 	var parts []string
 	body, bodyBytes := bodyPart{}, -1
 	flushBody := func() {
@@ -279,6 +279,8 @@ func briefHTTP1(segs []http1Segment) string {
 		case s.msg != nil:
 			flushBody()
 			parts = append(parts, briefMessage(s.msg))
+		case s.ws != nil:
+			parts = append(parts, briefWebSocket(s.ws, verbose))
 		case briefSSE(s.sse) != "":
 			flushBody()
 			parts = append(parts, briefSSE(s.sse))

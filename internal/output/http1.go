@@ -24,6 +24,7 @@ type http1Conns struct {
 type http1Conn struct {
 	dirs     [2]http1Dir // by tracer.Direction
 	headSent bool        // the last request was HEAD, so its response has no body
+	ws       *wsConn     // once it switched to WebSocket
 	lastUsed uint64
 }
 
@@ -35,6 +36,7 @@ const (
 	h1Chunked        // a chunked body
 	h1ToClose        // body bytes until the connection closes
 	h1Gone           // not HTTP/1 anymore (switched protocols, a tunnel)
+	h1WS             // switched to WebSocket (see websocket.go)
 )
 
 // Where a chunked body is.
@@ -78,6 +80,8 @@ type http1Segment struct {
 	// completed.
 	isSSE bool
 	sse   []sseEvent
+	// ws is set on the segments of a connection that switched to WebSocket.
+	ws *wsPart
 }
 
 const (
@@ -111,7 +115,9 @@ func (c *http1Conns) process(ev *tracer.Event) []http1Segment {
 	d := &conn.dirs[ev.Function.Direction()]
 	segs := conn.add(d, ev.Data, c.pool)
 	if missing := int(ev.Size) - len(ev.Data); missing > 0 {
-		if dec := d.lose(missing, missingWhy(ev)); dec != nil {
+		if d.state == h1WS {
+			segs = conn.ws.lose(ev.Function.Direction(), segs, missing, missingWhy(ev))
+		} else if dec := d.lose(missing, missingWhy(ev)); dec != nil {
 			if p := decodeBody(dec, nil, false); p.Err != "" {
 				segs = append(segs, http1Segment{body: p})
 			}
@@ -167,7 +173,7 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 			}
 			m, _ := parseHTTP1(data[:end])
 			conn.startBody(d, m, pool)
-			segs = append(segs, http1Segment{msg: &m, ends: d.state == h1Start})
+			segs = append(segs, http1Segment{msg: &m, ends: d.headersOnly()})
 			data = data[end:]
 		case h1Head:
 			old := len(d.head)
@@ -186,7 +192,7 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 				return append(segs, http1Segment{raw: data[:end-old]})
 			}
 			conn.startBody(d, m, pool)
-			segs = append(segs, http1Segment{raw: data[:end-old], ends: d.state == h1Start})
+			segs = append(segs, http1Segment{raw: data[:end-old], ends: d.headersOnly()})
 			data = data[end-old:]
 		case h1Length:
 			n := min(int64(len(data)), d.left)
@@ -217,11 +223,31 @@ func (conn *http1Conn) add(d *http1Dir, data []byte, pool *bodyPool) []http1Segm
 			data = data[n:]
 		case h1ToClose:
 			return append(segs, d.bodySegment(data, data, decodeBody(d.body, data, false), false))
+		case h1WS:
+			dir := conn.dirOf(d)
+			if conn.ws.atFrame(dir) && startsHTTP1(data) { // a new connection with the same handle
+				conn.dirs, conn.ws, conn.headSent = [2]http1Dir{}, nil, false
+				continue
+			}
+			return append(segs, conn.ws.segments(dir, data)...)
 		default: // h1Gone
 			return append(segs, http1Segment{raw: data})
 		}
 	}
 	return segs
+}
+
+// headersOnly reports whether the message whose headers were just read
+// ends with them: it has no body, or the connection stops being HTTP/1.x.
+func (d *http1Dir) headersOnly() bool {
+	return d.state == h1Start || d.state == h1Gone || d.state == h1WS
+}
+
+func (conn *http1Conn) dirOf(d *http1Dir) tracer.Direction {
+	if d == &conn.dirs[tracer.Write] {
+		return tracer.Write
+	}
+	return tracer.Read
 }
 
 // bodySegment returns the segment for bytes of the body being read; last
@@ -264,8 +290,11 @@ func (conn *http1Conn) startBody(d *http1Dir, m httpMessage, pool *bodyPool) {
 		status, _ := strconv.Atoi(strings.TrimSpace(rest[:min(3, len(rest))]))
 		switch {
 		case status == 101: // switching protocols, e.g. to WebSocket
-			d.state = h1Gone
-			conn.dirs[tracer.Read], conn.dirs[tracer.Write] = http1Dir{state: h1Gone}, http1Dir{state: h1Gone}
+			state := h1Gone
+			if conn.ws = newWSConn(m.headers, conn.dirOf(d)); conn.ws != nil {
+				state = h1WS
+			}
+			conn.dirs[tracer.Read], conn.dirs[tracer.Write] = http1Dir{state: state}, http1Dir{state: state}
 			return
 		case status < 200 || status == 204 || status == 304 || conn.headSent:
 			return // no body

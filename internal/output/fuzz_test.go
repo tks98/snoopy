@@ -138,6 +138,15 @@ func FuzzTLSStream(f *testing.F) {
 		fzRec(0, cat(h2Frame(1, 4, 1, fzHPACK(":status", "200", "content-type", "text/event-stream", "content-encoding", "gzip")),
 			h2Frame(0, 0, 1, fzGzip("data: {\"token\": \"secret\"}\n\nevent: end\ndata")),
 			h2Frame(1, 5, 1, fzHPACK("x-trailer", "1"))))))
+	// WebSocket with permessage-deflate: messages compressed, fragmented,
+	// masked, and some bytes missing.
+	f.Add(cat(fzRec(1, []byte("GET /ws HTTP/1.1\r\nUpgrade: websocket\r\n\r\n")),
+		fzRec(0, []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n"+
+			"\xc1\x07\xf2\x48\xcd\xc9\xc9\x07\x00\x01\x03Hel")),
+		fzRec(0, []byte("\x80\x02lo\xc1\x05\xf2\x00\x11\x00\x00")),
+		fzRec(1, wsFrameBytes(wsText, true, true, wsKey, []byte{0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00})),
+		fzRec(3, wsFrameBytes(wsBinary, true, false, wsKey, make([]byte, 300))[:100]),
+		fzRec(0, wsFrameBytes(wsClose, true, false, nil, []byte("\x03\xe8bye")))))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		fzRun(fzEvents(b, false))
 	})

@@ -74,6 +74,10 @@ type jsonEvent struct {
 	// bytes of an encoded body in it decoded to.
 	HTTP1 []jsonHTTP1 `json:"http1,omitempty"`
 	Body  *jsonBody   `json:"body,omitempty"`
+	// On a connection that switched to WebSocket: the frames in the data,
+	// and why decoding stopped for this direction, if it just did.
+	WebSocket      []jsonWSFrame `json:"websocket,omitempty"`
+	WebSocketError string        `json:"websocket_error,omitempty"`
 }
 
 // jsonHTTP1 is a piece of HTTP/1.x in an event: a request's or response's
@@ -278,6 +282,7 @@ func (j *JSON) Print(ev *tracer.Event) error {
 	if !dc.isHTTP2 {
 		out.HTTP2Error = dc.note
 		out.HTTP1 = jsonHTTP1Pieces(dc.http1, j.redact)
+		out.WebSocket, out.WebSocketError = jsonWebSocket(dc.http1, j.redact)
 		// Encoded bodies' pieces in the event, decoded, as one.
 		var body bodyPart
 		for _, s := range dc.http1 {

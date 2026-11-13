@@ -456,6 +456,7 @@ func (dc decoded) redact(r *redactStreams, conn harConnKey, dir tracer.Direction
 		s.raw = r.text(key(partRaw, 0), s.raw)
 		s.body.Decoded = r.text(key(partDecoded, 0), s.body.Decoded)
 		s.sse = redactSSE(s.sse)
+		s.ws = s.ws.redact(r, key(partRaw, 0), key(partDecoded, 0)) // which HTTP/1.x doesn't use anymore
 		segs[i] = s
 	}
 	if dc.http1 != nil {

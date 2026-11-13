@@ -483,8 +483,35 @@ signature finding against real binaries (see
   HTTP/2 and HTTP/3 find the encoding in a stream's HEADERS and end the body
   at END_STREAM or FIN; HTTP/1 (`output/http1.go`) follows messages per
   connection: Content-Length, chunked framing, until close, no body for HEAD
-  responses, 1xx, 204 and 304, and it stops at 101 and CONNECT. Bytes that
-  weren't captured stop a body's decoding, said once.
+  responses, 1xx, 204 and 304, and it stops at 101 (handing a switch to
+  WebSocket over, see below) and CONNECT. Bytes that weren't captured stop
+  a body's decoding, said once.
+- **WebSocket** (`output/websocket.go`): a 101 response with `Upgrade:
+  websocket` puts the HTTP/1 connection in state `h1WS`, whose bytes
+  `wsConn` parses as frames per direction, returned as `http1Segment.ws`
+  (so HAR, the filters and redaction see them where they see HTTP/1).
+  Payloads aren't buffered, except control frames' (125 bytes at most)
+  and compressed messages', which are decompressed synchronously at their
+  end (up to 4 MiB compressed) with `flate.NewReaderDict`: with context
+  takeover, the dictionary is the last 32 KiB that direction decompressed
+  to. Go's flate fails on a distance beyond its history, so once a message
+  couldn't be decompressed, the window starts empty and a later one that
+  refers back fails rather than decoding to garbage. Missing bytes are
+  skipped inside a payload; elsewhere they stop the direction, as an
+  invalid header does (reserved opcodes and bits, fragmented or long
+  control frames, continuations without a message). No valid frame starts
+  like an HTTP/1 start line, so one at a frame boundary starts a new
+  connection on the handle. `decoders.webSocket` keeps HTTP/2's
+  late-connection check (`http2Aligned`) off such connections: a 9-byte
+  frame can pass it. Text and `--brief` show a message's frames in one
+  call as one (`wsRuns`); pings and pongs are housekeeping. `--requests`
+  ends an exchange at a 101's headers (`headersOnly`), which it didn't
+  before, so upgrades weren't shown. WebSocket over HTTP/2 (extended
+  CONNECT, RFC 8441) isn't decoded: it would mean following
+  `:protocol websocket` streams in http2.go and the HTTP/2 printers.
+  `TestWebSocket` (an integration test in `package tracer_test`, since
+  output imports tracer) checks a real library, coder/websocket in
+  `internal/tracer/testdata/wsgo`, with context takeover.
 - **`--requests`** (`output/requests.go`) is the HAR writer's pairing with
   no entries kept (`maxKept` 0, so bodies are only counted) and a `done`
   hook, called once per exchange when its response ends: an HTTP/2 or

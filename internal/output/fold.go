@@ -74,6 +74,10 @@ func bodyRefs(ev *tracer.Event, dc decoded) (refs []bodyRef, onlyBody bool) {
 		}
 	case dc.http1 != nil:
 		for _, s := range dc.http1 {
+			if s.ws != nil {
+				refs, onlyBody = s.ws.bodyRefs(bodyKey{conn, dir, 0}, refs, onlyBody)
+				continue
+			}
 			if !s.inBody || s.isSSE {
 				onlyBody = false
 				continue
