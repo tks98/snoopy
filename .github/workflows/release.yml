@@ -25,7 +25,7 @@ jobs:
       # For the Java agent's jars (java/build.sh, a GoReleaser hook). An
       # exact JDK, so that the jars can be built again from the tag, byte
       # for byte; release-check.yml uses the same.
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: 21.0.13+9
