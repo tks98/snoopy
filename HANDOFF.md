@@ -53,8 +53,10 @@ the recipes).
 ## Working on it from a Mac
 
 eBPF only runs on Linux, and the generated `internal/tracer/snoopy_*_bpfel.go`
-files have `linux` build tags. So `internal/tracer` and `main` don't even
-compile for darwin, and `go test ./...` fails on macOS. Work inside a Linux VM:
+files have `linux` build tags. So `internal/tracer` doesn't even compile for
+darwin, and `go test ./...` fails on macOS. (`go build .` there gives
+`main_other.go`'s stub, which only says snoopy is Linux only; CI checks it
+builds.) Work inside a Linux VM:
 
 - **OrbStack** or **Lima** (`brew install lima && limactl start
   template://ubuntu-24.04`) give you an Ubuntu 24.04 arm64 VM on Apple Silicon.

@@ -47,6 +47,14 @@ jobs:
           CGO_ENABLED=0 GOARCH=amd64 go build -o /dev/null .
           CGO_ENABLED=0 GOARCH=arm64 go build -o /dev/null .
 
+      # On macOS, go build and go install give main_other.go's stub, which
+      # says snoopy is Linux only, instead of compile errors from the
+      # Linux-only packages.
+      - name: Build the stub for darwin
+        run: |
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /dev/null .
+          GOOS=darwin GOARCH=arm64 go vet .
+
   generate:
     name: BPF objects are up to date
     runs-on: ubuntu-24.04
