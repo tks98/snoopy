@@ -696,3 +696,67 @@ func TestWebSocketNotSSE(t *testing.T) {
 		t.Errorf("event stream with an Upgrade header: %+v", dc.http1)
 	}
 }
+
+// Events come in the order their calls returned, and a write can return
+// after the peer has read what it sent. On the server, a read of the
+// client's first frame (net/http reads a byte in the background) can then
+// come before the write of the 101; on the client, the read of the 101
+// before the write of the request. Either way, the frames are decoded.
+func TestWebSocketHandshakeOutOfOrder(t *testing.T) {
+	z := &deflater{}
+	frame := wsFrameBytes(wsText, true, true, wsKey, z.message(t, "first message"))
+	second := wsFrameBytes(wsText, true, true, wsKey, z.message(t, "first message, again"))
+	// The server's view of a call is the client's with the other function.
+	server := func(ev *tracer.Event) *tracer.Event {
+		ev.Function = map[tracer.Function]tracer.Function{tracer.FuncSSLWrite: tracer.FuncSSLRead, tracer.FuncSSLRead: tracer.FuncSSLWrite}[ev.Function]
+		return ev
+	}
+	const extensions = "permessage-deflate; client_no_context_takeover"
+	srv, cli := wsHandshake(extensions), wsHandshake(extensions)
+	for name, evs := range map[string][]*tracer.Event{
+		"server": {server(srv[0]), wsEvent(tracer.FuncSSLRead, frame[:1]), server(srv[1]),
+			wsEvent(tracer.FuncSSLRead, frame[1:]), wsEvent(tracer.FuncSSLRead, second)},
+		"client": {cli[1], cli[0], wsEvent(tracer.FuncSSLWrite, frame), wsEvent(tracer.FuncSSLWrite, second)},
+	} {
+		frames, errs := wsDecode(t, newDecoders(Options{}), evs...)
+		if got := messages(frames); strings.Join(got, "|") != "text: first message|text: first message, again" || strings.Join(errs, "") != "" {
+			t.Errorf("%s: %q, %q", name, got, errs)
+		}
+	}
+
+	// A request whose call returned late is shown as the request, not as a
+	// new connection on the handle.
+	hs := wsHandshake("")
+	got, _ := textOf(t, Options{}, hs[1], hs[0], wsEvent(tracer.FuncSSLWrite, wsFrameBytes(wsText, true, false, wsKey, []byte("hi"))))
+	if !strings.HasPrefix(got[1], "GET /chat HTTP/1.1\n") || got[2] != "WebSocket text length=2 [FIN]\nhi\n\n" {
+		t.Errorf("late request: %q", got)
+	}
+	// HAR, and with it --requests, pairs it with that 101.
+	var out bytes.Buffer
+	h := NewHAR(&out, "test", Options{})
+	for _, ev := range []*tracer.Event{hs[1], hs[0], wsEvent(tracer.FuncSSLWrite, wsFrameBytes(wsText, true, false, wsKey, []byte("hi")))} {
+		if err := h.Print(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if l := readHAR(t, out.Bytes()); len(l.Log.Entries) != 1 || l.Log.Entries[0].Request.Method != "GET" ||
+		l.Log.Entries[0].Response.Status != 101 || !strings.Contains(out.String(), `"data": "hi"`) {
+		t.Errorf("late request, HAR:\n%s", out.String())
+	}
+
+	// A refusal after bytes that were taken for frames: they were shown as
+	// such, and the rest of the client's side isn't followed.
+	evs := []*tracer.Event{server(wsHandshake("")[0]), wsEvent(tracer.FuncSSLRead, []byte{0x81, 0x82}),
+		event(tracer.FuncSSLWrite, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"),
+		event(tracer.FuncSSLRead, "more\r\n")}
+	d := newDecoders(Options{})
+	for _, ev := range evs {
+		d.decode(ev)
+	}
+	if conn := d.h1.conns[http2Key{42, 0xbeef}]; conn == nil || conn.ws != nil || conn.dirs[tracer.Read].state != h1Gone {
+		t.Errorf("after a refusal: %+v", conn)
+	}
+}

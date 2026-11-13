@@ -250,7 +250,7 @@ func (t *exchangeTracker) touched(ev *tracer.Event, dc decoded) []*exchange {
 		for _, s := range dc.http1 {
 			switch {
 			case s.msg != nil:
-				add(c.http1(dir, s.msg))
+				add(c.http1(dir, s.msg, s.lateRequest))
 			case s.inBody || s.body.Encoding != "" || s.ws != nil: // WebSocket after its handshake too
 				add(c.current[dir])
 			}
@@ -265,10 +265,15 @@ func (t *exchangeTracker) touched(ev *tracer.Event, dc decoded) []*exchange {
 	return out
 }
 
-func (c *exConn) http1(dir tracer.Direction, m *httpMessage) *exchange {
+func (c *exConn) http1(dir tracer.Direction, m *httpMessage, late bool) *exchange {
 	if !strings.HasPrefix(m.startLine, "HTTP/") {
 		method, rest, _ := strings.Cut(m.startLine, " ")
 		target, _, _ := strings.Cut(rest, " ")
+		if e := c.current[opposite(dir)]; late && e != nil && e.method == "" && e.reqDir == dir {
+			e.method, e.path = method, target // the request of the 101 before it
+			c.current[dir] = e
+			return e
+		}
 		e := &exchange{method: method, path: target, reqDir: dir}
 		c.queue = append(c.queue, e)
 		if len(c.queue) > maxQueued {
