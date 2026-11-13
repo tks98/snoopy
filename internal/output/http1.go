@@ -3,6 +3,7 @@ package output
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -105,7 +106,7 @@ func (c *http1Conns) process(ev *tracer.Event) []http1Segment {
 	d := &conn.dirs[ev.Function.Direction()]
 	segs := conn.add(d, ev.Data, c.pool)
 	if missing := int(ev.Size) - len(ev.Data); missing > 0 {
-		if dec := d.lose(missing); dec != nil {
+		if dec := d.lose(missing, missingWhy(ev)); dec != nil {
 			if p := decodeBody(dec, nil, false); p.Err != "" {
 				segs = append(segs, http1Segment{body: p})
 			}
@@ -350,22 +351,23 @@ func join(parts [][]byte) []byte {
 	return bytes.Join(parts, nil)
 }
 
-// lose accounts for bytes of the direction that weren't captured, and
-// returns the body decoder it stopped, if any.
-func (d *http1Dir) lose(n int) *bodyDecoder {
+// lose accounts for bytes of the direction that weren't captured, for the
+// reason why (missingWhy), and returns the body decoder it stopped, if any.
+func (d *http1Dir) lose(n int, why string) *bodyDecoder {
 	dec := d.body
+	lost := fmt.Errorf("bytes of the body weren't captured (%s)", why)
 	d.info.seen += int64(n)
 	switch d.state {
 	case h1Length:
-		d.endBody(errors.New("bytes of the body weren't captured (raise --max-size)"))
+		d.endBody(lost)
 		if d.left -= int64(n); d.left <= 0 {
 			d.state, d.body = h1Start, nil
 		}
 	case h1Chunked, h1Head:
-		d.endBody(errors.New("bytes of the body weren't captured (raise --max-size)"))
+		d.endBody(lost)
 		d.state, d.head, d.body = h1Start, nil, nil // the framing is lost
 	case h1ToClose:
-		d.endBody(errors.New("bytes of the body weren't captured (raise --max-size)"))
+		d.endBody(lost)
 	default:
 		return nil
 	}

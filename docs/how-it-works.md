@@ -130,7 +130,9 @@ it starts (see [maintenance.md](maintenance.md#http3-through-openssls-quic-curl-
    new programs, whose files are inspected the same way.
 2. A uprobe on each read/write function records the buffer pointer and the
    connection handle. A return probe copies the bytes actually transferred
-   into a ring buffer, in chunks of up to 16 KiB. Go programs can't use return
+   into a ring buffer (16 MiB, or `--buffer-size`), in chunks of up to
+   16 KiB; a call that doesn't fit, while snoopy is behind, is lost and
+   counted, and snoopy says so. Go programs can't use return
    probes, because Go moves goroutine stacks, so snoopy disassembles the
    function and puts a probe on each `RET` instruction instead. On Linux
    6.6 and later, a file's probes are attached through a few uprobe_multi

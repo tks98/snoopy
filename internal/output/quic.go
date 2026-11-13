@@ -363,6 +363,13 @@ func quicVarint(b []byte) (uint64, int, bool) {
 
 var errQUICShort = errors.New("frame cut off")
 
+// Errors of streams and header blocks that data missing from a QUIC
+// connection can cause (see quicItem.mayBeLoss).
+const (
+	quicWaitingQPACK = "waiting for QPACK encoder stream data"
+	quicOutOfOrder   = "too much data arrived out of order"
+)
+
 // unknownFrameError is a frame type parseQUICFrames doesn't know, whose
 // length it can't tell, so the rest of the packet can't be parsed.
 type unknownFrameError uint64
@@ -661,7 +668,7 @@ func (d *quicDir) deliver(sf streamFrame, s *quicStream) []quicItem {
 				dec.fail(errors.New("too much of the stream arrived out of order"))
 				delete(d.bodies, sf.id)
 			}
-			return []quicItem{{HTTP3: "(stream given up)", Stream: sf.id, Err: "too much data arrived out of order"}}
+			return []quicItem{{HTTP3: "(stream given up)", Stream: sf.id, Err: quicOutOfOrder}}
 		}
 		return nil
 	}
@@ -810,7 +817,7 @@ func (d *quicDir) headers(id uint64, block []byte) []quicItem {
 			return []quicItem{{HTTP3: "HEADERS", Stream: id,
 				Err: "headers not decoded: the connection probably started before snoopy"}}
 		}
-		return []quicItem{{HTTP3: "HEADERS", Stream: id, Err: "waiting for QPACK encoder stream data"}}
+		return []quicItem{{HTTP3: "HEADERS", Stream: id, Err: quicWaitingQPACK}}
 	}
 	return d.decodedItems(id, fields, err)
 }

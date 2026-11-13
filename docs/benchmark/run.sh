@@ -144,8 +144,9 @@ measure() {
 			local nostats="$(grep -ls '^prog_id' /proc/$sn/fdinfo/* 2>/dev/null | wc -l) program fds, bpftool says: $(bpftool prog show 2>&1 | head -1)"
 			kill -INT $sn
 			wait $sn 2>/dev/null || true
-			# Chunks the ring buffer had no room for, which snoopy warns about.
-			lost=$(grep -oE '[0-9]+ chunks dropped' "$tmp/err" | tail -1 | cut -d' ' -f1 || true)
+			# Calls the ring buffer had no room for: the total snoopy says
+			# when it stops.
+			lost=$(grep -oE '[0-9]+ calls? (was|were) lost, whole or in part, because' "$tmp/err" | tail -1 | cut -d' ' -f1 || true)
 			lost=${lost:-0}
 		fi
 		read -r rps p50 p99 < "$tmp/median"

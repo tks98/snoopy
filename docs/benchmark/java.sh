@@ -95,7 +95,7 @@ measure() {
 			snoopycpu=$(awk -v a="$before" -v b="$(cpu $sn)" -v t=$((runs * secs)) 'BEGIN { printf "%.0f%%", (b - a) / t * 100 }')
 			kill -INT $sn
 			wait $sn 2>/dev/null || true
-			lost=$(grep -oE '[0-9]+ chunks dropped' "$tmp/err" | tail -1 | cut -d' ' -f1 || true)
+			lost=$(grep -oE '[0-9]+ calls? (was|were) lost, whole or in part, because' "$tmp/err" | tail -1 | cut -d' ' -f1 || true)
 			lost=${lost:-0}
 		fi
 		kill $jvm
