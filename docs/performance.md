@@ -69,10 +69,12 @@ changes (its faster decoding already in), for comparison.
 
 "µs/req" is CPU time per request: each server spends its two CPUs on its
 requests, so it's 2 CPUs divided by the requests per second. "snoopy CPU"
-is the share of one CPU snoopy used, and "chunks lost" the pieces of
-captured data the ring buffer had no room for, which snoopy warns about. A
-mode that loses chunks can look cheaper than one that doesn't, since the
-traced program doesn't wait for snoopy either way.
+is the share of one CPU snoopy used, and "chunks lost" the calls whose
+captured data the ring buffer had no room for, whole or from the 16 KiB
+chunk that didn't fit on (here each call was one chunk), which snoopy warns
+about (see [The ring buffer](#the-ring-buffer)). A mode that loses chunks
+can look cheaper than one that doesn't, since the traced program doesn't
+wait for snoopy either way.
 
 The BPF programs' own time per call, for nginx at 1 KiB traced: 180 to
 210 ns at entry (`ssl_read_enter`, `ssl_write_enter`), 470 ns at return
@@ -118,13 +120,35 @@ with `--java`.
 - **Output keeps up with tens of thousands of calls a second.** `--brief`
   kept up with everything here, `--json` with all but 256 KiB responses,
   and text lost under 1% at 1 KiB. Beyond that, the ring buffer fills
-  and snoopy drops data and warns; the traced program isn't slowed down for
+  and snoopy loses calls and warns; the traced program isn't slowed down for
   it. `--quiet` with `--pcap`, or `--brief`, keeps up with more. At these
   rates, text output dropped 2,277,321 chunks of nginx's at 1 KiB in 2.5,
   before 2.6's faster decoding, and 413,321 before its BPF changes.
 
 To measure on another machine, run `sudo docs/benchmark/run.sh`; its header
 says what it needs.
+
+## The ring buffer
+
+The BPF program writes what it captures into a ring buffer that snoopy
+reads, of 16 MiB unless `--buffer-size` says otherwise (a power of two, up
+to 1 GiB). Each 16 KiB chunk of a call takes a record of 256 bytes, 2 KiB
+or 16 KiB, whichever fits, plus 168 bytes of headers, so 16 MiB holds about
+7,500 calls of 1 KiB, or a thousand of 16 KiB, that snoopy hasn't read
+yet: about a tenth of a second of nginx's 1 KiB responses above. A call
+that doesn't fit is lost, whole or from the chunk that didn't fit on, and
+counted; snoopy says so within a second, and the total when it stops.
+
+A larger buffer rides out longer bursts, and a stall in what reads
+snoopy's output. It doesn't help if output can't keep up on average, as
+with text output of nginx's 78,000 requests a second above: then any
+buffer fills, a larger one only later, and tracing fewer calls (`--comm`,
+`--pid`, `--container`) or output that takes less per call (`--brief`,
+`--quiet` with `--pcap`) is what helps. The buffer is kernel memory,
+allocated when snoopy starts and kept until it stops, and counted against
+its cgroup's memory limit if there is one; it costs the traced programs
+nothing per call. A buffer under 32 KiB can't hold a 16 KiB chunk, so
+every call of more than 2 KiB is lost, which snoopy warns about at startup.
 
 ## Attaching and exiting
 

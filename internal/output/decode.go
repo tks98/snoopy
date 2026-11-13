@@ -39,6 +39,11 @@ type Options struct {
 	// what's shown: the data, decoded headers, decompressed bodies, gRPC
 	// messages' fields; after Redact, so that it can't find what's masked.
 	Grep *regexp.Regexp
+	// Lost, if set, returns how many calls snoopy lost to a full ring
+	// buffer (Tracer.LostEvents). A call lost whole leaves a gap in its
+	// connection that the decoders can't see, so when one stops, it says
+	// that lost calls may be why.
+	Lost func() (uint64, error)
 }
 
 // startedEarly is what Warn is told when headers can't be decoded.
@@ -71,12 +76,37 @@ type decoders struct {
 	ex     *exchangeTracker // with filter
 	rs     *redactStreams   // with redact
 	grep   *regexp.Regexp
+	lost   *lostCheck
+}
+
+// lostCheck tells the decoders' messages whether calls were lost to a full
+// ring buffer.
+type lostCheck struct {
+	count func() (uint64, error) // Options.Lost
+	seen  bool                   // the count was above zero, and only goes up
+}
+
+// lostNote is what's added to a decoder's message about stopping when
+// calls were lost.
+const lostNote = "; snoopy lost calls to a full ring buffer, which may be why"
+
+// note returns lostNote if calls were lost, or "". The count is read only
+// when a decoder stops, which is rare, and not again once it's above zero.
+func (l *lostCheck) note() string {
+	if !l.seen && l.count != nil {
+		n, err := l.count()
+		l.seen = err == nil && n > 0
+	}
+	if l.seen {
+		return lostNote
+	}
+	return ""
 }
 
 func newDecoders(opts Options) decoders {
 	pool := newBodyPool()
 	d := decoders{h1: newHTTP1Conns(pool), h2: newHTTP2Conns(pool, opts.Proto), quic: newQUICConns(pool), warn: opts.Warn,
-		redact: opts.Redact, filter: opts.Filter}
+		redact: opts.Redact, filter: opts.Filter, lost: &lostCheck{count: opts.Lost}}
 	if opts.Filter != nil {
 		d.ex = newExchangeTracker()
 	}
@@ -127,8 +157,16 @@ func (d decoders) decode(ev *tracer.Event) decoded {
 	if ev.Function.IsQUIC() {
 		items, ok := d.quic.process(ev)
 		dc = decoded{isQUIC: true, notQUIC: !ok, quic: items, quicConn: d.quic.last, quicEnded: d.quic.ended}
+		for i, it := range dc.quic {
+			if it.mayBeLoss() {
+				dc.quic[i].Err += d.lost.note()
+			}
+		}
 	} else {
 		dc.http2, dc.isHTTP2, dc.note = d.h2.process(ev)
+		if strings.HasPrefix(dc.note, http2Stopped) && !strings.Contains(dc.note, "ring buffer") {
+			dc.note += d.lost.note()
+		}
 		if !dc.isHTTP2 {
 			dc.http1 = d.h1.process(ev)
 		}
@@ -231,6 +269,13 @@ func (f http2Frame) housekeeping() bool {
 		return len(f.Data) == 0 && len(f.Body.Decoded) == 0 && f.Body.Err == ""
 	}
 	return false
+}
+
+// mayBeLoss reports whether an item's error is one that a QUIC packet lost
+// to a full ring buffer can cause: a gap in a stream, or QPACK's table out
+// of step with the encoder's.
+func (it quicItem) mayBeLoss() bool {
+	return strings.HasPrefix(it.Err, "qpack: ") || it.Err == quicWaitingQPACK || it.Err == quicOutOfOrder
 }
 
 // housekeeping reports whether an item only keeps the connection going: a

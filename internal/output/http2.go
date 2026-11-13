@@ -116,6 +116,22 @@ type bodyInfo struct {
 // body whose end goes unnoticed would otherwise stay forever.
 const maxBodyInfos = 1024
 
+// http2Stopped starts the note of a direction whose decoding stopped.
+const http2Stopped = "HTTP/2 decoding stopped for this direction of the connection: "
+
+// missingWhy says why bytes of an event weren't captured, for what to do
+// about it: the ring buffer had no room for them, they couldn't be read
+// from the process, or the call was longer than --max-size.
+func missingWhy(ev *tracer.Event) string {
+	switch {
+	case ev.Incomplete:
+		return "the ring buffer was full; see --buffer-size"
+	case ev.ReadError:
+		return "they couldn't be read from the process's memory"
+	}
+	return "raise --max-size"
+}
+
 // http2Conns decodes the HTTP/2 connections seen in events. HPACK
 // compresses each side's headers against a table built up over the whole
 // connection, so headers are decoded from the connection preface on, and
@@ -252,7 +268,7 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 	}
 
 	missing := max(int(ev.Size)-len(ev.Data), 0) // truncated, dropped or unreadable
-	more, err := d.add(data, missing, c.pool)
+	more, err := d.add(data, missing, missingWhy(ev), c.pool)
 	if err != nil {
 		d.buf, d.block = nil, nil
 		d.endBodies(err)
@@ -263,7 +279,7 @@ func (c *http2Conns) process(ev *tracer.Event) (frames []http2Frame, ok bool, no
 			return nil, false, ""
 		}
 		d.broken = true
-		return nil, false, "HTTP/2 decoding stopped for this direction of the connection: " + err.Error()
+		return nil, false, http2Stopped + err.Error()
 	}
 	note = d.note
 	if conn.late && !conn.noted {
@@ -341,10 +357,10 @@ func (d *http2Dir) trimBodies() {
 }
 
 // add parses the bytes of one call: data, followed by missing bytes that
-// weren't captured. Missing bytes are fine within the payload of a DATA
-// frame, which isn't needed to follow the connection; anywhere else, the
-// framing or the header table is lost.
-func (d *http2Dir) add(data []byte, missing int, pool *bodyPool) ([]http2Frame, error) {
+// weren't captured, for the reason why (missingWhy). Missing bytes are fine
+// within the payload of a DATA frame, which isn't needed to follow the
+// connection; anywhere else, the framing or the header table is lost.
+func (d *http2Dir) add(data []byte, missing int, why string, pool *bodyPool) ([]http2Frame, error) {
 	var frames []http2Frame
 	d.buf = append(d.buf, data...)
 	for {
@@ -358,10 +374,10 @@ func (d *http2Dir) add(data []byte, missing int, pool *bodyPool) ([]http2Frame, 
 			}
 			if d.dataLeft > 0 { // all captured bytes used up
 				if missing > d.dataLeft {
-					return frames, errors.New("bytes after a DATA frame weren't captured (raise --max-size)")
+					return frames, fmt.Errorf("bytes after a DATA frame weren't captured (%s)", why)
 				}
 				if dec := d.bodies[d.data.stream]; dec != nil && missing > 0 {
-					dec.fail(errors.New("bytes of the body weren't captured (raise --max-size)"))
+					dec.fail(fmt.Errorf("bytes of the body weren't captured (%s)", why))
 					if p := decodeBody(dec, nil, false); p.Err != "" {
 						if n := len(frames); n > 0 && frames[n-1].Stream == d.data.stream {
 							frames[n-1].Body.Encoding, frames[n-1].Body.Err = p.Encoding, p.Err
@@ -390,7 +406,7 @@ func (d *http2Dir) add(data []byte, missing int, pool *bodyPool) ([]http2Frame, 
 		}
 		if len(d.buf) < 9 {
 			if missing > 0 {
-				return frames, errors.New("bytes of a frame header weren't captured (raise --max-size)")
+				return frames, fmt.Errorf("bytes of a frame header weren't captured (%s)", why)
 			}
 			return frames, nil
 		}
@@ -416,7 +432,7 @@ func (d *http2Dir) add(data []byte, missing int, pool *bodyPool) ([]http2Frame, 
 		}
 		if len(d.buf) < 9+length {
 			if missing > 0 {
-				return frames, fmt.Errorf("bytes of a %s frame weren't captured (raise --max-size)", f.Type)
+				return frames, fmt.Errorf("bytes of a %s frame weren't captured (%s)", f.Type, why)
 			}
 			if len(d.buf) > maxHTTP2Pending {
 				return frames, fmt.Errorf("%s frame of %d bytes is too large to follow", f.Type, length)

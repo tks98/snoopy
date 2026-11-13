@@ -51,6 +51,7 @@ type config struct {
 	hex        bool
 	full       bool
 	maxSize    int
+	bufferSize byteSize
 	count      int
 	pcap       string
 	har        string
@@ -200,6 +201,9 @@ Output:
 
 Capture:
   --max-size BYTES   bytes to capture per call (default %d, at most %d)
+  --buffer-size SIZE the kernel's buffer for captured data until snoopy
+                     reads it, which bursts of calls can fill: a power of
+                     two, as bytes or with K, M or G (default %s, at most %s)
   --java             also Java's own TLS (SunJSSE) in the --pid JVM, or the
                      JVMs in the --container containers, by loading
                      snoopy's agent into them (it stays loaded, idle,
@@ -223,7 +227,7 @@ Examples:
   sudo snoopy --count 20                      stop after 20 calls
   sudo snoopy --json | jq 'select(.direction == "write") | .data'
   sudo snoopy --quiet --pcap - | tcpdump -r - -nn -A
-`, tracer.DefaultMaxCapture, tracer.MaxCaptureLimit)
+`, tracer.DefaultMaxCapture, tracer.MaxCaptureLimit, formatSize(tracer.DefaultRingBufferSize), formatSize(tracer.MaxRingBufferSize))
 
 // flags returns the command line flags, which set c. Their errors are
 // returned, not printed, and neither is the help text.
@@ -249,6 +253,8 @@ func flags(c *config) *flag.FlagSet {
 	fs.BoolVar(&c.full, "full", false, "")
 	fs.BoolVar(&c.hex, "hex", false, "")
 	fs.IntVar(&c.maxSize, "max-size", tracer.DefaultMaxCapture, "")
+	c.bufferSize = tracer.DefaultRingBufferSize
+	fs.Var(&c.bufferSize, "buffer-size", "")
 	fs.IntVar(&c.count, "count", 0, "")
 	fs.DurationVar(&c.duration, "duration", 0, "")
 	fs.StringVar(&c.grep, "grep", "", "")
@@ -572,12 +578,15 @@ func run(cfg config) error {
 	// With a process filter, probes go on those processes only, so the
 	// rest don't pay for them; that needs the watcher, for new ones.
 	perProcess := !cfg.noScan && (cfg.pid != 0 || cfg.comm != "" || len(cfg.containers) > 0)
-	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize, PerProcess: perProcess, Java: cfg.java})
+	t, err := tracer.New(tracer.Options{PID: cfg.pid, Comm: cfg.comm, MaxCapture: cfg.maxSize, RingBufferSize: int(cfg.bufferSize), PerProcess: perProcess, Java: cfg.java})
 	if err != nil {
+		if errors.Is(err, unix.ENOMEM) && cfg.bufferSize != tracer.DefaultRingBufferSize {
+			return fmt.Errorf("%w (with --buffer-size %s; a smaller one may fit)", err, cfg.bufferSize.String())
+		}
 		return loadError(err, cfg.verbose)
 	}
 	defer t.Close()
-	printers, closePrinters, err := openPrinters(cfg)
+	printers, closePrinters, err := openPrinters(cfg, t.LostEvents)
 	if err != nil {
 		return err
 	}
@@ -707,6 +716,8 @@ func run(cfg config) error {
 	}
 	quic := &quicSeen{pids: map[uint32]bool{}}
 	go watchCounters(ctx, t, quic)
+	lost := newLostReporter(t.LostEvents, logf, lostHint(cfg))
+	go lost.watch(ctx)
 	if cfg.pid != 0 {
 		go watchExit(ctx, cfg.pid, stop)
 		if !t.ResolvesAddresses() {
@@ -729,6 +740,9 @@ func run(cfg config) error {
 		// The default is the widest: said once, since what's captured then
 		// includes other programs' secrets, snoopy's own host's included.
 		logf("every process on this machine is traced, so their passwords and tokens show too; --comm, --pid or --container narrows it, --redact masks them")
+	}
+	if w := smallBufferWarning(int(cfg.bufferSize)); w != "" {
+		logf("warning: %s", w)
 	}
 	if cfg.schemas != nil {
 		logf("--proto: gRPC messages of %d %s are decoded with their fields' names", cfg.schemas.Methods(), plural(cfg.schemas.Methods(), "method", "methods"))
@@ -769,9 +783,7 @@ func run(cfg config) error {
 	stopWatching() // nothing more to report attaching to
 
 	logf("%s", events.summary(printers))
-	if lost, _ := t.LostEvents(); lost > 0 {
-		logf("warning: %d chunks were dropped because the ring buffer was full", lost)
-	}
+	lost.final()
 	closePrinters()
 	stopJava()
 	return err
@@ -1233,8 +1245,9 @@ func followChildren(ctx context.Context, t *tracer.Tracer, pid int) {
 }
 
 // openPrinters sets up the requested outputs and returns a function that
-// flushes and closes them.
-func openPrinters(cfg config) ([]output.Printer, func(), error) {
+// flushes and closes them. lost is Tracer.LostEvents, which the decoders
+// read when they stop, to say that lost calls may be why.
+func openPrinters(cfg config, lost func() (uint64, error)) ([]output.Printer, func(), error) {
 	var printers []output.Printer
 	var closers []func() error
 	stdoutUsed := false
@@ -1286,13 +1299,13 @@ func openPrinters(cfg config) ([]output.Printer, func(), error) {
 		closers = append(closers, out.Close)
 		switch {
 		case cfg.json:
-			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas, Grep: cfg.grepRe}))
+			printers = append(printers, output.NewJSON(out, output.Options{Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas, Grep: cfg.grepRe, Lost: lost}))
 		case cfg.requests:
 			printers = append(printers, output.NewRequests(out, output.Options{Redact: cfg.redact, Filter: cfg.filter}))
 		case cfg.brief:
-			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Grep: cfg.grepRe}))
+			printers = append(printers, output.NewBrief(out, output.Options{Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Grep: cfg.grepRe, Lost: lost}))
 		default:
-			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas, Grep: cfg.grepRe}))
+			printers = append(printers, output.NewText(out, output.Options{Hex: cfg.hex, Full: cfg.full, Verbose: cfg.verbose, Redact: cfg.redact, Filter: cfg.filter, Warn: warn, Proto: cfg.schemas, Grep: cfg.grepRe, Lost: lost}))
 		}
 	}
 
@@ -1327,13 +1340,13 @@ func (q *quicSeen) has(pid uint32) bool {
 // receive, with none of its QUIC packets captured, to be warned about.
 const minUDP443 = 32
 
-// watchCounters warns about what the BPF program counts going missing: data
-// dropped because the ring buffer was full, and QUIC packets of connections
-// that started before snoopy and can't be followed (Firefox's).
+// watchCounters warns about the QUIC traffic the BPF program counts that
+// snoopy can't show: a process's HTTP/3 of which no packet was captured, and
+// packets of connections that started before snoopy and can't be followed
+// (Firefox's). Calls lost to a full ring buffer are lostReporter's.
 func watchCounters(ctx context.Context, t *tracer.Tracer, quic *quicSeen) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	var reported uint64
 	quicWarned := false
 	// HTTP/3 traffic of which nothing was captured: a QUIC library snoopy
 	// doesn't support, or one that changed. Captured packets are delivered
@@ -1363,11 +1376,6 @@ func watchCounters(ctx context.Context, t *tracer.Tracer, quic *quicSeen) {
 				}
 				logf("warning: %s (pid %d) sends or receives on UDP port 443, HTTP/3's, but none of its QUIC packets were captured: its QUIC library isn't supported, or has changed (see docs/maintenance.md)%s",
 					strings.TrimSpace(string(comm)), pid, hint)
-			}
-			lost, err := t.LostEvents()
-			if err == nil && lost > reported {
-				logf("warning: %d chunks dropped so far because the ring buffer was full", lost)
-				reported = lost
 			}
 			if n, err := t.UntrackedQUIC(); err == nil && n > 0 && !quicWarned {
 				logf("warning: Firefox has HTTP/3 connections that were open before snoopy started, which can't be traced; restart Firefox to trace them")

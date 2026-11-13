@@ -37,8 +37,19 @@ const (
 	// MaxCaptureLimit is CHUNK_SIZE * MAX_CHUNKS in bpf/snoopy.c.
 	MaxCaptureLimit = 1 << 20
 
-	defaultRingBufferSize = 16 << 20
-	maxCommLen            = 15
+	// DefaultRingBufferSize is the default size of the ring buffer that
+	// carries captured data from the kernel to snoopy. A call takes a
+	// record of 256 bytes, 2 KiB or 16 KiB per chunk, plus 168 bytes of
+	// headers (snoopy's and the ring buffer's), so this holds about a
+	// thousand calls of 16 KiB, 7,500 of up to 2 KiB or 39,000 of up to 256
+	// bytes that the reader hasn't caught up with.
+	DefaultRingBufferSize = 16 << 20
+	// MaxRingBufferSize bounds RingBufferSize. The kernel allows up to
+	// 2 GiB, but the buffer is kernel memory that can't be swapped out, and
+	// a size beyond this is likelier a mistake than a need.
+	MaxRingBufferSize = 1 << 30
+
+	maxCommLen = 15
 )
 
 // Options configures a Tracer.
@@ -55,8 +66,9 @@ type Options struct {
 	// MaxCapture is the maximum number of bytes captured per call.
 	// Zero means DefaultMaxCapture.
 	MaxCapture int
-	// RingBufferSize is the size of the kernel-to-user buffer in bytes; a
-	// power of two. Zero means 16 MiB.
+	// RingBufferSize is the size of the kernel-to-user buffer in bytes: a
+	// power of two, at least the page size and at most MaxRingBufferSize.
+	// Zero means DefaultRingBufferSize.
 	RingBufferSize int
 	// PerProcess attaches probes to the processes the caller attaches for
 	// (Attach's pid) rather than to files, with the kernel's PID filter:
@@ -151,10 +163,10 @@ func New(opts Options) (*Tracer, error) {
 		return nil, fmt.Errorf("max capture must be between 1 and %d bytes", MaxCaptureLimit)
 	}
 	if opts.RingBufferSize == 0 {
-		opts.RingBufferSize = defaultRingBufferSize
+		opts.RingBufferSize = DefaultRingBufferSize
 	}
-	if opts.RingBufferSize < os.Getpagesize() || opts.RingBufferSize&(opts.RingBufferSize-1) != 0 {
-		return nil, fmt.Errorf("ring buffer size must be a power of two and at least %d bytes", os.Getpagesize())
+	if opts.RingBufferSize < os.Getpagesize() || opts.RingBufferSize > MaxRingBufferSize || opts.RingBufferSize&(opts.RingBufferSize-1) != 0 {
+		return nil, fmt.Errorf("ring buffer size must be a power of two from %d to %d bytes", os.Getpagesize(), MaxRingBufferSize)
 	}
 
 	// Kernels before 5.11 charge BPF memory against RLIMIT_MEMLOCK.
@@ -1470,8 +1482,10 @@ func (t *Tracer) Run(ctx context.Context, handle func(*Event)) error {
 	}
 }
 
-// LostEvents returns how many chunks the kernel dropped because the ring
-// buffer was full.
+// LostEvents returns how many records the BPF program couldn't write
+// because the ring buffer was full. Each is a call, whole or the rest of it
+// from the chunk that didn't fit (those delivered in part are Incomplete),
+// or one of the small notices that follow sockets and QUIC packets.
 func (t *Tracer) LostEvents() (uint64, error) {
 	return t.counter(0) // COUNTER_LOST
 }

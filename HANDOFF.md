@@ -131,6 +131,7 @@ signature finding against real binaries (see
 | `internal/javaagent/` | `--java`: staging the agent's jars in a JVM's `/tmp`, and HotSpot's attach protocol, in Go; the jars themselves, embedded (`jars/`, built by `make jars`) |
 | `java/` | The Java agent (`agent/src`: the ASM transformer and `Hooks`, which writes frames to `/dev/null`), `build.sh`, and the spike's tools |
 | `main.go` | CLI flags and wiring |
+| `lost.go` | `--buffer-size`, and saying while snoopy runs that calls were lost to a full ring buffer |
 | `java.go` | `--java`: which JVMs, loading the agent into them, stopping it |
 | `.github/workflows/ci.yml` | Lint, unit tests, build, generate check, integration tests (x86_64, arm64), the Java agent per JDK |
 | `.github/workflows/rust.yml`, `canary.yml`, `loadcheck.yml`, `release-check.yml`, `kubectl-snoopy.yml`, `benchmark.yml`, `vulnscan.yml`, `codeql.yml` | The other checks in the Status table |
@@ -200,9 +201,20 @@ signature finding against real binaries (see
   traced from its first call. Uprobes aren't attached per process for the
   same reason. Without BTF, `main.go` adds new children from a `/proc` scan
   every second, and the exec watcher adds those that execute a program.
-- **Counters** (`counters`, per CPU): chunks lost to a full ring buffer, and
-  Firefox QUIC packets of contexts created before snoopy, which `main.go`
-  warns about once.
+- **Counters** (`counters`, per CPU): records the ring buffer had no room
+  for (`count_lost`: once per call, at the chunk that didn't fit, which
+  ends it, and for a socket or packet-sent notice), and Firefox QUIC
+  packets of contexts created before snoopy, which `main.go` warns about
+  once. `lostReporter` (`lost.go`) reads the first every second and says
+  when it goes up: at once with what to try, then at most every 5 s, and
+  the total at exit, which `docs/benchmark/*.sh` read. A call lost whole
+  never reaches the decoders, so they're given `Tracer.LostEvents`
+  (`Options.Lost`) and, when one stops (HTTP/2's `http2Stopped`, QPACK and
+  QUIC stream errors, `quicItem.mayBeLoss`), add that lost calls may be
+  why; a call lost in part is `Incomplete`, and the decoders put its
+  missing bytes down to the ring buffer rather than `--max-size`
+  (`missingWhy`). Nothing tells an HTTP/2 decoder that a call with whole
+  frames went missing, so its HPACK table can go out of step silently.
 
 ### Go side
 
@@ -608,8 +620,6 @@ signature finding against real binaries (see
   - rustls under tokio with ring, and HTTP/3 in curl and Go:
     docs/plan-rustls-http3.md.
   - An `--sslkeylog` mode.
-  - A flag for the ring buffer size (`tracer.Options.RingBufferSize` exists,
-    but there's no CLI flag).
 
 ## Things learned about the environment
 

@@ -88,6 +88,9 @@ Output:
 
 Capture:
   --max-size BYTES   bytes to capture per call (default 16384, at most 1048576)
+  --buffer-size SIZE the kernel's buffer for captured data until snoopy
+                     reads it, which bursts of calls can fill: a power of
+                     two, as bytes or with K, M or G (default 16M, at most 1G)
   --java             also Java's own TLS (SunJSSE) in the --pid JVM, or the
                      JVMs in the --container containers, by loading
                      snoopy's agent into them (it stays loaded, idle,
@@ -350,7 +353,7 @@ Each line is one call to a TLS read or write function:
 | `latency_ns` | Time spent inside the call. |
 | `size` | Bytes the call transferred. |
 | `captured` | Bytes captured; less than `size` when `truncated` is set (see `--max-size`). |
-| `incomplete` | Set when part of the payload was dropped because the ring buffer was full. |
+| `incomplete` | Set when part of the payload was dropped because the ring buffer was full. Calls lost whole aren't output; snoopy says how many on stderr. |
 | `read_error` | Set when the payload couldn't be read from the process's memory. |
 | `data` / `data_base64` | The captured bytes: as a string if they are valid UTF-8, otherwise base64. With `--redact`, `data` is redacted and `data_base64` left out, since HTTP/2's and HTTP/3's headers are compressed in it. |
 | `redacted` | Set with `--redact`. |
@@ -503,8 +506,9 @@ Each traced TLS call costs the calling program a few microseconds. Without
 (the system's OpenSSL) pay for its probes too, a few microseconds per call,
 because they're on the library's file; with them, only the processes
 selected do. Text output keeps up with tens of thousands of calls
-a second; beyond that, snoopy drops data and warns. [performance.md](performance.md)
-has the measurements.
+a second; beyond that, the ring buffer that carries captured data to snoopy
+fills, and calls are lost, which snoopy warns about as it happens (see
+Troubleshooting). [performance.md](performance.md) has the measurements.
 
 ## Troubleshooting
 
@@ -527,6 +531,24 @@ processes the given one starts, so use the parent's PID, or `--comm`.
 
 **Too much output.** Use `--brief`, narrow it down with `--comm`, `--host`
 and `--port`, or stop after a number of calls with `--count`.
+
+**`the ring buffer was full, so N calls were lost, whole or in part`.**
+The BPF program writes what it captures to a ring buffer of 16 MiB, which
+snoopy reads, and a call that doesn't fit is lost: snoopy fell behind, in
+a burst of calls or because printing them takes longer than they take to
+make (text and JSON take the most; a terminal, or a program reading
+`snoopy | less` slowly, holds it up further). The traced programs aren't
+slowed down for it. snoopy says so within a second of the first loss, then
+at most every 5 seconds while it goes on, and the total when it stops; in
+JSON mode too, on stderr, so that stdout stays one object per call. A
+larger `--buffer-size` (such as `64M`) rides out longer bursts; `--comm`,
+`--pid` or `--container` traces fewer calls; `--brief`, or `--quiet` with
+`--pcap`, keeps up with more. A call that lost its end is shown, marked
+`[incomplete]` (`incomplete` in JSON). One lost whole leaves a gap in its
+connection that snoopy can't see: decoding the connection's HTTP/2 or
+HTTP/3 may stop, with a note that lost calls may be why, and an HTTP/2
+connection's later headers can come out wrong, since HPACK builds up its
+table across the connection.
 
 **Hex dumps instead of HTTP.** The data isn't HTTP that snoopy can follow: a
 different protocol, or a connection it joined partway through.

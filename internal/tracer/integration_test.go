@@ -278,6 +278,60 @@ func TestGoCryptoTLS(t *testing.T) {
 	}
 }
 
+// With a ring buffer of one page, a call of more than 2 KiB, whose first
+// record is 16 KiB, never fits: it's lost and counted every time, while
+// small calls still arrive.
+func TestRingBufferFull(t *testing.T) {
+	requireRoot(t)
+	page := os.Getpagesize()
+	if page > 16<<10 {
+		t.Skipf("a page of %d bytes holds a 16 KiB record", page)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := discover.Inspect(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := New(Options{PID: os.Getpid(), RingBufferSize: page})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range targets {
+		if _, err := tr.Attach(target, 0); err != nil {
+			tr.Close()
+			t.Fatal(err)
+		}
+	}
+	events := runTracer(t, tr)
+
+	srv, _ := newServer(t)
+	resp, err := srv.Client().Post(srv.URL+"/lost", "text/plain", strings.NewReader(strings.Repeat("x", 64<<10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	waitFor(t, events, "client read", func(ev *Event) bool {
+		return ev.Function == FuncGoRead && contains("served /lost with 65536 body bytes")(ev)
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	lost, err := tr.LostEvents()
+	for err == nil && lost == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		lost, err = tr.LostEvents()
+	}
+	if err != nil || lost == 0 {
+		t.Errorf("LostEvents: %d, %v", lost, err)
+	}
+	if ev := events.find(func(ev *Event) bool { return len(ev.Data) > 2048 }); ev != nil {
+		t.Errorf("a call of %d bytes arrived", len(ev.Data))
+	}
+}
+
 func TestOpenSSL(t *testing.T) {
 	requireRoot(t)
 	curl := requireTool(t, "curl")
