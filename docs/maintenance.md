@@ -39,6 +39,7 @@ file, then match what you see:
 | `warning: ...: quic-go is linked in, but Go's AEADs it encrypts with weren't found, so its HTTP/3 isn't traced` | Go moved or renamed its AEADs | [HTTP/3 over quic-go](#http3-over-quic-go) |
 | `warning: some HTTP/2 or HTTP/3 connections started before snoopy, so their headers can't be decoded; ...` | Expected for connections that were already open; if it's about new ones, the HPACK or QPACK decoding | [HTTP decoding and compressed bodies](#http-decoding-and-compressed-bodies) |
 | A Rust program shows nothing, or wrong sizes | rustls symbol names or Rust's return layout | [rustls](#rustls) |
+| Node.js events without fd or addresses (`local:? > peer:?`), or with another connection's | How Node moves records between OpenSSL's memory BIOs and its sockets | [OpenSSL over memory BIOs (Node.js)](#openssl-over-memory-bios-nodejs) |
 | A Go program shows events without fd or addresses, or isn't attached | Go's struct offsets, prologue or pclntab | [Go crypto/tls](#go-cryptotls) |
 | arm64 Chromium has TLS but no HTTP/3, after a dependency update | `golang.org/x/arch` output changed | [funcfind and golang.org/x/arch](#funcfind-and-golangorgxarch) |
 | CI's "BPF objects are up to date" is red, or loading fails on an old kernel | Generated objects or the verifier | [The BPF program](#the-bpf-program) |
@@ -816,6 +817,63 @@ place and without associated data.
   Erlang's `erl`, e.g. one built with `./configure --with-ssl
   --disable-dynamic-ssl-lib` (static libcrypto from libssl-dev), whose
   crypto NIF is then what's probed.
+
+## OpenSSL over memory BIOs (Node.js)
+
+### How it was found
+
+snoopy showed Node's requests as `local:? > peer:?`. Node's `TLSWrap` gives
+OpenSSL memory BIOs and moves the records to and from the socket itself,
+through libuv. bpftrace on `SSL_read` and `SSL_write` (with their returns)
+and on the socket syscalls, for one `fetch`, with Ubuntu's Node 18 (libssl)
+and an official Node 22 (OpenSSL in `node`):
+
+```bash
+B=/path/to/node   # or /lib/aarch64-linux-gnu/libssl.so.3
+bpftrace -e "uprobe:$B:SSL_write,uprobe:$B:SSL_read /pid == $PID/ { printf(\"%d %s enter %x\\n\", tid, probe, arg0); }
+  uretprobe:$B:SSL_write,uretprobe:$B:SSL_read /pid == $PID/ { printf(\"%d %s ret %d\\n\", tid, probe, retval); }
+  tracepoint:syscalls:sys_enter_read,tracepoint:syscalls:sys_enter_write,tracepoint:syscalls:sys_enter_writev /pid == $PID/ {
+    printf(\"%d %s fd %d\\n\", tid, probe, args.fd); }"
+```
+
+Everything is on the main thread: `SSL_write` returns, then `write` on the
+socket sends its record; the socket's `read` comes just before the
+`SSL_read` that decrypts it. The first request's `SSL_write` is nested in
+an `SSL_read` (the handshake's completion runs JavaScript), which is why
+its response already had an address: the send happened inside the
+`SSL_read`. Node's OpenSSL also opens, reads and closes a file inside
+these calls; `record_fd` only takes sockets.
+
+Dart (3.14, `dart:stable`) was checked the same way, with the offsets of
+its BoringSSL's functions from snoopy's cache (`~/.cache/snoopy/boringssl`,
+file offsets; bpftrace needs `--unsafe` for a stripped binary): it calls
+`SSL_read` and `SSL_write` on one `DartWorker` thread and reads and writes
+the socket on another, so nothing per thread pairs them, and it isn't
+paired.
+
+### How it works
+
+`memory_bio_return` (see HANDOFF.md, "OpenSSL over memory BIOs"): for a
+connection whose socket isn't known, a write is paired with the thread's
+next send, within 10 ms, and a read with its last receive, each only if it
+holds an application data record of the call's length plus an AEAD's
+overhead (`has_app_record`). The write's event is held in user space for
+the socket notice (`EVENT_FLAG_SOCKET_LATER`). Only with BTF.
+
+### How to tell it broke, and how to fix it
+
+- **No addresses again:** Node moved its socket I/O off the thread that
+  calls `SSL_write` (to a worker), or deferred it past the next send of
+  another connection, or started padding records; rerun the bpftrace
+  session and compare the threads and the order. A CBC suite never
+  matches, by design.
+- **Another connection's address:** two connections' records of the same
+  length, the second sent first on the thread, before the first's socket
+  was known. Check with `ss -tnp` against `--json`'s fds.
+- **To test:** `TestNodeSockets` (a client of two servers at once, over
+  TLS 1.3 and 1.2, and a server), with whatever `node` is first in `PATH`:
+  on GitHub's runners an official build, which brings its own OpenSSL;
+  Ubuntu's uses libssl.
 
 ## HTTP/3 over quic-go
 

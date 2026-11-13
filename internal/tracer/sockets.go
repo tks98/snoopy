@@ -16,7 +16,8 @@ const fnQUICPacketSent = 0xfe
 
 // learnsSocketLater reports whether the function's data is encrypted before
 // the thread's next socket syscall shows which socket it goes out on, so a
-// connection's first write can't have one when it's emitted.
+// connection's first write can't have one when it's emitted. Other events
+// say so themselves (Event.socketLater): writes over OpenSSL's memory BIOs.
 func (f Function) learnsSocketLater() bool {
 	switch f {
 	case FuncRustlsWrite, FuncQUICSend, FuncNSSQUICSend, FuncRecordSend, FuncRingSend, FuncAwsLCQUICSend, FuncRingQUICSend,
@@ -55,7 +56,7 @@ func newSocketWaiter() *socketWaiter {
 func (w *socketWaiter) add(ev *Event, now time.Time) []*Event {
 	key := connKey{ev.PID, ev.ConnID}
 	h := w.held[key]
-	if ev.FD < 0 && ev.Function.learnsSocketLater() {
+	if ev.FD < 0 && (ev.socketLater || ev.Function.learnsSocketLater()) {
 		if h == nil {
 			h = &heldEvents{since: now}
 			w.held[key] = h

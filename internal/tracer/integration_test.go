@@ -18,9 +18,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"debug/elf"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -1747,6 +1749,116 @@ func erlangCryptoNIF(t *testing.T, erl string) string {
 		}
 	}
 	return ""
+}
+
+// startNodeTracer traces node, a copy of node named comm: through the
+// system's OpenSSL, for Ubuntu's node, which only this node's calls are let
+// through (by its name); or the one built into node (official builds, as on
+// GitHub's runners), which only this copy of node uses, and whose main
+// thread calls itself MainThread, so that it's not told by name.
+func startNodeTracer(t *testing.T, node, comm string, noBTF bool) *eventLog {
+	t.Helper()
+	opts := Options{Comm: comm, ignoreKernelBTF: noBTF}
+	targets := systemTargets(t, discover.OpenSSL)
+	if found, err := discover.Inspect(node); err == nil {
+		var own []discover.Target
+		for _, target := range found {
+			if target.Library == discover.OpenSSL && target.Problem == nil {
+				own = append(own, target)
+			}
+		}
+		if len(own) > 0 {
+			opts.Comm, targets = "", own
+		}
+	}
+	return startTracer(t, opts, targets)
+}
+
+// Node.js does its own socket I/O around OpenSSL's memory BIOs, on its event
+// loop's thread: SSL_write's record is sent right after it, and SSL_read's
+// was received right before. Its events get their socket from those, as a
+// client of two servers at once and as a server, and over TLS 1.2 and 1.3.
+func TestNodeSockets(t *testing.T) {
+	requireRoot(t)
+	node := renamedTool(t, "node", "socknode")
+	events := startNodeTracer(t, node, "socknode", false)
+	srvA, _ := newServer(t)
+	srvB, _ := newServer(t)
+
+	// The node server's certificate: the test servers'.
+	cert := srvA.TLS.Certificates[0]
+	key, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+const https = require('https'), fs = require('fs');
+const [a, b, certFile, keyFile] = process.argv.slice(1);
+const get = (url, maxVersion) => new Promise((ok, fail) =>
+	https.get(url, {rejectUnauthorized: false, maxVersion, agent: false}, r => { r.resume(); r.on('end', ok); }).on('error', fail));
+let left = 2;
+const done = () => { if (--left == 0) setTimeout(() => process.exit(0), 300); };
+const srv = https.createServer({cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile)}, (req, res) => {
+	res.end('node served ' + req.url);
+	done();
+});
+srv.listen(0, '127.0.0.1', () => {
+	console.log(srv.address().port);
+	Promise.all([get(a + '/node-a', 'TLSv1.3'), get(b + '/node-b', 'TLSv1.2')]).then(done, e => { console.error(e); process.exit(1); });
+});
+`
+	cmd := exec.Command(node, "-e", script, srvA.URL, srvB.URL, certFile, keyFile)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		cmd.Wait()
+		t.Fatalf("node: %v: %s", err, stderr.Bytes())
+	}
+	nodeServer := "127.0.0.1:" + strings.TrimSpace(line)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	resp, err := client.Get("https://" + nodeServer + "/node-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("node: %v: %s", err, stderr.Bytes())
+	}
+
+	pid := uint32(cmd.Process.Pid)
+	check := func(desc string, dir Direction, data, server string) {
+		t.Helper()
+		ev := waitFor(t, events, desc, func(ev *Event) bool {
+			return ev.PID == pid && ev.Function.Direction() == dir && contains(data)(ev)
+		})
+		t.Logf("%s: %s fd %d, %s -> %s", desc, ev.Function, ev.FD, ev.Local, ev.Remote)
+		checkConnection(t, ev, server)
+	}
+	check("request to A", Write, "GET /node-a", srvA.Listener.Addr().String())
+	check("response from A", Read, "served /node-a", srvA.Listener.Addr().String())
+	check("request to B", Write, "GET /node-b", srvB.Listener.Addr().String())
+	check("response from B", Read, "served /node-b", srvB.Listener.Addr().String())
+	check("request to node", Read, "GET /node-server", nodeServer)
+	check("response from node", Write, "node served /node-server", nodeServer)
 }
 
 // freeUDPPort returns a UDP port on 127.0.0.1 that was free a moment ago.
