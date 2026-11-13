@@ -512,6 +512,21 @@ signature finding against real binaries (see
   call as one (`wsRuns`); pings and pongs are housekeeping. `--requests`
   ends an exchange at a 101's headers (`headersOnly`), which it didn't
   before, so upgrades weren't shown.
+  Events come in the order their calls returned, and a write can return
+  after the peer has read what it sent, so the handshake can come out of
+  order with the other direction (seen under load in CI, with
+  coder/websocket over net/http). On the server, a read of the client's
+  first frame (net/http's background read of a byte, then the rest) can
+  come before the server's write of the 101: `wsEarly` then starts
+  reading the request's direction as WebSocket, with the extensions the
+  request offered, when bytes that aren't HTTP/1 follow an upgrade request
+  (`wsAsk`), and `switchProtocols` keeps those frames and applies what the
+  101 accepted (`wsDir.negotiated`); a refusal leaves that direction
+  `h1Gone`. On the client, the read of the 101 can come before the write
+  of its request: `wsLate` takes the request direction's next call, if
+  it's a request, as that request (`http1Segment.lateRequest`, which HAR
+  and the filters pair with the 101) rather than a new connection on the
+  handle. `TestWebSocketHandshakeOutOfOrder` has both.
   WebSocket over HTTP/2 and HTTP/3 (extended CONNECT, RFC 8441 and 9220):
   `wsConnect` spots the request, `wsAccept` the 2xx response, made into
   a `wsConn` by `newWSStream` from its `sec-websocket-extensions` (as
