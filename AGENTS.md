@@ -18,9 +18,11 @@ in CI, and test servers and clients you control.
 ## Building and testing
 
 eBPF only runs on Linux, and the generated `internal/tracer/snoopy_*_bpfel.go`
-files have `linux` build tags, so `main` and `internal/tracer` don't compile
-on macOS. On a Mac, `GOOS=linux go vet ./...` checks the build; run tests in a
-Linux VM or container (see HANDOFF.md, "Working on it from a Mac").
+files have `linux` build tags, so `internal/tracer` and most other packages
+don't compile on macOS. The root package's files have `linux` tags too, and on
+other systems it builds `main_other.go`, a stub that says snoopy is Linux only.
+On a Mac, `GOOS=linux go vet ./...` checks the build; run tests in a Linux VM
+or container (see HANDOFF.md, "Working on it from a Mac").
 
 ```bash
 make build         # ./snoopy, a static binary
